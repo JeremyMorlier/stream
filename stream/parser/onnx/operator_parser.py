@@ -39,6 +39,8 @@ class OnnxOperatorParser(ONNXOperatorParserZigZag, metaclass=ABCMeta):
     def get_operand_source_input_format(self):
         predecessors = self.get_node_predecessors()
         match len(predecessors):
+            case 0 :
+                return {}
             case 1:
                 # One source operand, one constant
                 return {"W": self.node_id, "I": predecessors[0]}
@@ -64,6 +66,13 @@ class OnnxComputeOperatorParser(OnnxOperatorParser, metaclass=ABCMeta):
         intermediate_output_precision = self.get_intermediate_output_precision()
         predecessors = self.get_node_predecessors()
         match len(predecessors):
+            case 0 :
+                return {
+                    "W": weight_precision,
+                    "I": weight_precision,
+                    "O_final": act_precision,
+                    "O": intermediate_output_precision,
+                }
             case 1:
                 # One source operand, one constant
                 return {

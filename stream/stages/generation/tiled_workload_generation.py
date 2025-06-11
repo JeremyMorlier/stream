@@ -146,13 +146,13 @@ class TiledWorkloadGenerationStage(Stage):
 
             # Now we have all ComputationNode successors
             for successor in successors:
-                intermediates = G.shortest_path(node, successor)[1:-1]
+                intermediates = get_non_compute_shortest_path(G, node, successor)
+                if intermediates is None:
+                    raise ValueError(
+                        "No valid Path found between two ComputationNodes. "
+                    )
                 complex_pair = False
-                for intermediate in intermediates:
-                    if isinstance(intermediate, ComputationNode):
-                        raise ValueError(
-                            "Intermediate node between two ComputationNodes should not be a ComputationNode."
-                        )
+                for intermediate in intermediates[1:-1]:
                     if not isinstance(intermediate, DummyNode):
                         complex_pair = True
                 pairs.append((node, successor, complex_pair))
@@ -874,6 +874,55 @@ class TiledWorkloadGenerationStage(Stage):
             split_factors[node] = split_factor
         return split_factors
 
+# Function that find the shortest path between nodes that does not have ComputationNodes in between.  
+def get_non_compute_shortest_path(G: DNNWorkloadStream, producer: ComputationNode, consumer: ComputationNode) -> list[Node]:
+    """
+    Perform BFS recursively to find the shortest path between two nodes in a graph,
+    ensuring the path does not contain any ComputationNode as intermediate nodes.
+
+    Args:
+        G (DNNWorkloadStream): The graph to search.
+        producer (ComputationNode): The starting node.
+        consumer (ComputationNode): The target node.
+
+    Returns:
+        list[Node]: The shortest path from producer to consumer without ComputationNode intermediates.
+    """
+    def bfs_recursive(queue, visited):
+        # Base case: if the queue is empty, return None (no path found)
+        if not queue:
+            return None
+
+        # Dequeue the first element
+        current_node, path = queue.pop(0)
+        # If we reach the consumer node, return the path
+        if current_node == consumer:
+            return path
+
+        # Mark the current node as visited
+        visited.add(current_node)
+
+        # Explore neighbors
+        for neighbor in G.neighbors(current_node):
+            # If we reach the consumer node, return the path
+            if neighbor == consumer:
+                return path + [neighbor]
+            # Skip visited nodes and ComputationNodes
+            if neighbor in visited or isinstance(neighbor, ComputationNode):
+                continue
+            
+            # Add the neighbor to the queue with the updated path
+            queue.append((neighbor, path + [neighbor]))
+
+        # Recursive call with the updated queue and visited set
+        return bfs_recursive(queue, visited)
+
+    # Initialize the queue and visited set
+    queue = [(producer, [producer])]
+    visited = set()
+
+    # Start the recursive BFS
+    return bfs_recursive(queue, visited)
 
 def deduce_tensor_reuse_factors(
     original_node: ComputationNode, outer_temporal_loops: list[TemporalLoop]

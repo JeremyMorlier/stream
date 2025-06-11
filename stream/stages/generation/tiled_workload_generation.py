@@ -22,6 +22,7 @@ from stream.workload.dependency_propagation.dummy_node import DummyNode
 from stream.workload.dependency_propagation.elementwise_node import ElementwiseNode
 from stream.workload.dependency_propagation.flatten_node import FlattenNode
 from stream.workload.dependency_propagation.gather_node import GatherNode
+from stream.workload.dependency_propagation.pad_node import PadNode
 from stream.workload.dependency_propagation.lpnormalization_node import LpNormalizationNode
 from stream.workload.dependency_propagation.reshape_node import ReshapeNode
 from stream.workload.dependency_propagation.transpose_node import TransposeNode
@@ -691,6 +692,8 @@ class TiledWorkloadGenerationStage(Stage):
                 return node.gather_operand_tensor(input_tensor)
             case ConcatNode():
                 return node.concat(input_tensor)
+            case PadNode():
+                return node.pad(input_tensor)
             case DummyNode():
                 return input_tensor
             case _:

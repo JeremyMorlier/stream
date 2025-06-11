@@ -25,12 +25,17 @@ from stream.parser.onnx.softmaxcrossentropygrad import SoftmaxCrossEntropyGradPa
 from stream.parser.onnx.convtranspose import ConvTransposeParser
 from stream.parser.onnx.reducesum import ReduceSumParser
 from stream.parser.onnx.InPlaceAccumulator import InPlaceAccumulatorParser
+from stream.parser.onnx.relugrad import ReLUGradParser
+from stream.parser.onnx.pad import PadParser
+from stream.parser.onnx.pool_grad import AveragePoolGradParser
 from stream.utils import get_onnx_input_shapes, has_asymmetric_input_data
 from stream.workload.mapping import InterCoreMappingAttributes
 from stream.workload.onnx_workload import ONNXWorkload
 
+import matplotlib.pyplot as plt
+import networkx as nx
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)
 
 class ONNXModelParser:
     """Parse the ONNX model into a workload."""
@@ -62,6 +67,9 @@ class ONNXModelParser:
         "ConvTranspose": ConvTransposeParser,
         "ReduceSum" :ReduceSumParser,
         "InPlaceAccumulatorV2": InPlaceAccumulatorParser,
+        "ReluGrad": ReLUGradParser,
+        "Pad": PadParser,
+        "AveragePoolGrad" : AveragePoolGradParser,
         # "ConvGrad": ConvGradParser,
     }
 
@@ -142,8 +150,10 @@ class ONNXModelParser:
                 accelerator=self.accelerator,
             )
 
-            logger.info("Parsed %s node %s.", node.op_type, node.name)
+            # logger.info("Parsed %s node %s.", node.op_type, node.name)
             for node_obj in parser.run():
+                # print(node_id)
+                logger.info("Parsed %s node %s. id %s", node.op_type, node.name, node_id)
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)
                 node_id += 1
@@ -155,5 +165,23 @@ class ONNXModelParser:
             workload.number_of_nodes(),
             workload.number_of_edges(),  # type: ignore
         )
+
+        # Plot the workload graph
+        plt.figure(figsize=(10, 10))
+        pos =  nx.circular_layout(workload)
+        # pos =  nx.nx_agraph.graphviz_layout(workload, prog='dot')
+        plt.title("ONNX Workload Graph")
+        plt.axis("off")
+        nx.draw(
+            workload,
+            pos,
+            with_labels=True,
+            node_size=10,
+            node_color="lightblue",
+            font_size=10,
+            font_color="black",
+            font_weight="bold",
+        )
+        plt.savefig("onnx_workload_graph.png", format="png")
 
         return workload

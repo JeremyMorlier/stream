@@ -53,7 +53,8 @@ class ComputationNode(LayerNode, Node):
         "reduce":[LayerDim("K")],
         "reducesum":[LayerDim("K")],
         "convtranspose":[LayerDim("IY"), LayerDim("IX")],
-        "accumulate": [LayerDim("K")]
+        "accumulate": [LayerDim("K")],
+        "averagepoolgrad": [LayerDim("IY")],
     }  # TODO default to "K" ?
 
     def __init__(

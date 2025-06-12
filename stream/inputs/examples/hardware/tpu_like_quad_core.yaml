@@ -1,13 +1,13 @@
 name: tpu_like_quad_core
 
 cores:
-  0: ./cores/tpu_like.yaml
-  1: ./cores/tpu_like.yaml
-  2: ./cores/tpu_like.yaml
-  3: ./cores/tpu_like.yaml
-  4: ./cores/pooling.yaml
-  5: ./cores/simd.yaml
-offchip_core: ./cores/offchip.yaml
+  0: tpu_like.yaml
+  1: tpu_like.yaml
+  2: tpu_like.yaml
+  3: tpu_like.yaml
+  4: pooling.yaml
+  5: simd.yaml
+offchip_core: offchip.yaml
 
 core_connectivity:
   # 2D mesh

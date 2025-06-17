@@ -22,7 +22,7 @@ class AsymmetricSimdParser(OnnxComputeOperatorParser):
             input_shape: the non-batched input shape
             output_shape: the batched output shape, equal to the batched input shape
         """
-        if not (len(output_shape) == 3 and len(input_shape) == 2):
+        if  len(output_shape) not in [2, 3, 4] and len(input_shape) in [1, 2, 3]:
             raise NotImplementedError
 
         data: dict[str, Any] = {}
@@ -34,8 +34,27 @@ class AsymmetricSimdParser(OnnxComputeOperatorParser):
         data["dimension_relations"] = []
         data["loop_sizes"] = output_shape
 
-        data["equation"] = "O[b][d][k]+=I[b][d][k]*W[d][k]"
-        data["loop_dims"] = ["B", "D", "k"]
+        # TODO: generalize the loop dims and equation generation
+        match len(output_shape):
+            case 2:
+                data["loop_dims"] = ["D", "K"]
+                data["equation"] = "O[d][k]+=I[d][k]*W[k]"
+            case 3:
+                data["loop_dims"] = ["B", "D", "K"]
+                match len(input_shape):
+                    case 1:
+                        data["equation"] = "O[b][d][k]+=I[b][d][k]*W[k]"
+                    case 2:
+                        data["equation"] = "O[b][d][k]+=I[b][d][k]*W[d][k]"
+            case 4:
+                data["loop_dims"] = ["B", "H", "D", "H"]
+                match len(input_shape):
+                    case 1:
+                        data["equation"] = "O[b][h][d][k]+=I[b][h][d][k]*W[k]"
+                    case 2:
+                        data["equation"] = "O[b][h][d][k]+=I[b][h][d][k]*W[d][k]"
+                    case 3:
+                        data["equation"] = "O[b][h][d][k]+=I[b][h][d][k]*W[h][d][k]"
 
         return data
 

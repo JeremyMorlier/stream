@@ -15,7 +15,7 @@ _logging.basicConfig(format=_logging_format)
 ############################################INPUTS############################################
 accelerator = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"
 workload_path = "stream/inputs/examples/workload/resnet18.onnx"
-mapping_path = "stream/inputs/examples/mapping/tpu_like_quad_core.yaml"
+mapping_path = "stream/inputs/examples/mapping/tpu_like_quad_core_ga.yaml"
 mode = "fused"
 layer_stacks = [tuple(range(0, 11)), tuple(range(11, 22))] + list((i,) for i in range(22, 49))
 nb_ga_generations = 4

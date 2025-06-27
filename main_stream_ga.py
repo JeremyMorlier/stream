@@ -9,9 +9,8 @@ from stream.visualization.schedule import (
     visualize_timeline_plotly,
 )
 
-_logging_level = _logging.INFO
 _logging_format = "%(asctime)s - %(name)s.%(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
-_logging.basicConfig(level=_logging_level, format=_logging_format)
+_logging.basicConfig(format=_logging_format)
 
 ############################################INPUTS############################################
 accelerator = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"

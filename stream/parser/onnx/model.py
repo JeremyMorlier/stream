@@ -35,7 +35,6 @@ from stream.workload.onnx_workload import ONNXWorkload
 import matplotlib.pyplot as plt
 import networkx as nx
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 class ONNXModelParser:
     """Parse the ONNX model into a workload."""
@@ -182,6 +181,6 @@ class ONNXModelParser:
             font_color="black",
             font_weight="bold",
         )
-        plt.savefig("onnx_workload_graph.png", format="png")
+        plt.savefig("onnx_workload_graph.svg", format="svg")
 
         return workload

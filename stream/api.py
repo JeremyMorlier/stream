@@ -20,9 +20,8 @@ from stream.stages.parsing.onnx_model_parser import ONNXModelParserStage as Stre
 from stream.stages.set_fixed_allocation_performance import SetFixedAllocationPerformanceStage
 from stream.stages.stage import MainStage
 
-_logging_level = _logging.INFO
 _logging_format = "%(asctime)s - %(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
-_logging.basicConfig(level=_logging_level, format=_logging_format)
+_logging.basicConfig(format=_logging_format)
 
 
 def _sanity_check_inputs(

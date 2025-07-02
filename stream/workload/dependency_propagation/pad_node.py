@@ -1,11 +1,10 @@
 from zigzag.datatypes import Constants
-from zigzag.workload.layer_node_abc import LayerNodeABC
 
 from stream.node_tensor import NodeTensor
+from stream.workload.dependency_propagation.propagation_node import PropagationNode
 from stream.workload.node import Node
 
-
-class PadNode(Node, LayerNodeABC):
+class PadNode(PropagationNode):
     """Class that represents an onnx Reshape node."""
 
     def __init__(
@@ -15,6 +14,7 @@ class PadNode(Node, LayerNodeABC):
         predecessor: int,
         padding: tuple[int, ...],
         allow_zero: bool = False,
+        input_names: list[str] = [],
     ) -> None:
         """Initialize the PadNode
 
@@ -23,17 +23,8 @@ class PadNode(Node, LayerNodeABC):
             padding: Padding to add to the input tensor
             allow_zero: wether the output shape can be 0 at some dimensions. Iff True, shape `[2,0,3]` becomes `[2,3]`
         """
-        Node.__init__(
-            self,
-            node_id=node_id,
-            node_name=node_name,
-            type="pad",
-            onchip_energy=0,
-            offchip_energy=0,
-            runtime=0,
-            possible_core_allocation=[-1],
-        )
-        LayerNodeABC.__init__(self, node_id=node_id, node_name=node_name)
+        op_type = "pad"
+        super().__init__(node_id, node_name, op_type, input_names)
 
         self.allow_zero = allow_zero
         self.padding = padding
@@ -42,6 +33,17 @@ class PadNode(Node, LayerNodeABC):
         else :
             self.input_operand_source = {Constants.LAYER_OP_I: predecessor[0]}
 
-    def pad(self, tensor: NodeTensor):
-        """Pad the tensor back to the representation needed for producer/consumer."""
-        return tensor.pad(self.padding)
+    def propagate(
+        self,
+        tensor: NodeTensor,
+        previous_node: Node | None = None,
+        next_node: Node | None = None,
+        relevant_axes: list[bool] = [],
+    ) -> tuple[NodeTensor, list[bool]]:
+        """Perform gather operation on the tensor."""
+
+        for axis in range(0, len(self.padding) // 2) :
+            if self.padding[2*axis] != 0 or self.padding[2*axis + 1] != 0:
+                relevant_axes[axis] = True
+
+        return tensor.pad(self.padding), relevant_axes

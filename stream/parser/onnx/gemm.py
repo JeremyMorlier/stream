@@ -31,11 +31,10 @@ class GemmParser(OnnxComputeOperatorParser):
 
         logger.info("%s node name %s input shape %s output shape", self.node.name, input_shape, output_shape)
         # From the ONNX node
-        node_data = self.get_layer_node_user_format(input_shape, output_shape)
+        mapping = self.get_mapping_this_node()
+        node_data = self.get_layer_node_user_format(input_shape, output_shape, mapping)
         node_factory = LayerNodeFactory(node_data, mapping_data=[])
         node_attrs = node_factory.create_node_attr()
-
-        mapping = self.get_mapping_this_node()
 
         return ComputationNode(
             node_id=self.node_id,

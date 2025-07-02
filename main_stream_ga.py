@@ -10,7 +10,7 @@ from stream.visualization.schedule import (
 )
 
 _logging_format = "%(asctime)s - %(name)s.%(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
-_logging.basicConfig(format=_logging_format)
+_logging.basicConfig(level=_logging.INFO, format=_logging_format)
 
 ############################################INPUTS############################################
 accelerator = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"

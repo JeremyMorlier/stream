@@ -10,7 +10,8 @@ class InPlaceAccumulatorParser(SimdParser) :
         accumulator_shape, grad_shape = InPlaceAccumulator_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
     
         # From the ONNX node
-        node_data = self.get_layer_node_user_format(grad_shape, accumulator_shape)
+        mapping = self.get_mapping_this_node()
+        node_data = self.get_layer_node_user_format(grad_shape, accumulator_shape, mapping)
         node_factory = LayerNodeFactory(node_data, mapping_data=[])
         node_attrs = node_factory.create_node_attr()
 

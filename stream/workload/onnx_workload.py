@@ -48,7 +48,7 @@ class ONNXWorkload(DiGraphWrapper[Node]):
         while valid_paths:
             valid_path = valid_paths.pop(0)
             next_nodes = list(self.successors(valid_path[-1]))
-
+            print([(node.id, type(node)) for node in next_nodes], start.id, end.id, only_intermediate_type)
             for next_node in next_nodes:
                 if isinstance(next_node, only_intermediate_type):
                     valid_paths.append(valid_path + [next_node])

@@ -125,6 +125,7 @@ class TiledWorkloadGenerationStage(Stage):
         # For each node get all the tiles and the edges between them
         all_tiles: list[ComputationNode] = []
         all_edges: list[tuple[ComputationNode, ComputationNode, dict[str, int]]] = []
+        # print([type(node) for node in self.workload.topological_sort()])
         for node in self.workload.topological_sort():
             # If other node types shouldn't be included in tiled workload graph, add here
             if not isinstance(node, ComputationNode):
@@ -153,7 +154,7 @@ class TiledWorkloadGenerationStage(Stage):
             # Get all pairs of nodes that we have to extract inter edges for
             all_pairs = self.get_all_node_pairs(self.workload)
             for producer, consumer, is_complex in all_pairs:
-
+                # print(producer.type, producer.id, consumer.type, consumer.id, is_complex)
                 if is_complex:
                     inter_edges = self.get_inter_edges_numpy(producer, consumer)
                 else:
@@ -893,6 +894,7 @@ class TiledWorkloadGenerationStage(Stage):
         """
         inter_edges: set[tuple[ComputationNode, ComputationNode]] = []
         dims = final_node.operand_dimensionality_order[op]
+        print("error1", len(dims), len(relevant_axes))
         assert len(dims) == len(relevant_axes)
         for consumer_tile in self.tiles_dict[final_node]:
             relevant_loop_ranges = [consumer_tile.loop_ranges[dim] for dim in dims]
@@ -1072,6 +1074,11 @@ class TiledWorkloadGenerationStage(Stage):
                     raise ValueError("Something went wrong.")
             split_factors[node] = split_factor
         return split_factors
+    
+    def load_cached_tiled_workload(self) -> ComputationNodeWorkload | None:
+        if os.path.exists(self.tiled_workload_path):
+            return pickle_load(self.tiled_workload_path)
+        return None
 
 # Function that find the shortest path between nodes that does not have ComputationNodes in between.  
 def get_non_compute_shortest_path(G: DNNWorkloadStream, producer: ComputationNode, consumer: ComputationNode) -> list[Node]:
@@ -1122,59 +1129,3 @@ def get_non_compute_shortest_path(G: DNNWorkloadStream, producer: ComputationNod
 
     # Start the recursive BFS
     return bfs_recursive(queue, visited)
-
-def deduce_tensor_reuse_factors(
-    original_node: ComputationNode, outer_temporal_loops: list[TemporalLoop]
-) -> dict[LayerOperand, list[int]]:
-    """This function is used to generate a list of inter-CN data reuse factor for each CN's constant operand, like W,
-      based on the outer-CN loops and the r, ir relations.
-
-    Args:
-        original_node (ComputationNode): the original layer node before tilling
-        outer_temporal_loops (list[TemporalLoop]): the outer CN temporal loops
-
-    Returns:
-        data_reuse_factor (dict[list[int]]): a list of data reuse factor (base priority) for constant operands of each
-        CN
-    """
-
-    # If there is no loop in the r_ir_loop, meaning that there is no outer-CN loop -> layer-by-layer
-    if not outer_temporal_loops:
-        return {}
-
-    if not original_node.constant_operands:
-        return {}
-
-    # Transfer the outer_temporal_loops to r_ir_loop.
-    #  An example can be r_ir_loop = {'W': [('ir', 3), ('r', 2), ('ir', 3)]}.
-    r_ir_LUT = original_node.loop_relevancy_info
-    constant_operands = original_node.constant_operands
-    r_ir_loop: dict[LayerOperand, list[tuple[str, int]]] = {}
-    for constant_operand in constant_operands:
-        r_ir_loop[constant_operand] = []
-        for loop in outer_temporal_loops:
-            if loop.dimension in r_ir_LUT.get_ir_layer_dims(constant_operand):
-                r_ir_loop[constant_operand].append(("ir", loop.size))
-            else:
-                r_ir_loop[constant_operand].append(("r", loop.size))
-
-    # total_reuse_factor is the upper bound of the reuse factor that current layer CNs can reach
-    total_reuse_factors = {
-        op: prod([reuse_factor for (loop_type, reuse_factor) in r_ir_loop[op] if loop_type == "ir"])
-        for op in r_ir_loop.keys()
-    }
-
-    # total number of nodes that will be generated
-    nb_nodes = prod([tl.size for tl in outer_temporal_loops])
-
-    # tensor reuse factor will be set to the total reuse factor for each node
-    # whenveer a cn will be scheduled, the tensor reuse factor will decrease
-    tensor_reuse_factors: dict[LayerOperand, list[int]] = {}
-    for op, total_reuse_factor in total_reuse_factors.items():
-        tensor_reuse_factors[op] = [total_reuse_factor] * nb_nodes
-
-    return tensor_reuse_factors
-    def load_cached_tiled_workload(self) -> ComputationNodeWorkload | None:
-        if os.path.exists(self.tiled_workload_path):
-            return pickle_load(self.tiled_workload_path)
-        return None

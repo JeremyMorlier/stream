@@ -33,12 +33,11 @@ from stream.parser.onnx.InPlaceAccumulator import InPlaceAccumulatorParser
 from stream.parser.onnx.relugrad import ReLUGradParser
 from stream.parser.onnx.pad import PadParser
 from stream.parser.onnx.pool_grad import AveragePoolGradParser
-from stream.utils import get_onnx_input_shapes, has_asymmetric_input_data
 from stream.workload.mapping import InterCoreMappingAttributes
 from stream.workload.onnx_workload import ONNXWorkload
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)  # Set the logging level to INFO
 class ONNXModelParser:
     """Parse the ONNX model into a workload."""
 
@@ -85,7 +84,6 @@ class ONNXModelParser:
         "ReluGrad": ReLUGradParser,
         "Pad": PadParser,
         "AveragePoolGrad" : AveragePoolGradParser,
-        # "ConvGrad": ConvGradParser,
         "Split": SplitParser,
         "Slice": SliceParser,
     }
@@ -157,7 +155,6 @@ class ONNXModelParser:
                 accelerator=self.accelerator,
             )
 
-            logger.info("Parsed %s node %s.", node.op_type, node.name)
             id_of_first_node = node_id
             for node_obj in parser.run():
                 # print(node_id)

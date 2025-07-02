@@ -29,7 +29,7 @@ class ReduceSumParser(OnnxComputeOperatorParser) :
         data["name"] = self.node.name
         data["operator_type"] = self.node.op_type
         data["operand_source"] = self.get_operand_source_input_format()
-        data["operand_precision"] = self.get_operand_precision_input_format()
+        data["operand_precision"] = self.get_operand_precision_user_format()
         data["dimension_relations"] = []
         data["loop_sizes"] = input_shape
 
@@ -61,6 +61,7 @@ class ReduceSumParser(OnnxComputeOperatorParser) :
             case _:
                 raise NotImplementedError
         return data
+    
     def generate_node(self):
         # Get the input and output activation shapes
         data_shape, axes_shape, output_shape = get_reduce_sum_input_dimension_shapes(self.node, self.onnx_model)

@@ -21,7 +21,7 @@ from stream.stages.set_fixed_allocation_performance import SetFixedAllocationPer
 from stream.stages.stage import MainStage
 
 _logging_format = "%(asctime)s - %(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
-_logging.basicConfig(format=_logging_format)
+_logging.basicConfig(level=_logging.INFO, format=_logging_format)
 
 
 def _sanity_check_inputs(

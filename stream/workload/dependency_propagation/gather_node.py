@@ -15,7 +15,7 @@ class GatherNode(PropagationNode):
         predecessors: list[int],
         gather_axis: int,
         gather_indices: int | list[int],
-        input_names: list[str] = [],
+        input_names: list[str] | None = None,
     ) -> None:
         """Initialize the GatherNode
 
@@ -24,6 +24,8 @@ class GatherNode(PropagationNode):
             gather_axis: Which axis to gather on.
             gather_indices: Indices of elements to be gathered.
         """
+        if input_names is None:
+            input_names = []
         op_type = "gather"
         super().__init__(node_id, node_name, op_type, input_names)
 
@@ -45,7 +47,7 @@ class GatherNode(PropagationNode):
         tensor: NodeTensor,
         previous_node: Node | None = None,
         next_node: Node | None = None,
-        relevant_axes: list[bool] = [],
+        relevant_axes: list[bool] | None = None,
     ) -> tuple[NodeTensor, list[bool]]:
         """Perform gather operation on the tensor."""
         # print(self.gather_axis, len(relevant_axes))

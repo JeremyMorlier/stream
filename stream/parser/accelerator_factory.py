@@ -1,6 +1,5 @@
 from typing import Any
 
-from zigzag.datatypes import Constants
 from zigzag.hardware.architecture.memory_level import MemoryLevel
 from zigzag.parser.accelerator_factory import AcceleratorFactory as ZigZagCoreFactory
 
@@ -35,15 +34,10 @@ class AcceleratorFactory:
                 "both yaml files, including the memory instance name."
             )
 
-        # Create offchip core
-        if "offchip_core" not in self.data:
-            offchip_core_id = None
-            offchip_core = None
-        else:
-            offchip_core_id = max(self.data["cores"]) + 1
-            offchip_core = self.create_core(self.data["offchip_core"], offchip_core_id)
+        # Save offchip core id if it exists
+        offchip_core_id = self.data.get("offchip_core_id", None)
 
-        cores_graph = self.create_core_graph(cores, offchip_core)
+        cores_graph = self.create_core_graph(cores)
         nb_shared_mem_groups = len(unique_shared_mem_group_ids)
 
         # Take next available core id
@@ -59,6 +53,7 @@ class AcceleratorFactory:
         core = core_factory.create(core_id, shared_mem_group_id=shared_mem_group_id)
         # Typecast
         core = Core.from_zigzag_core(core)
+        core.type = core_data.get("type", "compute")  # Default type is 'compute'
         return core
 
     def get_shared_mem_group_id(self, core_id: int):
@@ -99,82 +94,56 @@ class AcceleratorFactory:
         top_instances_b = [level.memory_instance for level in top_levels_b]
         if len(top_instances_a) != len(top_instances_b):
             return True
-        for instance_a, instance_b in zip(top_instances_a, top_instances_b):
+        for instance_a, instance_b in zip(top_instances_a, top_instances_b, strict=False):
             if frozenset(instance_a.__dict__.values()) != frozenset(instance_b.__dict__.values()):
                 return True
         return False
 
-    def create_core_graph(self, cores: list[Core], offchip_core: Core | None):
+    def create_core_graph(self, cores: list[Core]):
         assert all(core.id == i for i, core in enumerate(cores))
-        bandwidth = self.data["bandwidth"]
-        unit_energy_cost = self.data["unit_energy_cost"]
-        connections: list[tuple[int, ...]] = self.data["core_connectivity"]
         edges: list[tuple[Core, Core, dict[str, CommunicationLink]]] = []
         current_bus_id = 0
+        core_connectivity: list[dict[str, Any]] = self.data["core_connectivity"]
+        default_unit_energy_cost = self.data.get("unit_energy_cost", 0)
 
         # All links between cores
-        for connection in connections:
-            connected_cores = [cores[core_id] for core_id in connection]
-
-            if len(connection) == 2:
-                core_a, core_b = connected_cores
+        for connection in core_connectivity:
+            connection_type = connection.get("type", "link")
+            bw = connection["bandwidth"]
+            uec = connection.get("unit_energy_cost", default_unit_energy_cost)
+            core_objs = [cores[cid] for cid in connection["cores"]]
+            CONNECTION_LENGTH_FOR_ONE_TO_ONE = 2
+            if connection_type == "link":
+                if len(core_objs) != CONNECTION_LENGTH_FOR_ONE_TO_ONE:
+                    raise ValueError(
+                        f"Invalid connection type '{connection_type}' for connection {core_objs}. "
+                        f"Expected exactly {CONNECTION_LENGTH_FOR_ONE_TO_ONE} cores for a link."
+                    )
+                core_a, core_b = core_objs
                 edges += get_bidirectional_edges(
                     core_a,
                     core_b,
-                    bandwidth=bandwidth,
-                    unit_energy_cost=unit_energy_cost,
-                    link_type="link",
+                    bandwidth=bw,
+                    unit_energy_cost=uec,
+                    link_type=connection_type,
                 )
-            else:
+            elif connection_type == "bus":
                 # Connect cores to bus, edge by edge
                 # Make sure all links refer to the same `CommunicationLink` instance
-                bus_instance = CommunicationLink("Any", "Any", bandwidth, unit_energy_cost, bus_id=current_bus_id)
+                bus_instance = CommunicationLink("Any", "Any", bw, uec, bus_id=current_bus_id)
                 current_bus_id += 1
-                pairs_this_connection = [
-                    (a, b) for idx, a in enumerate(connected_cores) for b in connected_cores[idx + 1 :]
-                ]
+                pairs_this_connection = [(a, b) for idx, a in enumerate(core_objs) for b in core_objs[idx + 1 :]]
                 for core_a, core_b in pairs_this_connection:
                     edges += get_bidirectional_edges(
                         core_a,
                         core_b,
-                        bandwidth=bandwidth,
-                        unit_energy_cost=unit_energy_cost,
+                        bandwidth=bw,
+                        unit_energy_cost=uec,
                         link_type="bus",
                         bus_instance=bus_instance,
                     )
-
-        # All links between cores and offchip core
-        if offchip_core is not None:
-            edges += self.get_edges_to_offchip_core(cores, offchip_core)
+            else:
+                raise ValueError(
+                    f"Invalid connection type '{connection_type}' for connection {core_objs}. Expected 'link' or 'bus'."
+                )
         return CoreGraph(edges)
-
-    def get_edges_to_offchip_core(self, cores: list[Core], offchip_core: Core):
-        edges: list[tuple[Core, Core, dict[str, CommunicationLink]]] = []
-
-        unit_energy_cost = self.data["unit_energy_cost"]
-
-        offchip_read_bandwidth = offchip_core.mem_r_bw_dict[Constants.OUTPUT_MEM_OP][0]
-        offchip_write_bandwidth = offchip_core.mem_w_bw_dict[Constants.OUTPUT_MEM_OP][0]
-
-        # if the offchip core has only one port
-        if len(offchip_core.mem_hierarchy_dict[Constants.OUTPUT_MEM_OP][0].port_list) == 1:
-            to_offchip_link = CommunicationLink(
-                offchip_core,
-                "Any",
-                offchip_write_bandwidth,
-                unit_energy_cost,
-                bidirectional=True,
-            )
-            from_offchip_link = to_offchip_link
-
-        # if the offchip core has more than one port
-        else:
-            to_offchip_link = CommunicationLink("Any", offchip_core, offchip_write_bandwidth, unit_energy_cost)
-            from_offchip_link = CommunicationLink(offchip_core, "Any", offchip_read_bandwidth, unit_energy_cost)
-
-        # Create edge for each core
-        for core in cores:
-            edges.append((core, offchip_core, {"cl": to_offchip_link}))
-            edges.append((offchip_core, core, {"cl": from_offchip_link}))
-
-        return edges

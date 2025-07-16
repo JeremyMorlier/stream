@@ -123,7 +123,6 @@ class TiledWorkloadGenerationStage(Stage):
         # For each node get all the tiles and the edges between them
         all_tiles: list[ComputationNode] = []
         all_edges: list[tuple[ComputationNode, ComputationNode, dict[str, int]]] = []
-        # print([type(node) for node in self.workload.topological_sort()])
         for node in self.workload.topological_sort():
             # If other node types shouldn't be included in tiled workload graph, add here
             if not isinstance(node, ComputationNode):
@@ -151,7 +150,6 @@ class TiledWorkloadGenerationStage(Stage):
             # Get all pairs of nodes that we have to extract inter edges for
             all_pairs = self.get_all_node_pairs(self.workload)
             for producer, consumer, is_complex in all_pairs:
-                # print(producer.type, producer.id, consumer.type, consumer.id, is_complex)
                 if is_complex:
                     inter_edges = self.get_inter_edges_numpy(producer, consumer)
                 else:
@@ -220,11 +218,9 @@ class TiledWorkloadGenerationStage(Stage):
 
             # Now we have all ComputationNode successors
             for successor in successors:
-                intermediates = get_non_compute_shortest_path(G, node, successor)
+                intermediates = get_non_compute_shortest_path(g, node, successor)
                 if intermediates is None:
-                    raise ValueError(
-                        "No valid Path found between two ComputationNodes. "
-                    )
+                    raise ValueError("No valid Path found between two ComputationNodes. ")
                 complex_pair = False
                 for intermediate in intermediates[1:-1]:
                     if not isinstance(intermediate, DummyNode):
@@ -888,7 +884,7 @@ class TiledWorkloadGenerationStage(Stage):
         """
         inter_edges: set[tuple[ComputationNode, ComputationNode]] = set()
         dims = final_node.operand_dimensionality_order[op]
-        print("error1", len(dims), len(relevant_axes))
+
         assert len(dims) == len(relevant_axes)
         for consumer_tile in self.tiles_dict[final_node]:
             relevant_loop_ranges = [consumer_tile.loop_ranges[dim] for dim in dims]
@@ -1071,14 +1067,17 @@ class TiledWorkloadGenerationStage(Stage):
                     raise ValueError("Something went wrong.")
             split_factors[node] = split_factor
         return split_factors
-    
+
     def load_cached_tiled_workload(self) -> ComputationNodeWorkload | None:
         if os.path.exists(self.tiled_workload_path):
             return pickle_load(self.tiled_workload_path)
         return None
 
-# Function that find the shortest path between nodes that does not have ComputationNodes in between.  
-def get_non_compute_shortest_path(G: DNNWorkloadStream, producer: ComputationNode, consumer: ComputationNode) -> list[Node]:
+
+# Function that find the shortest path between nodes that does not have ComputationNodes in between.
+def get_non_compute_shortest_path(
+    G: DNNWorkloadStream, producer: ComputationNode, consumer: ComputationNode
+) -> list[Node]:
     """
     Perform BFS recursively to find the shortest path between two nodes in a graph,
     ensuring the path does not contain any ComputationNode as intermediate nodes.
@@ -1091,6 +1090,7 @@ def get_non_compute_shortest_path(G: DNNWorkloadStream, producer: ComputationNod
     Returns:
         list[Node]: The shortest path from producer to consumer without ComputationNode intermediates.
     """
+
     def bfs_recursive(queue, visited):
         # Base case: if the queue is empty, return None (no path found)
         if not queue:
@@ -1113,7 +1113,7 @@ def get_non_compute_shortest_path(G: DNNWorkloadStream, producer: ComputationNod
             # Skip visited nodes and ComputationNodes
             if neighbor in visited or isinstance(neighbor, ComputationNode):
                 continue
-            
+
             # Add the neighbor to the queue with the updated path
             queue.append((neighbor, path + [neighbor]))
 

@@ -22,7 +22,7 @@ classifiers = [
 ]
 keywords = ["stream", "multi-core", "accelerator", "layer-fused", "scheduling", "zigzag", "dse", "design-space-exploration", "machine-learning", "deep-learning", "mapping"]
 dependencies = [
-    'zigzag-dse',
+    'zigzag-dse>=3.8.2',
     'rtree',
     'deap',
     'brokenaxes',

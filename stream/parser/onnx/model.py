@@ -38,6 +38,8 @@ from stream.workload.onnx_workload import ONNXWorkload
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Set the logging level to INFO
+
+
 class ONNXModelParser:
     """Parse the ONNX model into a workload."""
 
@@ -76,14 +78,14 @@ class ONNXModelParser:
         "Reshape": ReshapeParser,
         "Flatten": FlattenParser,
         "Concat": ConcatParser,
-        "SoftmaxCrossEntropyLoss" : SoftmaxCrossEntropyParser,
+        "SoftmaxCrossEntropyLoss": SoftmaxCrossEntropyParser,
         "SoftmaxCrossEntropyLossGrad": SoftmaxCrossEntropyGradParser,
         "ConvTranspose": ConvTransposeParser,
-        "ReduceSum" :ReduceSumParser,
+        "ReduceSum": ReduceSumParser,
         "InPlaceAccumulatorV2": InPlaceAccumulatorParser,
         "ReluGrad": ReLUGradParser,
         "Pad": PadParser,
-        "AveragePoolGrad" : AveragePoolGradParser,
+        "AveragePoolGrad": AveragePoolGradParser,
         "Split": SplitParser,
         "Slice": SliceParser,
     }
@@ -157,7 +159,6 @@ class ONNXModelParser:
 
             id_of_first_node = node_id
             for node_obj in parser.run():
-                # print(node_id)
                 logger.info("Parsed %s node %s. id %s", node.op_type, node.name, node_id)
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)

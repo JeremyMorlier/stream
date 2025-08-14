@@ -161,12 +161,10 @@ class NodeTensor(np.ndarray[Any, Any]):
             return np.concat((empty_tensor, self.as_ndarray()), axis=axis).view(NodeTensor)
         else:
             return np.concat((self.as_ndarray(), empty_tensor), axis=axis).view(NodeTensor)
-        
-    def pad(self, padding: list[int]) -> "NodeTensor" :
+
+    def pad(self, padding: list[int]) -> "NodeTensor":
         # We take into account that the last dimension is reserved for nodes, so we must pad the other dimensions
-        padding.append((0, 0))  # No padding for the last dimension
-        return np.pad(self.as_ndarray(), padding).view(NodeTensor)
-    
+        return np.pad(self.as_ndarray(), padding + [(0, 0)]).view(NodeTensor)  # No padding for the last dimension
 
     def concat_with_empty_both_sides(
         self, output_shape: tuple[int, ...], axis: int, slice_idx: int, axis_exists_in_input: bool = False

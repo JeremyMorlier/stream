@@ -22,10 +22,10 @@ from stream.utils import contains_wildcard, get_inter_core_tiling_size
 from stream.workload.computation.computation_node import LOOP_RANGES_T, ComputationNode, GeneratedComputationNode
 from stream.workload.dependency_propagation.dummy_node import DummyNode
 from stream.workload.dependency_propagation.propagation_node import PropagationNode
+from stream.workload.dnn_workload import DNNWorkloadStream
 from stream.workload.node import Node
 from stream.workload.onnx_workload import ComputationNodeWorkload, ONNXWorkload
 from stream.workload.tensor import Tensor
-from stream.workload.dnn_workload import DNNWorkloadStream
 
 logger = logging.getLogger(__name__)
 

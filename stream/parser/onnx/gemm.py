@@ -1,11 +1,11 @@
 import logging
-from typing import Generator, Any
+from collections.abc import Generator
+from typing import Any
 
 from zigzag.parser.onnx.utils import (
     get_attribute_ints_with_name,
     get_node_input_output_dimension_shapes,
 )
-
 from zigzag.parser.workload_factory import LayerNodeFactory
 
 from stream.parser.onnx.operator_parser import OnnxComputeOperatorParser
@@ -43,6 +43,7 @@ class GemmParser(OnnxComputeOperatorParser):
             node_attr=node_attrs,
             mapping_attr=mapping,
         )
+
     DEFAULT_LAYER_DIMENSIONS = ["B", "H", "D", "C", "K"]
 
     def get_layer_node_user_format(

@@ -1,20 +1,18 @@
 from typing import Any
 
 from zigzag.datatypes import Constants
-
-from stream.workload.computation.computation_node import ComputationNode
+from zigzag.parser.onnx.utils import get_attribute_ints_with_name, get_onnx_tensor_type
 from zigzag.parser.workload_factory import LayerNodeFactory
-from zigzag.parser.onnx.utils import get_onnx_tensor_type, get_attribute_ints_with_name
-from stream.parser.onnx.operator_parser import OnnxComputeOperatorParser
 
-from stream.parser.onnx.reduce_1d import Reduce1DParser
 from stream.parser.onnx.conv import ConvParser
 from stream.parser.onnx.convtranspose import ConvTransposeParser
-
-from stream.parser.onnx.transpose import TransposeParser
+from stream.parser.onnx.operator_parser import OnnxComputeOperatorParser
+from stream.parser.onnx.reduce_1d import Reduce1DParser
+from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.dependency_propagation.transpose_node import TransposeNode
-class ConvGradParser(OnnxComputeOperatorParser):
 
+
+class ConvGradParser(OnnxComputeOperatorParser):
     NODE_TYPES = ["conv", "conv", "sum", "transpose", "transpose", "transpose"]
 
     def run(self):
@@ -34,13 +32,20 @@ class ConvGradParser(OnnxComputeOperatorParser):
         self.correct_nodes_operand_source()
 
         return self.nodes
-    
+
     def parse_into_subnodes(self):
         """Prase the base ONNX node multiple times into the different Computation Nodes.
         The CNs that result from this operation have some incorrect properties regarding the graph structure
         """
         # parser_classes: list[type] = [Reduce1DParser, SoftmaxExpParser, Reduce1DParser, SoftmaxDivParser, SoftmaxCrossEntropySIMDParser, Reduce1DParser, SoftmaxCrossEntropyReduceParser]
-        parser_classes: list[type] = [ConvGradWeightParser, ConvGradOutputParser, ConvGradBiasParser, TransposeNodeWeightGrad1, TransposeNodeWeightGrad2, TransposeNodeWeightGrad3]
+        parser_classes: list[type] = [
+            ConvGradWeightParser,
+            ConvGradOutputParser,
+            ConvGradBiasParser,
+            TransposeNodeWeightGrad1,
+            TransposeNodeWeightGrad2,
+            TransposeNodeWeightGrad3,
+        ]
         node_ids = [self.node_id + i for i in range(3)]
         parsers: list[OnnxComputeOperatorParser] = [
             parser(
@@ -51,17 +56,17 @@ class ConvGradParser(OnnxComputeOperatorParser):
                 all_mappings=self.all_mappings,
                 accelerator=self.accelerator,
             )
-            for parser, node_id in zip(parser_classes, node_ids)
+            for parser, node_id in zip(parser_classes, node_ids, strict=False)
         ]
         self.nodes = []
-        for parser in parsers :
-            for node in parser.run() :
+        for parser in parsers:
+            for node in parser.run():
                 self.nodes.append(node)
         self.nodes = tuple(self.nodes)
 
     def set_nodes_name_and_type(self):
         """Set the name and operator type of all Computation Nodes that stem from the base ONNX node"""
-        for node, node_type in zip(self.nodes, ConvGradParser.NODE_TYPES):
+        for node, node_type in zip(self.nodes, ConvGradParser.NODE_TYPES, strict=False):
             node.type = node_type
             node.name += f"-{node_type}/"
 
@@ -71,17 +76,21 @@ class ConvGradParser(OnnxComputeOperatorParser):
         op_I = Constants.LAYER_OP_I
         op_W = Constants.LAYER_OP_W
 
-        node_grad_weight, node_grad_output, node_grad_bias, node_transpose1, node_transpose2, node_transpose3 = self.nodes
-        id_grad_weight, id_grad_output, id_grad_bias, id_transpose1, id_transpose2, id_transpose3 = [node.id for node in self.nodes]
+        node_grad_weight, node_grad_output, node_grad_bias, node_transpose1, node_transpose2, node_transpose3 = (
+            self.nodes
+        )
+        id_grad_weight, id_grad_output, id_grad_bias, id_transpose1, id_transpose2, id_transpose3 = [
+            node.id for node in self.nodes
+        ]
         prev_node_id = node_grad_weight.input_operand_source[op_I]
-    
+
         # fix nodes inputs
         node_grad_weight.input_operand_source = {}
         node_grad_output.input_operand_source = {}
         node_grad_bias.input_operand_source = {}
         # node_transpose1.input_operand_source = {op_I:}
         # node_transpose2.input_operand_source = {op_I:}
-        node_transpose3.input_operand_source = {op_I:id_grad_weight}
+        node_transpose3.input_operand_source = {op_I: id_grad_weight}
 
         # node_sfm_max, node_sfm_exp, node_sfm_sum, node_sfm_div, node_log, node_sum, node_reduce = self.nodes
         node_sfm_max, node_sfm_exp, node_sfm_sum, node_sfm_div, node_log = self.nodes
@@ -104,12 +113,13 @@ class ConvGradParser(OnnxComputeOperatorParser):
         # node_sum.constant_operands = []
         # node_reduce.constant_operands = []
 
-class TransposeNodeWeightGrad1(TransposeNode) :
+
+class TransposeNodeWeightGrad1(TransposeNode):
     def generate_node(self):
         predecessors = self.get_node_predecessors()
         predecessor = predecessors.pop()
 
-        permute_axes = [1, 0, 2 , 3]
+        permute_axes = [1, 0, 2, 3]
 
         return TransposeNode(
             node_id=self.node_id,
@@ -118,12 +128,13 @@ class TransposeNodeWeightGrad1(TransposeNode) :
             permute_axes=permute_axes,
         )
 
-class TransposeNodeWeightGrad2(TransposeNode) :
+
+class TransposeNodeWeightGrad2(TransposeNode):
     def generate_node(self):
         predecessors = self.get_node_predecessors()
         predecessor = predecessors.pop()
 
-        permute_axes = [1, 0, 2 , 3]
+        permute_axes = [1, 0, 2, 3]
 
         return TransposeNode(
             node_id=self.node_id,
@@ -131,13 +142,14 @@ class TransposeNodeWeightGrad2(TransposeNode) :
             predecessor=predecessor,
             permute_axes=permute_axes,
         )
-    
-class TransposeNodeWeightGrad3(TransposeNode) :
+
+
+class TransposeNodeWeightGrad3(TransposeNode):
     def generate_node(self):
         predecessors = self.get_node_predecessors()
         predecessor = predecessors.pop()
 
-        permute_axes = [1, 0, 2 , 3]
+        permute_axes = [1, 0, 2, 3]
 
         return TransposeNode(
             node_id=self.node_id,
@@ -145,19 +157,23 @@ class TransposeNodeWeightGrad3(TransposeNode) :
             predecessor=predecessor,
             permute_axes=permute_axes,
         )
-class ConvGradWeightParser(ConvParser) :
+
+
+class ConvGradWeightParser(ConvParser):
     def generate_node(self):
         attrs = self.node.attribute
         # dilations and strides are inverted
         dilations: list[int] = get_attribute_ints_with_name("strides", attrs, default=[1, 1])  # type:ignore
         strides: list[int] = get_attribute_ints_with_name("dilations", attrs, default=[1, 1])  # type:ignore
 
-        #TODO: check for padding and group size difference
+        # TODO: check for padding and group size difference
         group_size: int = get_attribute_ints_with_name("group", attrs, default=1)  # type:ignore
         padding: list[int] = get_attribute_ints_with_name("pads", attrs, default=[0, 0, 0, 0])  # type:ignore
 
         # Get the input and output activation shapes
-        grad_shape, activations_shape, weight_shape, output_grad_shape = convgrad_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        grad_shape, activations_shape, weight_shape, output_grad_shape = (
+            convgrad_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        )
 
         node_data: dict[str, Any] = self.get_layer_node_user_format(
             grad_shape,
@@ -182,7 +198,8 @@ class ConvGradWeightParser(ConvParser) :
             operand_tensor_reshape=None,
         )
 
-class ConvGradOutputParser(ConvTransposeParser) :  
+
+class ConvGradOutputParser(ConvTransposeParser):
     def generate_node(self):
         attrs = self.node.attribute
         kernel_shape: list[int] = get_attribute_ints_with_name("kernel_shape", attrs, default=None)  # type:ignore
@@ -192,7 +209,9 @@ class ConvGradOutputParser(ConvTransposeParser) :
         padding: list[int] = get_attribute_ints_with_name("pads", attrs, default=[0, 0, 0, 0])  # type:ignore
 
         # Get the input and output activation shapes
-        grad_shape, activations_shape, weight_shape, output_grad_shape = convgrad_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        grad_shape, activations_shape, weight_shape, output_grad_shape = (
+            convgrad_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        )
         node_data: dict[str, Any] = self.get_layer_node_user_format(
             kernel_shape,
             strides,
@@ -215,11 +234,14 @@ class ConvGradOutputParser(ConvTransposeParser) :
             op_type=ConvParser.OP_TYPE,
             operand_tensor_reshape=None,
         )
-    
-class ConvGradBiasParser(Reduce1DParser) :
+
+
+class ConvGradBiasParser(Reduce1DParser):
     def generate_node(self):
         # Get the input and output activation shapes
-        grad_shape, activations_shape, weight_shape, output_grad_shape = convgrad_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        grad_shape, activations_shape, weight_shape, output_grad_shape = (
+            convgrad_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        )
 
         # From the ONNX node
         node_data = self.get_layer_node_user_format(grad_shape, None)
@@ -235,8 +257,10 @@ class ConvGradBiasParser(Reduce1DParser) :
             node_attr=node_attrs,
             mapping_attr=mapping,
         )
-def convgrad_get_node_input_output_dimension_shapes(node, model) :
-    # weight_grad and bias_grad may not be known 
+
+
+def convgrad_get_node_input_output_dimension_shapes(node, model):
+    # weight_grad and bias_grad may not be known
 
     grad = node.input[0]
     grad_shape = get_onnx_tensor_type(grad, model).shape

@@ -1,18 +1,14 @@
 from typing import Any
 
-from zigzag.datatypes import Constants
+from zigzag.parser.onnx.utils import get_onnx_tensor_type
+from zigzag.parser.workload_factory import LayerNodeFactory
 
 from stream.parser.onnx.operator_parser import OnnxComputeOperatorParser
-from stream.parser.onnx.reduce_1d import Reduce1DParser
-
-from zigzag.parser.onnx.utils import get_node_input_output_dimension_shapes
-from zigzag.parser.workload_factory import LayerNodeFactory
-from zigzag.parser.onnx.utils import get_onnx_tensor_type
-from stream.workload.computation.computation_node import ComputationNode
 from stream.utils import get_value
+from stream.workload.computation.computation_node import ComputationNode
 
 
-class ReduceSumParser(OnnxComputeOperatorParser) :
+class ReduceSumParser(OnnxComputeOperatorParser):
     """Parses an operator that reduces the data in multiple dimensions.
     e.g. sum over multiple row or max of a single row
     """
@@ -35,18 +31,16 @@ class ReduceSumParser(OnnxComputeOperatorParser) :
 
         match len(input_shape):
             case 2:
-                
                 data["loop_dims"] = ["K", "C"]
                 dims = ["K", "C"]
-                for element in axes: 
+                for element in axes:
                     dims.remove(data["loop_dims"][element])
                 output_indices = "".join(f"[{dim.lower()}]" for dim in dims)
                 data["equation"] = f"O{output_indices}+=I[k][c]*W[]"
             case 3:
-                
                 data["loop_dims"] = ["B", "K", "C"]
                 dims = ["B", "K", "C"]
-                for element in axes: 
+                for element in axes:
                     dims.remove(data["loop_dims"][element])
                 output_indices = "".join(f"[{dim.lower()}]" for dim in dims)
                 data["equation"] = f"O{output_indices}+=I[b][k][c]*W[]"
@@ -54,14 +48,14 @@ class ReduceSumParser(OnnxComputeOperatorParser) :
                 # data["equation"] = "O[h] += I[b][h][k][c] * W[]"
                 data["loop_dims"] = ["B", "H", "K", "C"]
                 dims = ["B", "H", "K", "C"]
-                for element in axes: 
+                for element in axes:
                     dims.remove(data["loop_dims"][element])
                 output_indices = "".join(f"[{dim.lower()}]" for dim in dims)
                 data["equation"] = f"O{output_indices}+=I[b][h][k][c]*W[]"
             case _:
                 raise NotImplementedError
         return data
-    
+
     def generate_node(self):
         # Get the input and output activation shapes
         data_shape, axes_shape, output_shape = get_reduce_sum_input_dimension_shapes(self.node, self.onnx_model)
@@ -81,6 +75,8 @@ class ReduceSumParser(OnnxComputeOperatorParser) :
             node_attr=node_attrs,
             mapping_attr=mapping,
         )
+
+
 def get_reduce_sum_input_dimension_shapes(node, model):
     """Get the input and output dimension shapes for the ReduceSumParser."""
 

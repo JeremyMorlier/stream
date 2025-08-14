@@ -7,32 +7,32 @@ from zigzag.parser.onnx.utils import parse_onnx_model_from_path
 from stream.hardware.architecture.accelerator import Accelerator
 from stream.parser.onnx.concat import ConcatParser
 from stream.parser.onnx.conv import ConvParser
+from stream.parser.onnx.convtranspose import ConvTransposeParser
 from stream.parser.onnx.default import DefaultNodeParser
 from stream.parser.onnx.einsum import EinsumParser
 from stream.parser.onnx.flatten import FlattenParser
 from stream.parser.onnx.gather import GatherParser
 from stream.parser.onnx.gemm import GemmParser
+from stream.parser.onnx.InPlaceAccumulator import InPlaceAccumulatorParser
 from stream.parser.onnx.lpnormalization import LpNormalizationParser
 from stream.parser.onnx.matmul import MatMulParser
 from stream.parser.onnx.mul import MulParser
 from stream.parser.onnx.operator_parser import OnnxOperatorParser
+from stream.parser.onnx.pad import PadParser
+from stream.parser.onnx.pool_grad import AveragePoolGradParser
 from stream.parser.onnx.pooling import PoolingParser
 from stream.parser.onnx.reduce_1d import Reduce1DParser
+from stream.parser.onnx.reducesum import ReduceSumParser
+from stream.parser.onnx.relugrad import ReLUGradParser
 from stream.parser.onnx.reshape import ReshapeParser
 from stream.parser.onnx.simd import SimdParser
 from stream.parser.onnx.slice import SliceParser
 from stream.parser.onnx.softmax import SoftmaxParser
+from stream.parser.onnx.softmaxcrossentropy import SoftmaxCrossEntropyParser
+from stream.parser.onnx.softmaxcrossentropygrad import SoftmaxCrossEntropyGradParser
 from stream.parser.onnx.split import SplitParser
 from stream.parser.onnx.ssm import SSMParser
 from stream.parser.onnx.transpose import TransposeParser
-from stream.parser.onnx.softmaxcrossentropy import SoftmaxCrossEntropyParser
-from stream.parser.onnx.softmaxcrossentropygrad import SoftmaxCrossEntropyGradParser
-from stream.parser.onnx.convtranspose import ConvTransposeParser
-from stream.parser.onnx.reducesum import ReduceSumParser
-from stream.parser.onnx.InPlaceAccumulator import InPlaceAccumulatorParser
-from stream.parser.onnx.relugrad import ReLUGradParser
-from stream.parser.onnx.pad import PadParser
-from stream.parser.onnx.pool_grad import AveragePoolGradParser
 from stream.workload.mapping import InterCoreMappingAttributes
 from stream.workload.onnx_workload import ONNXWorkload
 
@@ -159,7 +159,7 @@ class ONNXModelParser:
 
             id_of_first_node = node_id
             for node_obj in parser.run():
-                logger.info("Parsed %s node %s. id %s", node.op_type, node.name, node_id)
+                logger.info("Parsed %s node %s id %s", node.op_type, node.name, node_id)
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)
                 assert node_obj.id == node_id

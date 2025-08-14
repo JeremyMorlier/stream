@@ -1,14 +1,15 @@
 from typing import Any
 
 from zigzag.datatypes import Constants
-
-from stream.workload.computation.computation_node import ComputationNode
-from zigzag.parser.workload_factory import LayerNodeFactory
 from zigzag.parser.onnx.utils import get_onnx_tensor_type
+from zigzag.parser.workload_factory import LayerNodeFactory
+
 from stream.parser.onnx.operator_parser import OnnxComputeOperatorParser
-from stream.parser.onnx.softmax import SoftmaxExpParser, SoftmaxDivParser
-from stream.parser.onnx.simd import SimdParser
 from stream.parser.onnx.reduce_1d import Reduce1DParser
+from stream.parser.onnx.simd import SimdParser
+from stream.parser.onnx.softmax import SoftmaxDivParser, SoftmaxExpParser
+from stream.workload.computation.computation_node import ComputationNode
+
 
 class SoftmaxCrossEntropyParser(OnnxComputeOperatorParser):
     """
@@ -16,7 +17,7 @@ class SoftmaxCrossEntropyParser(OnnxComputeOperatorParser):
     attributes :
         - ignore_index:int
         - reduction:string (default mean), "none", "sum", "mean"
-    inputs: 
+    inputs:
         - scores
         - labels
         - weights (optional)
@@ -36,8 +37,7 @@ class SoftmaxCrossEntropyParser(OnnxComputeOperatorParser):
     NODE_TYPES = ["max", "exp", "sum", "div", "log"]
 
     def run(self):
-        for node in self.get_nodes():
-            yield node
+        yield from self.get_nodes()
 
     def get_layer_node_user_format(self, input_shape: list[int], output_shape: list[int]) -> dict[str, Any]:
         """Not used for this class, but abstract base class requires instantiation anyway"""
@@ -52,14 +52,20 @@ class SoftmaxCrossEntropyParser(OnnxComputeOperatorParser):
         self.correct_nodes_operand_source()
 
         return self.nodes
-    
+
     def parse_into_subnodes(self):
         """Prase the base ONNX node multiple times into the different Computation Nodes.
         The CNs that result from this operation have some incorrect properties regarding the graph structure
         """
         # parser_classes: list[type] = [Reduce1DParser, SoftmaxExpParser, Reduce1DParser, SoftmaxDivParser, SoftmaxCrossEntropySIMDParser, Reduce1DParser, SoftmaxCrossEntropyReduceParser]
-        parser_classes: list[type] = [Reduce1DParser, SoftmaxExpParser, Reduce1DParser, SoftmaxDivParser, SoftmaxCrossEntropySIMDParser]
-        node_ids = [self.node_id + i for i in range(7)]
+        parser_classes: list[type] = [
+            SoftmaxCrossEntropyReduceParser,
+            SoftmaxExpParser,
+            SoftmaxCrossEntropyReduceParser,
+            SoftmaxDivParser,
+            SoftmaxCrossEntropySIMDParser,
+        ]
+        node_ids = [self.node_id + i for i in range(5)]
         parsers: list[OnnxComputeOperatorParser] = [
             parser(
                 node_id=node_id,
@@ -69,17 +75,17 @@ class SoftmaxCrossEntropyParser(OnnxComputeOperatorParser):
                 all_mappings=self.all_mappings,
                 accelerator=self.accelerator,
             )
-            for parser, node_id in zip(parser_classes, node_ids)
+            for parser, node_id in zip(parser_classes, node_ids, strict=True)
         ]
         self.nodes = []
-        for parser in parsers :
-            for node in parser.run() :
+        for parser in parsers:
+            for node in parser.run():
                 self.nodes.append(node)
         self.nodes = tuple(self.nodes)
 
     def set_nodes_name_and_type(self):
         """Set the name and operator type of all Computation Nodes that stem from the base ONNX node"""
-        for node, node_type in zip(self.nodes, SoftmaxCrossEntropyParser.NODE_TYPES):
+        for node, node_type in zip(self.nodes, SoftmaxCrossEntropyParser.NODE_TYPES, strict=True):
             node.type = node_type
             node.name += f"-{node_type}/"
 
@@ -102,18 +108,22 @@ class SoftmaxCrossEntropyParser(OnnxComputeOperatorParser):
         # TODO: fix constant operands for added nodes
         node_log.input_operand_source = {op_I: id_sfm_div}
         node_log.constant_operands = []
-        
-class SoftmaxCrossEntropySIMDParser(SimdParser) :
+
+
+class SoftmaxCrossEntropySIMDParser(SimdParser):
+    DEFAULT_LAYER_DIMENSIONS = ["B", "H", "D", "K"]
+
     def generate_node(self):
         # Get the input and output activation shapes
-        scores_shape, labels_shape, output_shape, logprob_shape = softmaxcrossentropy_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        scores_shape, labels_shape, output_shape, logprob_shape = (
+            softmaxcrossentropy_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        )
 
         # From the ONNX node
-        node_data = self.get_layer_node_user_format(scores_shape, scores_shape)
+        mapping = self.get_mapping_this_node()
+        node_data = self.get_layer_node_user_format(scores_shape, scores_shape, mapping)
         node_factory = LayerNodeFactory(node_data, mapping_data=[])
         node_attrs = node_factory.create_node_attr()
-
-        mapping = self.get_mapping_this_node()
 
         return ComputationNode(
             node_id=self.node_id,
@@ -123,17 +133,21 @@ class SoftmaxCrossEntropySIMDParser(SimdParser) :
             mapping_attr=mapping,
         )
 
-class SoftmaxCrossEntropyReduceParser(Reduce1DParser) :
+
+class SoftmaxCrossEntropyReduceParser(Reduce1DParser):
+    DEFAULT_LAYER_DIMENSIONS = ["B", "H", "D", "K"]
+
     def generate_node(self):
         # Get the input and output activation shapes
-        scores_shape, labels_shape, output_shape, logprob_shape = softmaxcrossentropy_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        scores_shape, labels_shape, output_shape, logprob_shape = (
+            softmaxcrossentropy_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
+        )
 
         # From the ONNX node
-        node_data = self.get_layer_node_user_format(scores_shape, scores_shape)
+        mapping = self.get_mapping_this_node()
+        node_data = self.get_layer_node_user_format(scores_shape, logprob_shape, mapping)
         node_factory = LayerNodeFactory(node_data, mapping_data=[])
         node_attrs = node_factory.create_node_attr()
-
-        mapping = self.get_mapping_this_node()
 
         return ComputationNode(
             node_id=self.node_id,
@@ -143,7 +157,8 @@ class SoftmaxCrossEntropyReduceParser(Reduce1DParser) :
             mapping_attr=mapping,
         )
 
-def softmaxcrossentropy_get_node_input_output_dimension_shapes(node, model) :
+
+def softmaxcrossentropy_get_node_input_output_dimension_shapes(node, model):
     # assumed it is the first input, don't see a way to otherwise know
 
     scores_name = node.input[0]

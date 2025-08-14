@@ -1,10 +1,9 @@
+import numpy as np
 from zigzag.datatypes import LayerOperand
 
 from stream.node_tensor import NodeTensor
 from stream.workload.dependency_propagation.propagation_node import PropagationNode
 from stream.workload.node import Node
-
-import numpy as np
 
 
 class GatherNode(PropagationNode):

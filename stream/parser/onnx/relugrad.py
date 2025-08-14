@@ -1,7 +1,9 @@
-from stream.workload.computation.computation_node import ComputationNode
-from zigzag.parser.workload_factory import LayerNodeFactory
 from zigzag.parser.onnx.utils import get_onnx_tensor_type
+from zigzag.parser.workload_factory import LayerNodeFactory
+
 from stream.parser.onnx.simd import SimdParser
+from stream.workload.computation.computation_node import ComputationNode
+
 
 class ReLUGradParser(SimdParser):
     # Modify SIMD Parser as it is the same operation
@@ -26,7 +28,8 @@ class ReLUGradParser(SimdParser):
             mapping_attr=mapping,
         )
 
-def relugrad_get_node_input_output_dimension_shapes(node, model) :
+
+def relugrad_get_node_input_output_dimension_shapes(node, model):
     # assumed it is the first input, don't see a way to otherwise know
 
     grad_name = node.input[0]
@@ -35,4 +38,3 @@ def relugrad_get_node_input_output_dimension_shapes(node, model) :
     activation_shape = get_onnx_tensor_type(activation_name, model).shape
 
     return grad_shape, activation_shape
-    

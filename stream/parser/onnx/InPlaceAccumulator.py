@@ -1,14 +1,17 @@
-from stream.workload.computation.computation_node import ComputationNode
-from zigzag.parser.workload_factory import LayerNodeFactory
 from zigzag.parser.onnx.utils import get_onnx_tensor_type
-from stream.parser.onnx.simd import SimdParser 
+from zigzag.parser.workload_factory import LayerNodeFactory
 
-class InPlaceAccumulatorParser(SimdParser) :
+from stream.parser.onnx.simd import SimdParser
+from stream.workload.computation.computation_node import ComputationNode
 
+
+class InPlaceAccumulatorParser(SimdParser):
     def generate_node(self):
         # Get the input and output activation shapes
-        accumulator_shape, grad_shape = InPlaceAccumulator_get_node_input_output_dimension_shapes(self.node, self.onnx_model)
-    
+        accumulator_shape, grad_shape = InPlaceAccumulator_get_node_input_output_dimension_shapes(
+            self.node, self.onnx_model
+        )
+
         # From the ONNX node
         mapping = self.get_mapping_this_node()
         node_data = self.get_layer_node_user_format(grad_shape, accumulator_shape, mapping)
@@ -26,7 +29,7 @@ class InPlaceAccumulatorParser(SimdParser) :
         )
 
 
-def InPlaceAccumulator_get_node_input_output_dimension_shapes(node, model) :
+def InPlaceAccumulator_get_node_input_output_dimension_shapes(node, model):
     # assumed it is the first input, don't see a way to otherwise know
 
     accumulator_name = node.input[0]
@@ -38,4 +41,3 @@ def InPlaceAccumulator_get_node_input_output_dimension_shapes(node, model) :
     # output_shape = get_onnx_tensor_type(output_name, model).shape
 
     return accumulator_shape, grad_shape
-    

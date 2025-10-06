@@ -13,12 +13,14 @@ from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
 
+
 class AveragePoolGradParser(OnnxComputeOperatorParser):
     """Parser for ONNX AveragePoolGrad nodes into LayerNode.
-       Parse the ONNX AveragePoolGrad Operator into a ConvTransposeNode.
+    Parse the ONNX AveragePoolGrad Operator into a ConvTransposeNode.
     """
 
     OP_TYPE = "averagepoolgrad"
+
     def get_layer_node_user_format(  # type: ignore
         self,
         kernel_shape: list[int],
@@ -85,13 +87,12 @@ class AveragePoolGradParser(OnnxComputeOperatorParser):
 
         # Find the previous layer(s) that should be this node's parent(s)
         node_inputs = self.node.input
-        first_input_name= node_inputs[:1]
+        first_input_name = node_inputs[:1]
         source_list_I = [
             src for (src, src_output_names) in self.nodes_outputs.items() if first_input_name in src_output_names
         ]
 
         assert len(source_list_I) <= 1
-
 
         source_I = source_list_I[0] if len(source_list_I) == 1 else self.node_id
         source_W = self.node_id
@@ -102,7 +103,7 @@ class AveragePoolGradParser(OnnxComputeOperatorParser):
         }
 
         return data
-    
+
     def generate_node(self):
         attrs = self.node.attribute
         kernel_shape: list[int] = get_attribute_ints_with_name("kernel_shape", attrs, default=None)  # type:ignore

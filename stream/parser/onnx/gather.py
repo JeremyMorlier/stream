@@ -42,9 +42,7 @@ class GatherParser(OnnxOperatorParser):
             # Try to find the indices in the initializers
             try:
                 indices_tensor = next(
-                    filter(
-                        lambda x: x.name == indices_tensor_name, self.onnx_model.graph.initializer
-                    )
+                    filter(lambda x: x.name == indices_tensor_name, self.onnx_model.graph.initializer)
                 )
                 indices_array = numpy_helper.to_array(indices_tensor)
                 indices = list(indices_array) if len(indices_array.shape) > 0 else DEFAULT

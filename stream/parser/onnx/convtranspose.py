@@ -85,7 +85,10 @@ class ConvTransposeParser(OnnxComputeOperatorParser):
 
         # Find the previous layer(s) that should be this node's parent(s)
         node_inputs = self.node.input
-        assert len(node_inputs) >= 2, f"Conv should have at least two input names, but has: {node_inputs}."
+        NUM_INPUTS_EXPECTED = 2
+        assert len(node_inputs) >= NUM_INPUTS_EXPECTED, (
+            f"Conv should have at least two input names, but has: {node_inputs}."
+        )
         (first_input_name, second_input_name) = node_inputs[:2]
 
         source_list_I = [

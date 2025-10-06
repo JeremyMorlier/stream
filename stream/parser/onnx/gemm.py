@@ -1,11 +1,11 @@
 import logging
-from typing import Generator, Any
+from collections.abc import Generator
+from typing import Any
 
 from zigzag.parser.onnx.utils import (
     get_attribute_ints_with_name,
     get_node_input_output_dimension_shapes,
 )
-
 from zigzag.parser.workload_factory import LayerNodeFactory
 
 from stream.parser.onnx.operator_parser import OnnxComputeOperatorParser
@@ -26,7 +26,10 @@ class GemmParser(OnnxComputeOperatorParser):
         input_shape, output_shape = get_node_input_output_dimension_shapes(self.node, self.onnx_model)
         transpose_first_input = get_attribute_ints_with_name("transA", self.node.attribute, default=0)
         if transpose_first_input:
-            assert len(input_shape) == 2, "Transpose only supported for GEMMs with two input dimensions"
+            NUM_INPUTS_EXPECTED = 2
+            assert len(input_shape) == NUM_INPUTS_EXPECTED, (
+                "Transpose only supported for GEMMs with two input dimensions"
+            )
             input_shape = [input_shape[1], input_shape[0]]
 
         logger.info("%s node name %s input shape %s output shape", self.node.name, input_shape, output_shape)
@@ -43,6 +46,7 @@ class GemmParser(OnnxComputeOperatorParser):
             node_attr=node_attrs,
             mapping_attr=mapping,
         )
+
     DEFAULT_LAYER_DIMENSIONS = ["B", "H", "D", "C", "K"]
 
     def get_layer_node_user_format(

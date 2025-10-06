@@ -162,7 +162,7 @@ class ComputationNode(LayerNode, Node):
                 LayerOperand("I"): (size_B, -1, size_IX, size_IY),
                 LayerOperand("O"): (size_B, -1, size_OX, size_OY),
             }
-        except KeyError as e:
+        except KeyError:
             try:
                 size_B = self.layer_dim_sizes[LayerDim("B")]
                 size_IX = self.layer_dim_sizes[LayerDim("IX")]
@@ -173,8 +173,7 @@ class ComputationNode(LayerNode, Node):
                     LayerOperand("I"): (size_B, -1, size_IX, size_IY),
                     LayerOperand("O"): (size_B, -1, size_OX, size_OY),
                 }
-            except KeyError as e:
-                
+            except KeyError:
                 return None
 
     def get_output_tensor(self) -> Tensor:

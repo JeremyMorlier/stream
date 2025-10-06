@@ -22,10 +22,10 @@ from stream.utils import contains_wildcard, get_inter_core_tiling_size
 from stream.workload.computation.computation_node import LOOP_RANGES_T, ComputationNode, GeneratedComputationNode
 from stream.workload.dependency_propagation.dummy_node import DummyNode
 from stream.workload.dependency_propagation.propagation_node import PropagationNode
+from stream.workload.dnn_workload import DNNWorkloadStream
 from stream.workload.node import Node
 from stream.workload.onnx_workload import ComputationNodeWorkload, ONNXWorkload
 from stream.workload.tensor import Tensor
-from stream.workload.dnn_workload import DNNWorkloadStream
 
 logger = logging.getLogger(__name__)
 
@@ -757,7 +757,6 @@ class TiledWorkloadGenerationStage(Stage):
                 p_bounding_box = self.get_bounding_box_dimensions(
                     producer, consumer, producer_r_dims_output, p_inclusive_ranges
                 )
-
                 # Get the consumer tile ids that intersect with this producer tile
                 intersecting_consumer_node_ids = consumer_tree.intersection(p_bounding_box)
 
@@ -1060,7 +1059,7 @@ class TiledWorkloadGenerationStage(Stage):
             try:
                 output_channels = node.layer_dim_sizes[LayerDim("K")]
             except KeyError:
-                raise NotImplementedError(f"{node} doesn't have a 'K' loop.")
+                raise NotImplementedError(f"{node} doesn't have a 'K' loop.") from KeyError
             while divmod(output_channels, split_factor)[1] != 0:
                 split_factor += 1
                 if split_factor > output_channels:
@@ -1076,7 +1075,7 @@ class TiledWorkloadGenerationStage(Stage):
 
 # Function that find the shortest path between nodes that does not have ComputationNodes in between.
 def get_non_compute_shortest_path(
-    G: DNNWorkloadStream, producer: ComputationNode, consumer: ComputationNode
+    g: DNNWorkloadStream, producer: ComputationNode, consumer: ComputationNode
 ) -> list[Node]:
     """
     Perform BFS recursively to find the shortest path between two nodes in a graph,
@@ -1106,7 +1105,7 @@ def get_non_compute_shortest_path(
         visited.add(current_node)
 
         # Explore neighbors
-        for neighbor in G.neighbors(current_node):
+        for neighbor in g.neighbors(current_node):
             # If we reach the consumer node, return the path
             if neighbor == consumer:
                 return path + [neighbor]

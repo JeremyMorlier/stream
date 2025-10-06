@@ -10,8 +10,14 @@ class PadParser(OnnxOperatorParser):
     def generate_node(self):
         predecessors = self.get_node_predecessors()
         padding = self.get_padding()
-
-        return PadNode(node_id=self.node_id, node_name=self.node.name, predecessor=predecessors, padding=padding)
+        input_names = list(self.node.input)
+        return PadNode(
+            node_id=self.node_id,
+            node_name=self.node.name,
+            predecessor=predecessors,
+            input_names=input_names,
+            padding=padding,
+        )
 
     def get_padding(self):
         """Find the value of the padding tensor associated with this pad node in ONNX"""
@@ -29,8 +35,8 @@ class PadParser(OnnxOperatorParser):
             padding_attr = next(filter(lambda x: x.name == "value", padding_tensor.attribute))
             padding_array = numpy_helper.to_array(padding_attr.t)  # type: ignore
             padding = list(padding_array) if len(padding_array.shape) > 0 else DEFAULT  # type: ignore
-            # The ONNX padding format is (x1_start, x2_start,...x1_end, x2_end, ...) and numpy expects (x1_start, x1_end, x2_start, x2_end, ...)
-            # padding = [padding[i] if j % 2 == 0 else padding[len(padding)//2 + i] for i in range(len(padding)//2) for j in range(2)]
+            # The ONNX padding format is (x1_start, x2_start,...x1_end, x2_end, ...) and
+            # numpy expects (x1_start, x1_end, x2_start, x2_end, ...)
             padding2 = []
             for i in range(len(padding) // 2):
                 padding2.append((padding[i].item(), padding[len(padding) // 2 + i].item()))
@@ -43,8 +49,8 @@ class PadParser(OnnxOperatorParser):
                 )
                 padding_array = numpy_helper.to_array(padding_tensor)
                 padding = list(padding_array) if len(padding_array.shape) > 0 else DEFAULT  # type: ignore
-                # The ONNX padding format is (x1_start, x2_start,...x1_end, x2_end, ...) and numpy expects (x1_start, x1_end, x2_start, x2_end, ...)
-                # padding = [padding[i] if j % 2 == 0 else padding[len(padding)//2 + i] for i in range(len(padding)//2) for j in range(2)]
+                # The ONNX padding format is (x1_start, x2_start,...x1_end, x2_end, ...) and
+                # numpy expects (x1_start, x1_end, x2_start, x2_end, ...)
                 padding2 = []
                 for i in range(len(padding) // 2):
                     padding2.append((padding[i].item(), padding[len(padding) // 2 + i].item()))

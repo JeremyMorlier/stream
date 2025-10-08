@@ -6,7 +6,7 @@ from stream.workload.node import Node
 
 
 class PadNode(PropagationNode):
-    """Class that represents an onnx Reshape node."""
+    """Class that represents an onnx Pad node."""
 
     def __init__(
         self,

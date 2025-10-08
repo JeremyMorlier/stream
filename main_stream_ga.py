@@ -6,8 +6,9 @@ from stream.utils import CostModelEvaluationLUT
 from stream.visualization.memory_usage import plot_memory_usage
 from stream.visualization.perfetto import convert_scme_to_perfetto_json
 
+_logging_level = _logging.INFO
 _logging_format = "%(asctime)s - %(name)s.%(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
-_logging.basicConfig(level=_logging.INFO, format=_logging_format)
+_logging.basicConfig(level=_logging_level, format=_logging_format)
 
 ############################################INPUTS############################################
 accelerator = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"

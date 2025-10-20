@@ -3,7 +3,7 @@ type: compute
 
 memories:
   rf_128B:
-    size: 1024
+    size: 2048
     r_cost: 0.095
     w_cost: 0.095
     area: 0
@@ -26,7 +26,7 @@ memories:
     served_dimensions: []
 
   rf_2B:
-    size: 16
+    size: 32
     r_cost: 0.021
     w_cost: 0.021
     area: 0
@@ -91,10 +91,10 @@ operational_array:
   unit_energy: 0.04 # pJ
   unit_area: 1 # unit
   dimensions: [D1, D2]
-  sizes: [32, 32]
+  sizes: [4, 64]
 
 dataflows:
   D1:
-    - K, 32
+    - K, 4
   D2:
-    - C, 32
+    - C, 64

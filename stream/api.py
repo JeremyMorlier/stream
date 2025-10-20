@@ -147,7 +147,7 @@ def optimize_allocation_co(  # noqa: PLR0913
     cost_lut_path = f"{output_path}/{experiment_id}/cost_lut.pickle"
     allocations_path = f"{output_path}/{experiment_id}/waco/"
     tiled_workload_post_co_path = f"{output_path}/{experiment_id}/tiled_workload_post_co.pickle"
-    cost_lut_post_co_path = f"outputs/{experiment_id}/cost_lut_post_co.pickle"
+    cost_lut_post_co_path = f"{output_path}/{experiment_id}/cost_lut_post_co.pickle"
     scme_path = f"{output_path}/{experiment_id}/scme.pickle"
 
     # Get logger

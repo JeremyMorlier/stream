@@ -19,15 +19,16 @@ class SoftmaxCrossEntropyGradParser(SimdParser):
         node_data = self.get_layer_node_user_format(logprob_shape, logprob_shape, mapping)
         node_factory = LayerNodeFactory(node_data, mapping_data=[])
         node_attrs = node_factory.create_node_attr()
-
+        input_names = list(self.node.input)
         mapping = self.get_mapping_this_node()
 
         return ComputationNode(
             node_id=self.node_id,
             node_name=self.node.name,
-            op_type="add",
+            op_type="SFMaxCEGrad",
             node_attr=node_attrs,
             mapping_attr=mapping,
+            input_names=input_names,
         )
 
 

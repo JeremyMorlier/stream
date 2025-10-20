@@ -208,7 +208,8 @@ class SchedulingOrderGenerationStage(Stage):
         all_intra_core_tiling_factors: list[int] = [self.get_total_tiling_size(n.intra_core_tiling) for n in nodes]
         min_tiling_factor = min(all_intra_core_tiling_factors, default=1)
         assert all(tiling_factor % min_tiling_factor == 0 for tiling_factor in all_intra_core_tiling_factors), (
-            "Intra-core tiling factors are not multiples of minimum"
+            f"Intra-core tiling factors are not multiples of minimum. \r\n Nodes and tiling factors: "
+            f"{[f'{n.id}:{tiling_factor}' for n, tiling_factor in zip(nodes, all_intra_core_tiling_factors, strict=False)]}"  # noqa: E501
         )
         return min_tiling_factor
 

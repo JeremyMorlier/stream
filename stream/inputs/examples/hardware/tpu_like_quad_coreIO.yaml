@@ -17,46 +17,46 @@ core_connectivity:
   # ───── 2-D mesh among the four compute cores ─────
   - type: link
     cores: [0, 1]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [1, 2]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [2, 3]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [3, 0]
-    bandwidth: 32
+    bandwidth: 128
 
   # ───── Pooling core connected to every compute core ─────
   - type: link
     cores: [0, 4]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [1, 4]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [2, 4]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [3, 4]
-    bandwidth: 32
+    bandwidth: 128
 
   # ───── SIMD core connected to every compute core ─────
   - type: link
     cores: [0, 5]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [1, 5]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [2, 5]
-    bandwidth: 32
+    bandwidth: 128
   - type: link
     cores: [3, 5]
-    bandwidth: 32
+    bandwidth: 128
 
   # ───── Shared bus to off-chip memory (all cores ↔ DRAM) ─────
   - type: bus
     cores: [0, 1, 2, 3, 4, 5, 6]
-    bandwidth: 128        # wider than on-chip point-to-point links
+    bandwidth: 512        # wider than on-chip point-to-point links

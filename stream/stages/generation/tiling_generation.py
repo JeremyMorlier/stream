@@ -34,6 +34,9 @@ class TilingGenerationStage(Stage):
             "relu": LayerDim("K"),
             "gelu": LayerDim("K"),
             "silu": LayerDim("K"),
+            "convtranspose": LayerDim("IY"),
+            "sub": LayerDim("K"),
+            "sqrt": LayerDim("K"),
         },
     )
     FUSION_PARTITION_SIZE_DEFAULT = 2
@@ -89,8 +92,9 @@ class TilingGenerationStage(Stage):
                     raise ValueError("Unsupported mode for hint loops determination.")
 
         # Override the intra_core_tiling in case the node is alone in a stack
-        if stack_size == 1:
-            node.intra_core_tiling = []
+        # NOTE: this could result in too large tile and break downstream
+        # if stack_size == 1:
+        #     node.intra_core_tiling = []
 
     def set_valid_inter_core_tiling(self, node: ComputationNode):
         self.remove_invalid_entries_from_inter_core_tiling(node)
@@ -128,6 +132,8 @@ class TilingGenerationStage(Stage):
                         new_layer_dim_size += 1
                     logger.warning(f"Rounding {node}: {layer_dim} {layer_dim_size} -> {new_layer_dim_size}")
                     node.layer_dim_sizes[layer_dim] = new_layer_dim_size
+                    factor_new = factor
+                else:
                     factor_new = factor
 
                 valid_tiling.append((layer_dim, factor_new))
@@ -186,6 +192,7 @@ class TilingGenerationStage(Stage):
         """Give some valid inter-core tiling for the given node: either coming from the default inter-core partitions,
         or any arbitrary layer dimension.
         #TODO will the default size 1 (instead of `*`) work with ConstraintOptimization?
+        #TODO: it does not seem to work
         #"""
         for dim in TilingGenerationStage.INTER_CORE_PARTITION_DIM_DEFAULT:
             if dim in node.layer_dim_sizes and node.layer_dim_sizes[dim] > 1:
@@ -197,6 +204,7 @@ class TilingGenerationStage(Stage):
     @staticmethod
     def split_operator(model: ModelProto, node_name: str, num_splits: int):  # noqa: PLR0915
         """
+        NOTE: this function is not called anywhere should it stay here ?
         Replaces an ONNX Conv or Gemm operator in an ONNX model with a sequence of Conv operators with smaller kernel
         sizes that are concatenated together. The output channels of each new operator are equal to the output channels
         of the original operator divided by num_splits. Returns the names of the output tensors of the new

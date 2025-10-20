@@ -124,26 +124,60 @@ class GeneticAlgorithm:
         return self.pop, self.hof
 
     def mutate(self, individual):
-        prob_mutation = 1 / len(individual)
+        """
+        Mutation operator expected by DEAP: takes an individual and returns a tuple (individual,).
+        This implementation tries to change the core allocation for a randomly chosen gene.
+        If no alternative allocation exists for that gene, it will try up to `tries` other genes.
+        If none of the genes have alternatives, mutation is skipped and the individual is returned unchanged.
+        """
+        # Number of alternative gene positions to try before giving up
+        tries = min(5, len(individual))
 
-        # change one of the position's core allocation
-        change_percentage = 0.75
-        if random.random() < change_percentage:
-            for position in range(len(list(individual))):
-                individual[position]
-                if random.random() < prob_mutation:
-                    current_core_allocation = individual[position]
-                    valid_new_core_allocations = sorted(
-                        set(self.valid_allocations[position]) - set([current_core_allocation])
-                    )
-                    individual[position] = random.choice(valid_new_core_allocations)
-        # swap the core allocation of two randomly chosen positions
-        else:
-            first_position, second_position = random.sample(range(len(individual)), 2)
-            tmp = individual[second_position]
-            individual[second_position] = individual[first_position]
-            individual[first_position] = tmp
+        # attempt to find a gene that has an alternative allocation
+        attempted_positions = set()
+        for _ in range(tries):
+            # pick a random gene position we haven't attempted yet
+            remaining_positions = [i for i in range(len(individual)) if i not in attempted_positions]
+            if not remaining_positions:
+                break
+            position = random.choice(remaining_positions)
+            attempted_positions.add(position)
 
+            # Build list of valid new allocations for this gene.
+            # NOTE: The exact way to derive valid allocations depends on how `self.valid_core_allocations`
+            # is structured in your codebase. Replace or adapt the following line to match your data model.
+            # Here we expect `self.valid_core_allocations` to be a mapping-like or list-of-lists
+            # where entry for this gene/position gives allowed values.
+            try:
+                # If valid_core_allocations is a list-of-lists indexed by gene position:
+                valid_new_core_allocations = list(self.valid_core_allocations[position])
+            except Exception:
+                # Fallback: try to treat valid_core_allocations as a single list of allowed choices
+                try:
+                    valid_new_core_allocations = list(self.valid_core_allocations)
+                except Exception:
+                    valid_new_core_allocations = []
+
+            # Exclude current allocation if possible to get an actual change
+            current_value = individual[position]
+            choices = [c for c in valid_new_core_allocations if c != current_value]
+
+            if not choices:
+                # No alternative for this gene; try another gene
+                continue
+
+            # perform mutation
+            new_value = random.choice(choices)
+            individual[position] = new_value
+            print("Mutated position %d: %r -> %r", position, current_value, new_value)
+            return (individual,)
+
+        # If we reach here, we couldn't find any gene with an alternative allocation.
+        # Mutation is a no-op; return the individual unchanged (DEAP expects a tuple).
+        print(
+            "Mutation skipped: no alternative core allocations available for any tried gene positions. "
+            "This can happen when mapping defines a single core option per layer."
+        )
         return (individual,)
 
     def save_population(self, x):

@@ -53,7 +53,7 @@ class LayerStacksGenerationStage(Stage):
                 elif self.stack_cutoffs is not None:
                     self.layer_stacks = self.get_layer_stacks_fused_multiple_fixed()
                 else:
-                    self.layer_stacks = self.get_layer_stacks_fused_single()
+                    self.layer_stacks = self.get_layer_stacks_fused_local_memory()
             else:
                 self.layer_stacks = self.fill_layer_stacks_to_completion()
 
@@ -159,6 +159,40 @@ class LayerStacksGenerationStage(Stage):
                     current_stack.append(id)
         # Add last stack
         stacks.append(tuple(current_stack))
+
+        return stacks
+
+    def get_layer_stacks_fused_local_memory(self):
+        """
+        Creates new stacks whenever the local memory capacity is exceeded.
+        """
+        cumsum = 0
+        stacks: list[tuple[int, ...]] = []
+        current_stack: list[int] = []
+
+        for n in sorted(list(self.workload.node_list), key=lambda n: n.id):
+            if isinstance(n, ComputationNode):
+                id = n.id
+                try:
+                    op = next(op for op in n.constant_operands)
+                except StopIteration:
+                    current_stack.append(id)
+                    continue
+
+                size = n.operand_size_bit[op]
+                # Check if adding this layer exceeds the capacity
+                if cumsum + size > self.total_weight_capacity and current_stack:
+                    # Finalize current stack and start a new one
+                    stacks.append(tuple(current_stack))
+                    current_stack = [id]
+                    cumsum = size
+                else:
+                    current_stack.append(id)
+                    cumsum += size
+
+        # Add the last stack if it's not empty
+        if current_stack:
+            stacks.append(tuple(current_stack))
 
         return stacks
 

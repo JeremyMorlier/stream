@@ -9,9 +9,8 @@ from stream.stages.stage import Stage, StageCallable
 from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.onnx_workload import ComputationNodeWorkload
 from itertools import combinations
-import pulp
 from gurobipy import Model, GRB, quicksum
-
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +66,7 @@ def ilp_min_subgraphs_gurobi(G, subgraphs, cover_edges=True):
     # Solve the model
     model.optimize()
 
+    print("ilp status", model.Status)
     # Extract selected subgraphs
     selected_subgraphs = [subgraphs[i] for i in range(n) if x[i].x > 0.5]
 
@@ -102,76 +102,83 @@ def necessary_subgraphs(G, subgraphs):
     return necessary_subgraphs
 
 
-def find_constrained_subgraphs(G: nx.DiGraph):
-    subgraphs = []
-    visited = set()
+def find_subgraphs(G):
+    """
+    Find all connected subgraphs of a DiGraph where the subgraph has at most one outgoing source node.
 
-    for component in nx.weakly_connected_components(G):
-        subG = G.subgraph(component).copy()
+    Parameters:
+    G (nx.DiGraph): The input directed graph.
 
-        # Work from sinks upward
-        for node in list(subG.nodes):
-            if node in visited:
-                continue
+    Returns:
+    list: A list of connected subgraphs (each as a set of nodes) that satisfy the condition.
+    """
+    valid_subgraphs = []
 
-            # Build subgraph starting from this node
-            sub_nodes = set()
-            frontier = [node]
-            while frontier:
-                n = frontier.pop()
-                if n in sub_nodes:
-                    continue
-                sub_nodes.add(n)
+    # Iterate over all possible non-empty connected subgraphs
+    for node in G.nodes():
+        # Use BFS to explore connected subgraphs starting from 'node'
+        queue = [(node, {node})]  # (current_node, subgraph_nodes)
 
-                # Count outgoing edges that leave this potential subgraph
-                outgoing_outside = {u for u in sub_nodes for v in G.successors(u) if v not in sub_nodes}
+        while queue:
+            current_node, subgraph_nodes = queue.pop(0)
 
-                # Stop if more than 1 node sends outside
-                if len(outgoing_outside) > 1:
-                    sub_nodes.remove(n)
-                    continue
+            # Check if the subgraph has at most one outgoing source node
+            if len(subgraph_nodes) > 5:
+                break
+            outgoing_sources = set()
+            for n in subgraph_nodes:
+                for neighbor in G.neighbors(n):
+                    if neighbor not in subgraph_nodes:
+                        outgoing_sources.add(n)
+                        break  # Only need to know if it has at least one outgoing edge
 
-                # Expand backwards
-                for pred in G.predecessors(n):
-                    if pred not in sub_nodes:
-                        frontier.append(pred)
+            if len(outgoing_sources) <= 1:
+                if subgraph_nodes not in valid_subgraphs:
+                    valid_subgraphs.append(subgraph_nodes)
 
-            visited |= sub_nodes
-            subgraphs.append(G.subgraph(sub_nodes).copy())
+            # Expand the subgraph by adding neighbors
+            for neighbor in G.neighbors(current_node):
+                if neighbor not in subgraph_nodes:
+                    new_subgraph = subgraph_nodes.union({neighbor})
+                    queue.append((neighbor, new_subgraph))
 
-    return subgraphs
+    return valid_subgraphs
 
 
 def find_path(graph, source, computations_nodes):
     """
-    run a BFS between the source and all other computations_nodes
+    Run a BFS between the source and all other computations_nodes.
+    For each path, record the last edge's tensor size.
     """
-    paths = {}
-
-    # BFS setup
-    queue = [(source, [source])]
+    paths = {}  # Will store {computation_node: last_tensor_size}
+    queue = [(source, [source], None)]  # (current_node, current_path, last_tensor_size)
     visited = set()
 
     while queue:
-        current_node, current_path = queue.pop(0)
-
-        # Skip if already visited
+        current_node, current_path, last_tensor_size = queue.pop(0)
         if current_node in visited:
             continue
         visited.add(current_node)
 
-        # If current_node is a computation node and not the source, record the path
+        # If current_node is a computation node and not the source, record the last tensor size
         if current_node in computations_nodes and current_node != source:
-            paths[current_node] = 1
+            paths[current_node] = last_tensor_size
             continue  # No need to explore further from this node
 
         # Explore neighbors
         for neighbor in graph.neighbors(current_node):
-            # Only proceed if neighbor is not a computation node (or is the source)
-            # if not isinstance(neighbor, ComputationNode) or neighbor == source:
-            #     print(neighbor)
             if neighbor not in visited:
-                queue.append((neighbor, current_path + [neighbor]))
+                # Get the tensor size of the edge current_node -> neighbor
+                tensor_size = 0
+                if hasattr(neighbor, "operand_size_bit"):
+                    dict_input_size = neighbor.operand_size_bit
+                    dict_input_operand_source = neighbor.input_operand_source
+                    for operand_name, node_id in dict_input_operand_source.items():
+                        if current_node.id == node_id:
+                            tensor_size = dict_input_size[operand_name]
+
+                queue.append((neighbor, current_path + [neighbor], tensor_size))
+
     return paths
 
 
@@ -206,10 +213,11 @@ def abstract_computation_graph(original_graph):
         abstracted_graph.add_node(
             node,
             mem_size=size,
-            mem_size_per_core={
-                allocation: float(size / len(node.possible_core_allocation))
-                for allocation in node.possible_core_allocation
-            },
+            # mem_size_per_core={
+            #     allocation: float(size / len(node.possible_core_allocation))
+            #     for allocation in node.possible_core_allocation
+            # },
+            mem_size_per_core={allocation: size for allocation in node.possible_core_allocation},
             tiling=tiling,
             **original_graph.nodes[node],
         )
@@ -219,8 +227,11 @@ def abstract_computation_graph(original_graph):
     for u in computation_nodes:
         paths = find_path(original_graph, u, computation_nodes)
         for v in computation_nodes:
-            if v != u and v in paths and paths[v] == 1:
-                abstracted_graph.add_edge(u, v)
+            if v != u and v in paths and paths[v] >= 1:
+                tensor_size = float(paths[v] / len(node.possible_core_allocation))
+                tensor_size = paths[v]
+                # Add the edge to the abstracted graph with the tensor size
+                abstracted_graph.add_edge(u, v, tensor_size=tensor_size)
 
     return abstracted_graph
 
@@ -265,7 +276,9 @@ class LayerStacksGenerationStage(Stage):
                 elif self.stack_cutoffs is not None:
                     self.layer_stacks = self.get_layer_stacks_fused_multiple_fixed()
                 else:
-                    self.layer_stacks = self.get_layer_stacks_fused_local_memory()
+                    # self.layer_stacks = self.get_layer_stacks_fused_local_memory()
+                    # print(self.solve_constraint_programming())
+                    self.layer_stacks = self.solve_constraint_programming()
             else:
                 self.layer_stacks = self.fill_layer_stacks_to_completion()
 
@@ -274,8 +287,6 @@ class LayerStacksGenerationStage(Stage):
         else:
             raise ValueError("Unsupported mode for layer stack determination.")
 
-        print(self.solve_constraint_programming())
-        self.layer_stacks = self.solve_constraint_programming()
         logger.warning("%s", self.layer_stacks)
         self.only_keep_computation_node_ids()
 
@@ -377,25 +388,134 @@ class LayerStacksGenerationStage(Stage):
 
         return stacks
 
+    def check_node_types(self, graph):
+        """any subgraph with two gemm/matmul should not be considered as well as subgraph with more than 2 convolutions"""
+
+        subgraph_types = [node.type for node in graph]
+        if subgraph_types.count("conv") > 3:
+            return False
+        if subgraph_types.count("gemm") + subgraph_types.count("matmul") > 1:
+            return False
+        return True
+
+    def check_length_subgraph(self, graph, max_length: int = 5):
+        if len(graph) >= max_length:
+            return False
+        else:
+            return True
+
     def check_intra_core_tiling(self, graph):
         tilings = nx.get_node_attributes(graph, "tiling").values()
 
         divisible = all((a % b == 0 or b % a == 0) for a in tilings for b in tilings if a != b)
         return divisible
 
-    def check_memory_constraint(self, graph):
-        subgraphs_mem_per_cores = nx.get_node_attributes(graph, "mem_size_per_core")
-
+    def check_memory_constraint(self, subgraph, graph):
+        subgraphs_mem_per_cores = nx.get_node_attributes(subgraph, "mem_size_per_core")
+        subgraph_nodes = set(graph.nodes())
         for core_id in self.weight_capacities:
             core_allocated_mem = 0
-            for _, node_mem_per_core in subgraphs_mem_per_cores.items():
+            for node, node_mem_per_core in subgraphs_mem_per_cores.items():
                 if core_id in node_mem_per_core:
                     core_allocated_mem += node_mem_per_core[core_id]
 
+                for predecessor in graph.predecessors(node):
+                    # print(predecessor in subgraph_nodes)
+                    if predecessor not in subgraph_nodes:
+                        # Get the edge data for the edge (predecessor -> node)
+                        edge_data = graph.get_edge_data(predecessor, node)
+                        if edge_data:
+                            # Add the cost from the edge to the core's allocated memory
+                            # Assuming the cost is stored as 'cost' or 'tensor_size'
+                            cost = edge_data.get("tensor_size", 0)  # or "tensor_size"
+                            print(cost, predecessor.id, node.id)
+                            core_allocated_mem += cost
             if core_allocated_mem > self.weight_capacities[core_id]:
                 return False
 
         return True
+
+    def find_valid_subgraphs_bfs(self, G, max_size=None):
+        """
+        Find all connected subgraphs of G using BFS expansion that satisfy:
+        - check_intra_core_tiling(subgraph)
+        - check_memory_constraint(subgraph, G)
+
+        Parameters
+        ----------
+        G : nx.DiGraph
+            Original directed graph (assumed connected).
+        checker : object
+            Provides methods:
+                - checker.check_intra_core_tiling(graph)
+                - checker.check_memory_constraint(subgraph, graph)
+        max_size : int, optional
+            Optional limit on subgraph size (to avoid excessive exploration).
+
+        Returns
+        -------
+        list of nx.DiGraph
+            All connected subgraphs satisfying both checks.
+        """
+
+        valid_subgraphs = []
+        visited_sets = set()
+
+        for start_node in G.nodes:
+            print(start_node.id)
+            queue = deque()
+            queue.append({start_node})
+
+            while queue:
+                current_nodes = queue.popleft()
+                frozen = frozenset(current_nodes)
+
+                if frozen in visited_sets:
+                    continue
+                visited_sets.add(frozen)
+
+                subG = G.subgraph(current_nodes)
+
+                # Run the checks
+                if not self.check_node_types(subG):
+                    continue
+                if not self.check_intra_core_tiling(subG):
+                    continue
+                if not self.check_memory_constraint(subG, G):
+                    continue
+
+                outgoing_sources = set()
+                for n in current_nodes:
+                    for neighbor in G.successors(n):
+                        if neighbor not in current_nodes:
+                            outgoing_sources.add(n)
+                            break
+
+                if len(outgoing_sources) <= 1:
+                    valid_subgraphs.append(subG.copy())
+
+                # Store valid subgraph
+                # valid_subgraphs.append(subG.copy())
+                # print(len(valid_subgraphs), [[n.id for n in gra] for gra in valid_subgraphs])
+                # Expand if below size limit
+                if max_size and len(current_nodes) >= max_size:
+                    continue
+
+                # Expand by adding weak neighbors (successors or predecessors)
+                neighbors = set()
+                for node in current_nodes:
+                    neighbors.update(G.successors(node))
+                    neighbors.update(G.predecessors(node))
+
+                # Only consider neighbors not already in the subgraph
+                neighbors -= current_nodes
+
+                for n in neighbors:
+                    new_nodes = set(current_nodes)
+                    new_nodes.add(n)
+                    queue.append(new_nodes)
+
+        return valid_subgraphs
 
     def solve_constraint_programming(self):
         """
@@ -414,18 +534,19 @@ class LayerStacksGenerationStage(Stage):
 
         new_graph = abstract_computation_graph(self.workload)
 
-        subgraphs = find_constrained_subgraphs(new_graph)
-
+        subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=6)
+        print(len(subgraphs))
         # For each subgraph, we find if they match the constraints, otherwise we discard them
         valid_subgraphs = []
         for subgraph in subgraphs:
-            if self.check_intra_core_tiling(subgraph):
-                if self.check_memory_constraint(subgraph):
-                    valid_subgraphs.append(subgraph)
-
+            if self.check_node_types(subgraph):
+                # if self.check_length_subgraph(subgraph, 30):
+                if self.check_intra_core_tiling(subgraph):
+                    if self.check_memory_constraint(subgraph, new_graph):
+                        valid_subgraphs.append(subgraph)
         solution = ilp_min_subgraphs_gurobi(new_graph, valid_subgraphs + single_node_subgraphs(new_graph))
 
-        return [[node.id for node in subgraph] for subgraph in solution]
+        return sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in solution])
 
     def get_layer_stacks_fused_local_memory(self):
         """
@@ -489,7 +610,6 @@ class LayerStacksGenerationStage(Stage):
         # Add the last stack if it's not empty
         if current_stack:
             stacks.append(tuple(current_stack))
-        print(stacks)
         return stacks
 
     def get_layer_stacks_fused_single_fixed(self):

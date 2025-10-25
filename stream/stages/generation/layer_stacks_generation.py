@@ -11,6 +11,7 @@ from stream.workload.onnx_workload import ComputationNodeWorkload
 from itertools import combinations
 from gurobipy import Model, GRB, quicksum
 from collections import deque
+import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +64,160 @@ def ilp_min_subgraphs_gurobi(G, subgraphs, cover_edges=True):
             quicksum(x[i] for i, sg in enumerate(subgraphs) if v in sg.nodes) == 1, name=f"node_{v}_coverage"
         )
 
+    # Precompute the dependency graph between all subgraphs
+    dependency_graph = nx.DiGraph()
+    dependency_graph.add_nodes_from(range(n))
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            # Check if any node in subgraph j has a predecessor in subgraph i
+            for v in subgraphs[j].nodes:
+                predecessors = list(G.predecessors(v))
+                if any(p in subgraphs[i].nodes for p in predecessors):
+                    dependency_graph.add_edge(i, j)
+                    break
+
+    # Callback to add lazy constraints for cycle detection in the dependency graph
+    def no_cycles_callback(model, where):
+        if where == GRB.Callback.MIPSOL:
+            # Get the current solution
+            selected = [i for i in range(n) if model.cbGetSolution(x[i]) > 0.5]
+            # Build the dependency graph for the selected subgraphs
+            selected_dependency_graph = dependency_graph.subgraph(selected).copy()
+            # Check for cycles in the selected dependency graph
+            try:
+                nx.find_cycle(selected_dependency_graph, orientation="original")
+                # If a cycle is found, add a constraint to prevent this combination
+                model.cbLazy(quicksum(x[i] for i in selected) <= len(selected) - 1)
+            except nx.NetworkXNoCycle:
+                pass  # No cycle, do nothing
+
+    # Set the callback
+    model.Params.LazyConstraints = 1
+    model.optimize(no_cycles_callback)
     # Solve the model
-    model.optimize()
+    # model.optimize()
 
     print("ilp status", model.Status)
     # Extract selected subgraphs
     selected_subgraphs = [subgraphs[i] for i in range(n) if x[i].x > 0.5]
 
     return selected_subgraphs
+
+
+def cycle_check(subgraphs, graph):
+    # Create a mapping from subgraph index to its nodes
+    subgraph_indices = list(range(len(subgraphs)))
+    subgraph_nodes = [set(sg.nodes) for sg in subgraphs]
+
+    # Build a dependency graph between subgraphs
+    dependency_graph = nx.DiGraph()
+    dependency_graph.add_nodes_from(subgraph_indices)
+
+    # For each pair of subgraphs, check if any node in one has a predecessor in the other
+    for i in subgraph_indices:
+        for j in subgraph_indices:
+            if i == j:
+                continue
+            # Check if any node in subgraph j has a predecessor in subgraph i
+            for v in subgraphs[j].nodes:
+                predecessors = list(graph.predecessors(v))
+                if any(p in subgraph_nodes[i] for p in predecessors):
+                    dependency_graph.add_edge(i, j)
+                    break
+    try:
+        sorted_indices = list(nx.topological_sort(dependency_graph))
+    except nx.NetworkXUnfeasible:
+        # print("Cycle detected in dependency graph; returning original order.")
+        return False
+
+    # Return subgraphs in topological order
+    return True
+
+
+def topological_sort(selected_subgraphs, graph, draw_graph=True):
+    # Create a mapping from subgraph index to its nodes
+    subgraph_indices = list(range(len(selected_subgraphs)))
+    subgraph_nodes = [set(sg.nodes) for sg in selected_subgraphs]
+
+    # Build a dependency graph between subgraphs
+    dependency_graph = nx.DiGraph()
+    dependency_graph.add_nodes_from(subgraph_indices)
+
+    # For each pair of subgraphs, check if any node in one has a predecessor in the other
+    for i in subgraph_indices:
+        for j in subgraph_indices:
+            if i == j:
+                continue
+            # Check if any node in subgraph j has a predecessor in subgraph i
+            for v in selected_subgraphs[j].nodes:
+                predecessors = list(graph.predecessors(v))
+                if any(p in subgraph_nodes[i] for p in predecessors):
+                    dependency_graph.add_edge(i, j)
+                    break
+
+    # Optionally, draw the dependency graph
+    if draw_graph:
+        plt.figure(figsize=(10, 6))
+        pos = nx.spring_layout(dependency_graph)
+        nx.draw(
+            dependency_graph,
+            pos,
+            with_labels=True,
+            node_size=1000,
+            node_color="lightblue",
+            font_size=10,
+            font_weight="bold",
+            arrowsize=20,
+        )
+        plt.title("Dependency Graph of Selected Subgraphs")
+        plt.savefig("graph.png")
+    import matplotlib.colors as mcolors
+
+    draw_internal_graphs = True
+    colors = list(mcolors.TABLEAU_COLORS.values())
+    if draw_internal_graphs:
+        plt.figure(figsize=(12, 8))
+
+        # Create a combined graph for all subgraphs and their connections
+        combined_graph = nx.DiGraph()
+        for sg in selected_subgraphs:
+            combined_graph.add_nodes_from(sg.nodes)
+            combined_graph.add_edges_from(sg.edges)
+
+        # Draw all subgraphs with unique colors
+        pos = nx.spring_layout(combined_graph)
+        for idx, sg in enumerate(selected_subgraphs):
+            nx.draw_networkx_nodes(
+                sg, pos, nodelist=sg.nodes, node_size=500, node_color=colors[idx % len(colors)], label=f"Subgraph {idx}"
+            )
+            nx.draw_networkx_edges(sg, pos, edge_color=colors[idx % len(colors)], width=2)
+            nx.draw_networkx_labels(sg, pos, font_size=8, font_weight="bold")
+
+        # Draw grey edges for connections between subgraphs
+        for u, v in graph.edges:
+            # Check if u and v are in different subgraphs
+            u_in_subgraph = [idx for idx, sg_nodes in enumerate(subgraph_nodes) if u in sg_nodes]
+            v_in_subgraph = [idx for idx, sg_nodes in enumerate(subgraph_nodes) if v in sg_nodes]
+            if u_in_subgraph and v_in_subgraph and u_in_subgraph[0] != v_in_subgraph[0]:
+                nx.draw_networkx_edges(
+                    combined_graph, pos, edgelist=[(u, v)], edge_color="grey", width=1, style="dashed"
+                )
+
+        plt.title("Subgraphs with Input/Output Links (Grey)")
+        plt.legend(loc="upper right")
+        plt.savefig("subgraph.png")
+    # Perform topological sort
+    try:
+        sorted_indices = list(nx.topological_sort(dependency_graph))
+    except nx.NetworkXUnfeasible:
+        print("Cycle detected in dependency graph; returning original order.")
+        sorted_indices = subgraph_indices
+
+    # Return subgraphs in topological order
+    return [selected_subgraphs[i] for i in sorted_indices]
 
 
 def remove_necessary_subgraphs(subgraphs, necessary):
@@ -534,7 +681,7 @@ class LayerStacksGenerationStage(Stage):
 
         new_graph = abstract_computation_graph(self.workload)
 
-        subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=6)
+        subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=8)
         print(len(subgraphs))
         # For each subgraph, we find if they match the constraints, otherwise we discard them
         valid_subgraphs = []
@@ -546,7 +693,10 @@ class LayerStacksGenerationStage(Stage):
                         valid_subgraphs.append(subgraph)
         solution = ilp_min_subgraphs_gurobi(new_graph, valid_subgraphs + single_node_subgraphs(new_graph))
 
-        return sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in solution])
+        print(sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in solution]))
+        sorted_solution = topological_sort(solution, new_graph)
+        print(sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in sorted_solution]))
+        return sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in sorted_solution])
 
     def get_layer_stacks_fused_local_memory(self):
         """

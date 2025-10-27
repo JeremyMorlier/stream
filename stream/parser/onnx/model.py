@@ -20,7 +20,7 @@ from stream.parser.onnx.matmul import MatMulParser
 from stream.parser.onnx.mul import MulParser
 from stream.parser.onnx.operator_parser import OnnxOperatorParser
 from stream.parser.onnx.pad import PadParser
-from stream.parser.onnx.pool_grad import AveragePoolGradParser
+from stream.parser.onnx.pool_grad import PoolingGradParser
 from stream.parser.onnx.pooling import PoolingParser
 from stream.parser.onnx.reduce_1d import Reduce1DParser
 from stream.parser.onnx.reducesum import ReduceSumParser
@@ -37,6 +37,8 @@ from stream.parser.onnx.transpose import TransposeParser
 from stream.parser.onnx.unsqueeze import UnsqueezeParser
 from stream.workload.mapping import InterCoreMappingAttributes
 from stream.workload.onnx_workload import ONNXWorkload
+
+from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Set the logging level to INFO
@@ -60,6 +62,7 @@ class ONNXModelParser:
         "Add": MulParser,
         "Sub": MulParser,
         "Mul": MulParser,
+        "Sum": MulParser,
         # Special operators
         "SSM": SSMParser,
         "Softmax": SoftmaxParser,
@@ -87,7 +90,7 @@ class ONNXModelParser:
         "InPlaceAccumulatorV2": InPlaceAccumulatorParser,
         "ReluGrad": ReLUGradParser,
         "Pad": PadParser,
-        "AveragePoolGrad": AveragePoolGradParser,
+        "AveragePoolGrad": PoolingGradParser,
         "Split": SplitParser,
         "Slice": SliceParser,
         "Unsqueeze": UnsqueezeParser,
@@ -164,7 +167,25 @@ class ONNXModelParser:
 
             id_of_first_node = node_id
             for node_obj in parser.run():
-                logger.info("Parsed %s node %s id %s", node.op_type, node.name, node_id)
+                # logger.info(
+                #     "Parsed %s node %s id %s",
+                #     node.op_type,
+                #     node.name,
+                #     node_id,
+                # )
+                if isinstance(node_obj, ComputationNode):
+                    print(node_id, node.name, node.op_type, node_obj.layer_dim_sizes)
+                else:
+                    print("Parsed %s node %s id %s", node.op_type, node.name, node_id)
+                # logger.info(
+                #     "core allocation %s intra %s inter %s loop ranges %s dict %s",
+                #     node_obj.core_allocation,
+                #     node_obj.intra_core_tiling,
+                #     node_obj.inter_core_tiling,
+                #     node_obj.loop_ranges,
+                #     node_obj.__dict__,
+                # )
+                # logger.info("%i, %s, %s", node_id, node.op_type, node_obj.layer_dim_sizes)
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)
                 assert node_obj.id == node_id

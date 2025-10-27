@@ -52,11 +52,11 @@ class ConvTransposeParser(OnnxComputeOperatorParser):
         B = oa_shape[0]
         G = group_size
         K = ceil(oa_shape[1] / G)
-        OX = oa_shape[3]
-        OY = oa_shape[2]
+        OX = oa_shape[2]
+        OY = oa_shape[3]
         C = ceil(ia_shape[1] / G)
-        IX = ia_shape[3]
-        IY = ia_shape[2]
+        IX = ia_shape[2]
+        IY = ia_shape[3]
         FX = kernel_shape[0]
         FY = kernel_shape[1]
         data["loop_dims"] = ["B", "K", "G", "IX", "IY", "C", "FX", "FY"]

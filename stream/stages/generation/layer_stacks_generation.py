@@ -158,16 +158,15 @@ def topological_sort(selected_subgraphs, graph, draw_graph=True):
                 if any(p in subgraph_nodes[i] for p in predecessors):
                     dependency_graph.add_edge(i, j)
                     break
-
     # Optionally, draw the dependency graph
     if draw_graph:
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(20, 12))
         pos = nx.spring_layout(dependency_graph)
         nx.draw(
             dependency_graph,
             pos,
             with_labels=True,
-            node_size=1000,
+            node_size=500,
             node_color="lightblue",
             font_size=10,
             font_weight="bold",
@@ -218,6 +217,12 @@ def topological_sort(selected_subgraphs, graph, draw_graph=True):
         sorted_indices = subgraph_indices
 
     print(sorted_indices)
+    # sorted_indices = [0, 9, 10, 11, 2, 12, 3, 5, 4, 13, 1, 6, 8, 7, 14]
+    for i, subgraph in enumerate(selected_subgraphs):
+        str_subgraph = f"{i},   "
+        for node in subgraph:
+            str_subgraph += f"{node.type}, {node.id}      "
+        print(str_subgraph)
     print(
         "subgraph",
         [
@@ -225,80 +230,9 @@ def topological_sort(selected_subgraphs, graph, draw_graph=True):
             for i, selected_subgraph in enumerate(selected_subgraphs)
         ],
     )
+    # sorted_indices = [0, 9, 10, 1, 11, 2, 6, 8, 7, 12, 14, 3, 5, 4, 13]
     # Return subgraphs in topological order
     return [selected_subgraphs[i] for i in sorted_indices]
-
-
-def remove_necessary_subgraphs(subgraphs, necessary):
-    """
-    Removes all subgraphs that are included in the `necessary` list.
-    Comparison is done structurally (by node and edge sets).
-    """
-    necessary_signatures = [(frozenset(sg.nodes), frozenset(sg.edges)) for sg in necessary]
-
-    remaining = []
-    for sg in subgraphs:
-        sig = (frozenset(sg.nodes), frozenset(sg.edges))
-        if sig not in necessary_signatures:
-            remaining.append(sg)
-
-    return remaining
-
-
-def necessary_subgraphs(G, subgraphs):
-    necessary_subgraphs = []
-    for subgraph in subgraphs:
-        is_necessary = True
-        for subgraph2 in subgraphs:
-            if subgraph2 != subgraph:
-                if set([node.id for node in subgraph]) <= set([node.id for node in subgraph2]):
-                    is_necessary = False
-        if is_necessary:
-            necessary_subgraphs.append(subgraph)
-    return necessary_subgraphs
-
-
-def find_subgraphs(G):
-    """
-    Find all connected subgraphs of a DiGraph where the subgraph has at most one outgoing source node.
-
-    Parameters:
-    G (nx.DiGraph): The input directed graph.
-
-    Returns:
-    list: A list of connected subgraphs (each as a set of nodes) that satisfy the condition.
-    """
-    valid_subgraphs = []
-
-    # Iterate over all possible non-empty connected subgraphs
-    for node in G.nodes():
-        # Use BFS to explore connected subgraphs starting from 'node'
-        queue = [(node, {node})]  # (current_node, subgraph_nodes)
-
-        while queue:
-            current_node, subgraph_nodes = queue.pop(0)
-
-            # Check if the subgraph has at most one outgoing source node
-            if len(subgraph_nodes) > 5:
-                break
-            outgoing_sources = set()
-            for n in subgraph_nodes:
-                for neighbor in G.neighbors(n):
-                    if neighbor not in subgraph_nodes:
-                        outgoing_sources.add(n)
-                        break  # Only need to know if it has at least one outgoing edge
-
-            if len(outgoing_sources) <= 1:
-                if subgraph_nodes not in valid_subgraphs:
-                    valid_subgraphs.append(subgraph_nodes)
-
-            # Expand the subgraph by adding neighbors
-            for neighbor in G.neighbors(current_node):
-                if neighbor not in subgraph_nodes:
-                    new_subgraph = subgraph_nodes.union({neighbor})
-                    queue.append((neighbor, new_subgraph))
-
-    return valid_subgraphs
 
 
 def find_path(graph, source, computations_nodes):
@@ -340,7 +274,6 @@ def find_path(graph, source, computations_nodes):
 
 def abstract_computation_graph(original_graph):
     """
-    #TODO: add the output tensor size as the edge
     Creates a new digraph with only computation nodes, abstracting paths of non-computation nodes.
 
     Args:
@@ -349,6 +282,23 @@ def abstract_computation_graph(original_graph):
     Returns:
         nx.DiGraph: A new digraph with only computation nodes and abstracted edges.
     """
+
+    plt.figure(figsize=(20, 12))
+    pos = nx.spring_layout(original_graph)
+    node_labels = {node: node.id for node in original_graph.nodes()}
+    nx.draw(
+        original_graph,
+        pos,
+        labels=node_labels,
+        with_labels=True,
+        node_size=500,
+        node_color="lightblue",
+        font_size=10,
+        font_weight="bold",
+        arrowsize=20,
+    )
+    plt.title("Dependency Graph of Selected Subgraphs")
+    plt.savefig("graph3.png")
     # Create a new graph to store the abstracted computation graph
     abstracted_graph = nx.DiGraph()
 
@@ -389,6 +339,25 @@ def abstract_computation_graph(original_graph):
                 # Add the edge to the abstracted graph with the tensor size
                 abstracted_graph.add_edge(u, v, tensor_size=tensor_size)
 
+    for node in abstracted_graph:
+        if node.id == 53:
+            print(list(abstracted_graph.predecessors(node)))
+    plt.figure(figsize=(20, 12))
+    pos = nx.spring_layout(abstracted_graph)
+    node_labels = {node: node.id for node in abstracted_graph.nodes()}
+    nx.draw(
+        abstracted_graph,
+        pos,
+        labels=node_labels,
+        with_labels=True,
+        node_size=500,
+        node_color="lightblue",
+        font_size=10,
+        font_weight="bold",
+        arrowsize=20,
+    )
+    plt.title("Dependency Graph of Selected Subgraphs")
+    plt.savefig("graph2.png")
     return abstracted_graph
 
 
@@ -560,8 +529,8 @@ class LayerStacksGenerationStage(Stage):
             > 1
         ):
             return False
-        # if subgraph_types.count("sub") > 0 and len(graph) > 1:
-        #     return False
+        if subgraph_types.count("sub") > 0 and len(graph) > 1:
+            return False
         return True
 
     def check_length_subgraph(self, graph, max_length: int = 5):
@@ -628,7 +597,6 @@ class LayerStacksGenerationStage(Stage):
         visited_sets = set()
 
         for start_node in G.nodes:
-            print(start_node.id)
             queue = deque()
             queue.append({start_node})
 

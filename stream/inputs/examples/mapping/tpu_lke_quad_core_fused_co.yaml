@@ -1,0 +1,146 @@
+- name: default
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+
+- name: Conv
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - OY, all
+  inter_core_tiling:
+    - K, *
+
+- name: Gemm
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+
+- name: Matmul
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+
+- name: Pool
+  core_allocation: [4]
+  intra_core_tiling:
+    - OY, all
+  inter_core_tiling:
+    - K, *
+
+- name: MaxPool
+  core_allocation: [4]
+  intra_core_tiling:
+    - OY, all
+  inter_core_tiling:
+    - K, *
+
+- name: AveragePool
+  core_allocation: [4]
+  intra_core_tiling:
+    - OY, all
+  inter_core_tiling:
+    - K, *
+
+- name: GlobalAveragePool
+  core_allocation: [4]
+  intra_core_tiling:
+    - OY, all
+  inter_core_tiling:
+    - K, *
+
+- name: Add
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+- name: Div
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+- name: Sqrt
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+- name: Sub
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+- name: Sum
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+
+- name: Mul
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+- name: Relu
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+- name: ReluGrad
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, *
+
+- name: ConvTranspose
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - IY, all
+  inter_core_tiling:
+    - K, *
+
+- name: MatMul
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, *
+
+- name: ReduceSum
+  core_allocation: [5]
+  intra_core_tiling:
+    - K, all
+  inter_core_tiling:
+    - B, 1
+
+- name: SoftmaxCrossEntropyLossGrad
+  core_allocation: [5]
+  intra_core_tiling:
+    - H, all
+  inter_core_tiling:
+    - B, 1
+- name: AveragePoolGrad
+  core_allocation: [4]
+  intra_core_tiling:
+    - IY, all
+  inter_core_tiling:
+    - K, *

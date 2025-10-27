@@ -9,7 +9,7 @@ from stream.stages.stage import Stage, StageCallable
 from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.onnx_workload import ComputationNodeWorkload
 from itertools import combinations
-from gurobipy import Model, GRB, quicksum
+from gurobipy import Model, GRB, quicksum, Env
 from collections import deque
 import matplotlib.pyplot as plt
 
@@ -48,61 +48,62 @@ def ilp_min_subgraphs_gurobi(G, subgraphs, cover_edges=True):
     """
     n = len(subgraphs)
 
-    # Create Gurobi model
-    model = Model("MinSubgraphs")
-    model.Params.OutputFlag = 0  # Turn off solver output
+    with Env() as env:
+        # Create Gurobi model
+        model = Model("MinSubgraphs", env=env)
+        model.Params.OutputFlag = 0  # Turn off solver output
 
-    # Decision variables
-    x = [model.addVar(vtype=GRB.BINARY, name=f"x_{i}") for i in range(n)]
+        # Decision variables
+        x = [model.addVar(vtype=GRB.BINARY, name=f"x_{i}") for i in range(n)]
 
-    # Objective: minimize number of subgraphs selected
-    model.setObjective(quicksum(x), GRB.MINIMIZE)
+        # Objective: minimize number of subgraphs selected
+        model.setObjective(quicksum(x), GRB.MINIMIZE)
 
-    # Node coverage constraints: each node must appear in exactly one selected subgraph
-    for v in G.nodes:
-        model.addConstr(
-            quicksum(x[i] for i, sg in enumerate(subgraphs) if v in sg.nodes) == 1, name=f"node_{v}_coverage"
-        )
+        # Node coverage constraints: each node must appear in exactly one selected subgraph
+        for v in G.nodes:
+            model.addConstr(
+                quicksum(x[i] for i, sg in enumerate(subgraphs) if v in sg.nodes) == 1, name=f"node_{v}_coverage"
+            )
 
-    # Precompute the dependency graph between all subgraphs
-    dependency_graph = nx.DiGraph()
-    dependency_graph.add_nodes_from(range(n))
+        # Precompute the dependency graph between all subgraphs
+        dependency_graph = nx.DiGraph()
+        dependency_graph.add_nodes_from(range(n))
 
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            # Check if any node in subgraph j has a predecessor in subgraph i
-            for v in subgraphs[j].nodes:
-                predecessors = list(G.predecessors(v))
-                if any(p in subgraphs[i].nodes for p in predecessors):
-                    dependency_graph.add_edge(i, j)
-                    break
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                # Check if any node in subgraph j has a predecessor in subgraph i
+                for v in subgraphs[j].nodes:
+                    predecessors = list(G.predecessors(v))
+                    if any(p in subgraphs[i].nodes for p in predecessors):
+                        dependency_graph.add_edge(i, j)
+                        break
 
-    # Callback to add lazy constraints for cycle detection in the dependency graph
-    def no_cycles_callback(model, where):
-        if where == GRB.Callback.MIPSOL:
-            # Get the current solution
-            selected = [i for i in range(n) if model.cbGetSolution(x[i]) > 0.5]
-            # Build the dependency graph for the selected subgraphs
-            selected_dependency_graph = dependency_graph.subgraph(selected).copy()
-            # Check for cycles in the selected dependency graph
-            try:
-                nx.find_cycle(selected_dependency_graph, orientation="original")
-                # If a cycle is found, add a constraint to prevent this combination
-                model.cbLazy(quicksum(x[i] for i in selected) <= len(selected) - 1)
-            except nx.NetworkXNoCycle:
-                pass  # No cycle, do nothing
+        # Callback to add lazy constraints for cycle detection in the dependency graph
+        def no_cycles_callback(model, where):
+            if where == GRB.Callback.MIPSOL:
+                # Get the current solution
+                selected = [i for i in range(n) if model.cbGetSolution(x[i]) > 0.5]
+                # Build the dependency graph for the selected subgraphs
+                selected_dependency_graph = dependency_graph.subgraph(selected).copy()
+                # Check for cycles in the selected dependency graph
+                try:
+                    nx.find_cycle(selected_dependency_graph, orientation="original")
+                    # If a cycle is found, add a constraint to prevent this combination
+                    model.cbLazy(quicksum(x[i] for i in selected) <= len(selected) - 1)
+                except nx.NetworkXNoCycle:
+                    pass  # No cycle, do nothing
 
-    # Set the callback
-    model.Params.LazyConstraints = 1
-    model.optimize(no_cycles_callback)
-    # Solve the model
-    # model.optimize()
+        # Set the callback
+        model.Params.LazyConstraints = 1
+        model.optimize(no_cycles_callback)
+        # Solve the model
+        # model.optimize()
 
-    print("ilp status", model.Status)
-    # Extract selected subgraphs
-    selected_subgraphs = [subgraphs[i] for i in range(n) if x[i].x > 0.5]
+        print("ilp status", model.Status)
+        # Extract selected subgraphs
+        selected_subgraphs = [subgraphs[i] for i in range(n) if x[i].x > 0.5]
 
     return selected_subgraphs
 
@@ -216,6 +217,14 @@ def topological_sort(selected_subgraphs, graph, draw_graph=True):
         print("Cycle detected in dependency graph; returning original order.")
         sorted_indices = subgraph_indices
 
+    print(sorted_indices)
+    print(
+        "subgraph",
+        [
+            ([(node.id, node.type) for node in selected_subgraph], i)
+            for i, selected_subgraph in enumerate(selected_subgraphs)
+        ],
+    )
     # Return subgraphs in topological order
     return [selected_subgraphs[i] for i in sorted_indices]
 
@@ -543,6 +552,16 @@ class LayerStacksGenerationStage(Stage):
             return False
         if subgraph_types.count("gemm") + subgraph_types.count("matmul") > 1:
             return False
+        if (
+            subgraph_types.count("gemm")
+            + subgraph_types.count("matmul")
+            + subgraph_types.count("conv")
+            + subgraph_types.count("convtranspose")
+            > 1
+        ):
+            return False
+        # if subgraph_types.count("sub") > 0 and len(graph) > 1:
+        #     return False
         return True
 
     def check_length_subgraph(self, graph, max_length: int = 5):
@@ -681,7 +700,7 @@ class LayerStacksGenerationStage(Stage):
 
         new_graph = abstract_computation_graph(self.workload)
 
-        subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=8)
+        subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=6)
         print(len(subgraphs))
         # For each subgraph, we find if they match the constraints, otherwise we discard them
         valid_subgraphs = []
@@ -693,10 +712,8 @@ class LayerStacksGenerationStage(Stage):
                         valid_subgraphs.append(subgraph)
         solution = ilp_min_subgraphs_gurobi(new_graph, valid_subgraphs + single_node_subgraphs(new_graph))
 
-        print(sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in solution]))
         sorted_solution = topological_sort(solution, new_graph)
-        print(sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in sorted_solution]))
-        return sorted([tuple(sorted([node.id for node in subgraph])) for subgraph in sorted_solution])
+        return [tuple(sorted([node.id for node in subgraph])) for subgraph in sorted_solution]
 
     def get_layer_stacks_fused_local_memory(self):
         """

@@ -272,7 +272,7 @@ def find_path(graph, source, computations_nodes):
     return paths
 
 
-def abstract_computation_graph(original_graph):
+def abstract_computation_graph(original_graph, weight_cap=None):
     """
     Creates a new digraph with only computation nodes, abstracting paths of non-computation nodes.
 
@@ -308,13 +308,19 @@ def abstract_computation_graph(original_graph):
     # Add all computation nodes to the new graph
     for node in computation_nodes:
         # add some attributes to make the partitionning easier
-        try:
-            op = next(op for op in node.constant_operands)
-            size = node.operand_size_bit[op]
-        except StopIteration:
-            size = 0
-
+        size = 0
+        for op in node.constant_operands:
+            size += node.operand_size_bit[op]
+        # try:
+        #     op = next(op for op in node.constant_operands)
+        #     size = node.operand_size_bit[op]
+        # except StopIteration:
+        #     size = 0
+        if weight_cap :
+            weight_capactiies = [weight_cap[alloc] for alloc in node.possible_core_allocation]
+            # print(node.type, node.id, size, node.constant_operands, weight_capactiies, any([wc<size for wc in weight_capactiies]))
         intra_core_tiling = node.intra_core_tiling
+        print(node.id, node.name, node.type, node.intra_core_tiling, node.layer_dim_sizes)
         tiling = node.layer_dim_sizes[intra_core_tiling[0][0]]
         abstracted_graph.add_node(
             node,
@@ -547,7 +553,8 @@ class LayerStacksGenerationStage(Stage):
 
     def check_memory_constraint(self, subgraph, graph):
         subgraphs_mem_per_cores = nx.get_node_attributes(subgraph, "mem_size_per_core")
-        subgraph_nodes = set(graph.nodes())
+        # print(subgraphs_mem_per_cores)
+        subgraph_nodes = set(subgraph.nodes())
         for core_id in self.weight_capacities:
             core_allocated_mem = 0
             for node, node_mem_per_core in subgraphs_mem_per_cores.items():
@@ -563,7 +570,6 @@ class LayerStacksGenerationStage(Stage):
                             # Add the cost from the edge to the core's allocated memory
                             # Assuming the cost is stored as 'cost' or 'tensor_size'
                             cost = edge_data.get("tensor_size", 0)  # or "tensor_size"
-                            print(cost, predecessor.id, node.id)
                             core_allocated_mem += cost
             if core_allocated_mem > self.weight_capacities[core_id]:
                 return False
@@ -666,7 +672,7 @@ class LayerStacksGenerationStage(Stage):
         We use a Backtracking approach to find all possible subgraphs, then we find all possible complete graph and we select the best(still using backtracking)
         """
 
-        new_graph = abstract_computation_graph(self.workload)
+        new_graph = abstract_computation_graph(self.workload, self.weight_capacities)
 
         subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=6)
         print(len(subgraphs))

@@ -1,0 +1,62 @@
+# Four TPU-like compute cores + pooling, SIMD and off-chip DRAM controller
+name: tpu_like_quad_core
+
+cores:
+  0: ./cores/tpu_like.yaml   # compute A
+  1: ./cores/tpu_like.yaml   # compute B
+  2: ./cores/tpu_like.yaml   # compute C
+  3: ./cores/tpu_like.yaml   # compute D
+  4: ./cores/pooling.yaml    # pooling engine
+  5: ./cores/simd.yaml       # SIMD unit
+  6: ./cores/offchip.yaml    # DRAM controller
+
+offchip_core_id: 6     # core that fronts external memory
+unit_energy_cost: 0    # default energy for core_connectivity
+
+core_connectivity:
+  # ───── 2-D mesh among the four compute cores ─────
+  - type: link
+    cores: [0, 1]
+    bandwidth: 128
+  - type: link
+    cores: [1, 2]
+    bandwidth: 128
+  - type: link
+    cores: [2, 3]
+    bandwidth: 128
+  - type: link
+    cores: [3, 0]
+    bandwidth: 128
+
+  # ───── Pooling core connected to every compute core ─────
+  - type: link
+    cores: [0, 4]
+    bandwidth: 128
+  - type: link
+    cores: [1, 4]
+    bandwidth: 128
+  - type: link
+    cores: [2, 4]
+    bandwidth: 128
+  - type: link
+    cores: [3, 4]
+    bandwidth: 128
+
+  # ───── SIMD core connected to every compute core ─────
+  - type: link
+    cores: [0, 5]
+    bandwidth: 128
+  - type: link
+    cores: [1, 5]
+    bandwidth: 128
+  - type: link
+    cores: [2, 5]
+    bandwidth: 128
+  - type: link
+    cores: [3, 5]
+    bandwidth: 128
+
+  # ───── Shared bus to off-chip memory (all cores ↔ DRAM) ─────
+  - type: bus
+    cores: [0, 1, 2, 3, 4, 5, 6]
+    bandwidth: 512        # wider than on-chip point-to-point links

@@ -3,7 +3,7 @@ type: memory
 
 memories:
   dram:
-    size: 10000000000
+    size: 100000000000000
     r_cost: 1000
     w_cost: 1000
     area: 0

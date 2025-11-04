@@ -101,7 +101,7 @@ def ilp_min_subgraphs_gurobi(G, subgraphs, cover_edges=True):
         # Solve the model
         # model.optimize()
 
-        print("ilp status", model.Status)
+        # print("ilp status", model.Status)
         # Extract selected subgraphs
         selected_subgraphs = [subgraphs[i] for i in range(n) if x[i].x > 0.5]
 
@@ -158,57 +158,7 @@ def topological_sort(selected_subgraphs, graph, draw_graph=True):
                 if any(p in subgraph_nodes[i] for p in predecessors):
                     dependency_graph.add_edge(i, j)
                     break
-    # Optionally, draw the dependency graph
-    if draw_graph:
-        plt.figure(figsize=(20, 12))
-        pos = nx.spring_layout(dependency_graph)
-        nx.draw(
-            dependency_graph,
-            pos,
-            with_labels=True,
-            node_size=500,
-            node_color="lightblue",
-            font_size=10,
-            font_weight="bold",
-            arrowsize=20,
-        )
-        plt.title("Dependency Graph of Selected Subgraphs")
-        plt.savefig("graph.png")
-    import matplotlib.colors as mcolors
 
-    draw_internal_graphs = True
-    colors = list(mcolors.TABLEAU_COLORS.values())
-    if draw_internal_graphs:
-        plt.figure(figsize=(12, 8))
-
-        # Create a combined graph for all subgraphs and their connections
-        combined_graph = nx.DiGraph()
-        for sg in selected_subgraphs:
-            combined_graph.add_nodes_from(sg.nodes)
-            combined_graph.add_edges_from(sg.edges)
-
-        # Draw all subgraphs with unique colors
-        pos = nx.spring_layout(combined_graph)
-        for idx, sg in enumerate(selected_subgraphs):
-            nx.draw_networkx_nodes(
-                sg, pos, nodelist=sg.nodes, node_size=500, node_color=colors[idx % len(colors)], label=f"Subgraph {idx}"
-            )
-            nx.draw_networkx_edges(sg, pos, edge_color=colors[idx % len(colors)], width=2)
-            nx.draw_networkx_labels(sg, pos, font_size=8, font_weight="bold")
-
-        # Draw grey edges for connections between subgraphs
-        for u, v in graph.edges:
-            # Check if u and v are in different subgraphs
-            u_in_subgraph = [idx for idx, sg_nodes in enumerate(subgraph_nodes) if u in sg_nodes]
-            v_in_subgraph = [idx for idx, sg_nodes in enumerate(subgraph_nodes) if v in sg_nodes]
-            if u_in_subgraph and v_in_subgraph and u_in_subgraph[0] != v_in_subgraph[0]:
-                nx.draw_networkx_edges(
-                    combined_graph, pos, edgelist=[(u, v)], edge_color="grey", width=1, style="dashed"
-                )
-
-        plt.title("Subgraphs with Input/Output Links (Grey)")
-        plt.legend(loc="upper right")
-        plt.savefig("subgraph.png")
     # Perform topological sort
     try:
         sorted_indices = list(nx.topological_sort(dependency_graph))
@@ -216,21 +166,6 @@ def topological_sort(selected_subgraphs, graph, draw_graph=True):
         print("Cycle detected in dependency graph; returning original order.")
         sorted_indices = subgraph_indices
 
-    print(sorted_indices)
-    # sorted_indices = [0, 9, 10, 11, 2, 12, 3, 5, 4, 13, 1, 6, 8, 7, 14]
-    for i, subgraph in enumerate(selected_subgraphs):
-        str_subgraph = f"{i},   "
-        for node in subgraph:
-            str_subgraph += f"{node.type}, {node.id}      "
-        print(str_subgraph)
-    print(
-        "subgraph",
-        [
-            ([(node.id, node.type) for node in selected_subgraph], i)
-            for i, selected_subgraph in enumerate(selected_subgraphs)
-        ],
-    )
-    # sorted_indices = [0, 9, 10, 1, 11, 2, 6, 8, 7, 12, 14, 3, 5, 4, 13]
     # Return subgraphs in topological order
     return [selected_subgraphs[i] for i in sorted_indices]
 
@@ -283,22 +218,22 @@ def abstract_computation_graph(original_graph, weight_cap=None):
         nx.DiGraph: A new digraph with only computation nodes and abstracted edges.
     """
 
-    plt.figure(figsize=(20, 12))
-    pos = nx.spring_layout(original_graph)
-    node_labels = {node: node.id for node in original_graph.nodes()}
-    nx.draw(
-        original_graph,
-        pos,
-        labels=node_labels,
-        with_labels=True,
-        node_size=500,
-        node_color="lightblue",
-        font_size=10,
-        font_weight="bold",
-        arrowsize=20,
-    )
-    plt.title("Dependency Graph of Selected Subgraphs")
-    plt.savefig("graph3.png")
+    # plt.figure(figsize=(20, 12))
+    # pos = nx.spring_layout(original_graph)
+    # node_labels = {node: node.id for node in original_graph.nodes()}
+    # nx.draw(
+    #     original_graph,
+    #     pos,
+    #     labels=node_labels,
+    #     with_labels=True,
+    #     node_size=500,
+    #     node_color="lightblue",
+    #     font_size=10,
+    #     font_weight="bold",
+    #     arrowsize=20,
+    # )
+    # plt.title("Dependency Graph of Selected Subgraphs")
+    # plt.savefig("graph3.png")
     # Create a new graph to store the abstracted computation graph
     abstracted_graph = nx.DiGraph()
 
@@ -316,15 +251,15 @@ def abstract_computation_graph(original_graph, weight_cap=None):
         #     size = node.operand_size_bit[op]
         # except StopIteration:
         #     size = 0
-        if weight_cap :
+        if weight_cap:
             weight_capactiies = [weight_cap[alloc] for alloc in node.possible_core_allocation]
             # print(node.type, node.id, size, node.constant_operands, weight_capactiies, any([wc<size for wc in weight_capactiies]))
         intra_core_tiling = node.intra_core_tiling
-        print(node.id, node.name, node.type, node.intra_core_tiling, node.layer_dim_sizes)
+        # print(node.id, node.name, node.type, node.intra_core_tiling, node.layer_dim_sizes)
         tiling = node.layer_dim_sizes[intra_core_tiling[0][0]]
         abstracted_graph.add_node(
             node,
-            mem_size=size,
+            mem_size=int(size / len(node.possible_core_allocation)),
             # mem_size_per_core={
             #     allocation: float(size / len(node.possible_core_allocation))
             #     for allocation in node.possible_core_allocation
@@ -345,25 +280,24 @@ def abstract_computation_graph(original_graph, weight_cap=None):
                 # Add the edge to the abstracted graph with the tensor size
                 abstracted_graph.add_edge(u, v, tensor_size=tensor_size)
 
-    for node in abstracted_graph:
-        if node.id == 53:
-            print(list(abstracted_graph.predecessors(node)))
-    plt.figure(figsize=(20, 12))
-    pos = nx.spring_layout(abstracted_graph)
-    node_labels = {node: node.id for node in abstracted_graph.nodes()}
-    nx.draw(
-        abstracted_graph,
-        pos,
-        labels=node_labels,
-        with_labels=True,
-        node_size=500,
-        node_color="lightblue",
-        font_size=10,
-        font_weight="bold",
-        arrowsize=20,
-    )
-    plt.title("Dependency Graph of Selected Subgraphs")
-    plt.savefig("graph2.png")
+    # for node in abstracted_graph:
+
+    # plt.figure(figsize=(20, 12))
+    # pos = nx.spring_layout(abstracted_graph)
+    # node_labels = {node: node.id for node in abstracted_graph.nodes()}
+    # nx.draw(
+    #     abstracted_graph,
+    #     pos,
+    #     labels=node_labels,
+    #     with_labels=True,
+    #     node_size=500,
+    #     node_color="lightblue",
+    #     font_size=10,
+    #     font_weight="bold",
+    #     arrowsize=20,
+    # )
+    # plt.title("Dependency Graph of Selected Subgraphs")
+    # plt.savefig("graph2.png")
     return abstracted_graph
 
 
@@ -523,19 +457,14 @@ class LayerStacksGenerationStage(Stage):
         """any subgraph with two gemm/matmul should not be considered as well as subgraph with more than 2 convolutions"""
 
         subgraph_types = [node.type for node in graph]
-        if subgraph_types.count("conv") > 3:
+        if subgraph_types.count("conv") > 3 or subgraph_types.count("convtranpose") > 3:
             return False
         if subgraph_types.count("gemm") + subgraph_types.count("matmul") > 1:
             return False
-        if (
-            subgraph_types.count("gemm")
-            + subgraph_types.count("matmul")
-            + subgraph_types.count("conv")
-            + subgraph_types.count("convtranspose")
-            > 1
-        ):
-            return False
-        if subgraph_types.count("sub") > 0 and len(graph) > 1:
+
+        if (subgraph_types.count("gemm") + subgraph_types.count("matmul")) > 0 and subgraph_types.count(
+            "conv"
+        ) + subgraph_types.count("convtranspose") > 1:
             return False
         return True
 
@@ -561,16 +490,16 @@ class LayerStacksGenerationStage(Stage):
                 if core_id in node_mem_per_core:
                     core_allocated_mem += node_mem_per_core[core_id]
 
-                for predecessor in graph.predecessors(node):
-                    # print(predecessor in subgraph_nodes)
-                    if predecessor not in subgraph_nodes:
-                        # Get the edge data for the edge (predecessor -> node)
-                        edge_data = graph.get_edge_data(predecessor, node)
-                        if edge_data:
-                            # Add the cost from the edge to the core's allocated memory
-                            # Assuming the cost is stored as 'cost' or 'tensor_size'
-                            cost = edge_data.get("tensor_size", 0)  # or "tensor_size"
-                            core_allocated_mem += cost
+                # for predecessor in graph.predecessors(node):
+                #     # print(predecessor in subgraph_nodes)
+                #     if predecessor not in subgraph_nodes:
+                #         # Get the edge data for the edge (predecessor -> node)
+                #         edge_data = graph.get_edge_data(predecessor, node)
+                #         if edge_data:
+                #             # Add the cost from the edge to the core's allocated memory
+                #             # Assuming the cost is stored as 'cost' or 'tensor_size'
+                #             cost = edge_data.get("tensor_size", 0)  # or "tensor_size"
+                #             core_allocated_mem += cost
             if core_allocated_mem > self.weight_capacities[core_id]:
                 return False
 
@@ -675,7 +604,6 @@ class LayerStacksGenerationStage(Stage):
         new_graph = abstract_computation_graph(self.workload, self.weight_capacities)
 
         subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=6)
-        print(len(subgraphs))
         # For each subgraph, we find if they match the constraints, otherwise we discard them
         valid_subgraphs = []
         for subgraph in subgraphs:

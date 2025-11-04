@@ -34,6 +34,9 @@ class TilingGenerationStage(Stage):
             "relu": LayerDim("K"),
             "gelu": LayerDim("K"),
             "silu": LayerDim("K"),
+            "convtranspose": LayerDim("IY"),
+            "sub": LayerDim("K"),
+            "sqrt": LayerDim("K"),
         },
     )
     FUSION_PARTITION_SIZE_DEFAULT = 2
@@ -197,6 +200,7 @@ class TilingGenerationStage(Stage):
     @staticmethod
     def split_operator(model: ModelProto, node_name: str, num_splits: int):  # noqa: PLR0915
         """
+        NOTE: this function is not called anywhere should it stay here ?
         Replaces an ONNX Conv or Gemm operator in an ONNX model with a sequence of Conv operators with smaller kernel
         sizes that are concatenated together. The output channels of each new operator are equal to the output channels
         of the original operator divided by num_splits. Returns the names of the output tensors of the new

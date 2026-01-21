@@ -437,11 +437,15 @@ class LayerStacksGenerationStage(Stage):
         subgraph_types = [node.type for node in subgraph]
         MAX_CONV = 3
         MAX_GEMM = 1
-        if subgraph_types.count("conv") > MAX_CONV or subgraph_types.count("convtranpose") > MAX_CONV:
+        if subgraph_types.count("conv") > MAX_CONV or subgraph_types.count("convtranspose") > MAX_CONV:
             return False
         if subgraph_types.count("gemm") + subgraph_types.count("matmul") > MAX_GEMM:
             return False
 
+        if (subgraph_types.count("gemm") + subgraph_types.count("matmul")) > 0 and subgraph_types.count(
+            "conv"
+        ) + subgraph_types.count("convtranspose") > 1:
+            return False
         return True
 
     def check_length_subgraph(self, graph, max_length: int = 5):
@@ -572,7 +576,7 @@ class LayerStacksGenerationStage(Stage):
 
         new_graph = abstract_computation_graph(self.workload, self.weight_capacities)
 
-        valid_subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=None)
+        valid_subgraphs = self.find_valid_subgraphs_bfs(new_graph, max_size=6)
         solution = ilp_min_subgraphs_gurobi(new_graph, valid_subgraphs + single_node_subgraphs(new_graph))
 
         sorted_solution = topological_sort(solution, new_graph)

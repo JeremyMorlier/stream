@@ -164,7 +164,13 @@ class ONNXModelParser:
 
             id_of_first_node = node_id
             for node_obj in parser.run():
-                logger.info("Parsed %s node %s id %s", node.op_type, node.name, node_id)
+                logger.info(
+                    "Parsed %s node %s id %s layer_dim_sizes %s",
+                    node.op_type,
+                    node.name,
+                    node_id,
+                    node_obj.layer_dim_sizes,
+                )
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)
                 assert node_obj.id == node_id

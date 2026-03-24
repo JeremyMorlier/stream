@@ -341,12 +341,14 @@ class Accelerator:
     ) -> int:
         return self.communication_manager.block_offchip_links(too_large_operands, core_id, start_timestep, duration, cn)
 
-    def get_area(self):
-        total_area = 0
+    @property
+    def area(self) -> float:
+        total_area = 0.0
         for core in self.core_list:
             try:
                 area = core.get_area()
-            except (AttributeError, NotImplementedError):
+            except Exception as e:
+                print(f"error getting area for core, defaulting to 0 area for this core: {e}")
                 continue
             if area is not None:
                 total_area += area

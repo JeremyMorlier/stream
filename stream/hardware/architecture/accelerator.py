@@ -41,7 +41,7 @@ class Accelerator:
         self.communication_manager = CommunicationManager(self)
 
     def get_core(self, core_id: int) -> Core:
-        """s
+        """
         Return the core with id 'core_id'.
         Raises ValueError() when a core_id is not found in the available cores.
         """
@@ -340,6 +340,17 @@ class Accelerator:
         cn: ComputationNode,
     ) -> int:
         return self.communication_manager.block_offchip_links(too_large_operands, core_id, start_timestep, duration, cn)
+
+    def get_area(self):
+        total_area = 0
+        for core in self.core_list:
+            try:
+                area = core.get_area()
+            except (AttributeError, NotImplementedError):
+                continue
+            if area is not None:
+                total_area += area
+        return total_area
 
     @property
     def core_list(self) -> list[Core]:

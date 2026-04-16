@@ -326,6 +326,7 @@ class ConstraintOptimizationAllocationStage(Stage):
 
             sg = self.workload.get_subgraph(nodes)
             sink_nodes = self._get_sorted_sink_nodes(sg)
+            print(f"Stack {i} with layers {stack} has sink nodes {[n.id for n in sink_nodes]}.")
             self._process_stack_sink_nodes(stack, sink_nodes, sg)
 
         self._log_steady_state_statistics()
@@ -337,6 +338,7 @@ class ConstraintOptimizationAllocationStage(Stage):
             if len(get_real_successors(n, sg)) == 0  # type: ignore
         )
         sink_layer_ids = sorted(set(n.id for n in sink_nodes))
+        print(sink_layer_ids)
         assert len(sink_layer_ids) == 1, "Expected only one sink layer per layer stack. Update your layer stacks."
         return sorted(sink_nodes)
 
@@ -555,6 +557,7 @@ class ConstraintOptimizationAllocationStage(Stage):
         self.set_fixed_allocations_for_workload(unpartitioned_sub_workload, allocation)
         # Generate/check inter core mapping for all nodes
         self.update_inter_core_mapping(unpartitioned_sub_workload, allocation)
+        self.visualize_unpartitioned_workload_graph(unpartitioned_sub_workload)
         scheduling_order = self.get_scheduling_order(allocation)
 
         loma_lpf_limit = 7
@@ -568,6 +571,7 @@ class ConstraintOptimizationAllocationStage(Stage):
         kwargs["cost_lut_path"] = self.cost_lut_post_co_path
         kwargs["latency_attr"] = self.latency_attr
         kwargs["fix_all"] = True  # Fix all core allocations to the given ones
+        kwargs["unrolled_allocation"] = allocation
 
         # Create stages that will run a single cost model evaluation (fixed core allocations)
         main_stage = MainStage(
@@ -582,6 +586,39 @@ class ConstraintOptimizationAllocationStage(Stage):
         scme, _ = main_stage.run()
         scme = scme[0]
         return scme
+
+    def visualize_unpartitioned_workload_graph(self, workload: DNNWorkloadStream):
+        """Render the unpartitioned post-CO workload graph to a PNG file."""
+        try:
+            from networkx.drawing.nx_pydot import to_pydot  # type: ignore
+        except ImportError:
+            logger.warning("Skipping unpartitioned workload visualization: nx_pydot is not available.")
+            return
+
+        output_dir = os.path.dirname(self.tiled_workload_post_co_path)
+        os.makedirs(output_dir, exist_ok=True)
+        fig_path = os.path.join(output_dir, "unpartitioned_workload_post_co.png")
+
+        dot = to_pydot(workload)
+        dot.set_rankdir("LR")
+        dot.set_concentrate(True)
+
+        for node in workload.nodes():
+            dot_nodes = dot.get_node(str(node))
+            if not dot_nodes:
+                continue
+            dot_node = dot_nodes[0]
+            core_alloc = getattr(node, "possible_core_allocation", None)
+            dot_node.set_label(f"{node.name}\\n(id={node.id}, sub={node.sub_id})\\ncores={core_alloc}")
+            dot_node.set_shape("box")
+            dot_node.set_style("filled")
+            dot_node.set_fillcolor("#bbdefb")
+
+        try:
+            dot.write_png(fig_path)
+            logger.info("Saved unpartitioned post-CO workload graph to %s.", fig_path)
+        except Exception:
+            logger.exception("Failed to save unpartitioned post-CO workload graph to %s.", fig_path)
 
     def update_inter_core_mapping(
         self, unpartitioned_sub_workload: ComputationNodeWorkload, allocation: TimeSlotAllocation

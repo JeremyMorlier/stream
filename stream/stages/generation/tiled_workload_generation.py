@@ -117,6 +117,8 @@ class TiledWorkloadGenerationStage(Stage):
         # Memoize the numpy tensors for dependency generation
         self.numpy_tensors: dict[tuple[ComputationNode, LayerOperand], NodeTensor] = {}
         self.tiled_workload_path = tiled_workload_path
+        self.allocations_path: str | None = kwargs.get("allocations_path")
+        self.unrolled_allocation = kwargs.get("unrolled_allocation")
 
     def run(self):
         all_unique_tiles: list[ComputationNode] = []
@@ -182,7 +184,235 @@ class TiledWorkloadGenerationStage(Stage):
         sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
         yield from sub_stage.run()
 
+        warmup_node_keys, steady_state_node_keys, cooldown_node_keys, repeating_steady_state_node_keys = (
+            self.get_phase_node_keys()
+        )
+        self.visualize_tiled_workload_graph(
+            tiled_workload,
+            warmup_node_keys,
+            steady_state_node_keys,
+            cooldown_node_keys,
+            repeating_steady_state_node_keys,
+        )
         yield None, None
+
+    def get_phase_node_keys(
+        self,
+    ) -> tuple[
+        set[tuple[int, int]],
+        set[tuple[int, int]],
+        set[tuple[int, int]],
+        set[tuple[int, int]],
+    ]:
+        """Return warmup/steady/cooldown and repeating steady-state node keys.
+
+        Returns:
+            tuple[
+                set[(node_id, node_sub_id)],  # warmup
+                set[(node_id, node_sub_id)],  # steady-state
+                set[(node_id, node_sub_id)],  # cooldown
+                set[(node_id, node_sub_id)],  # steady-state nodes recurring across multiple slots
+            ]
+        """
+        warmup_keys: set[tuple[int, int]] = set()
+        steady_state_keys: set[tuple[int, int]] = set()
+        cooldown_keys: set[tuple[int, int]] = set()
+        ss_node_slots: dict[tuple[int, int], set[int]] = defaultdict(set)
+
+        # Preferred source: unrolled TimeSlotAllocation carries explicit node phases.
+        if self.unrolled_allocation is not None and hasattr(self.unrolled_allocation, "allocations"):
+            node_types = getattr(self.unrolled_allocation, "_node_types", {})
+            for entry in self.unrolled_allocation.allocations:
+                if not isinstance(entry, tuple) or len(entry) < 3:
+                    continue
+                slot, _, node = entry
+                if not isinstance(slot, int) or not hasattr(node, "id") or not hasattr(node, "sub_id"):
+                    continue
+                node_key = (node.id, node.sub_id)
+                node_type = node_types.get(node)
+                node_type_name = getattr(node_type, "name", "STEADY_STATE")
+                if node_type_name == "WARMUP":
+                    warmup_keys.add(node_key)
+                elif node_type_name == "COOLDOWN":
+                    cooldown_keys.add(node_key)
+                else:
+                    steady_state_keys.add(node_key)
+                    ss_node_slots[node_key].add(slot)
+
+            repeating_ss_keys = {node_key for node_key, slots in ss_node_slots.items() if len(slots) > 1}
+            return warmup_keys, steady_state_keys, cooldown_keys, repeating_ss_keys
+
+        # Fallback source: steady-state allocations from MILP cache.
+        if not self.allocations_path or not os.path.isdir(self.allocations_path):
+            return set(), set(), set(), set()
+
+        steady_state_files = sorted(
+            filename
+            for filename in os.listdir(self.allocations_path)
+            if filename.startswith("steady_state-") and filename.endswith(".pickle")
+        )
+        node_keys: set[tuple[int, int]] = set()
+
+        for filename in steady_state_files:
+            filepath = os.path.join(self.allocations_path, filename)
+            try:
+                allocation = pickle_load(filepath)
+            except Exception:
+                logger.exception("Failed to load steady-state allocation from %s.", filepath)
+                continue
+
+            if not isinstance(allocation, list):
+                continue
+
+            # Expected format from allocator:
+            # list[tuple[slot, core_id, tuple[node_id, node_sub_id]]]
+            for entry in allocation:
+                if not isinstance(entry, tuple) or len(entry) < 3:
+                    continue
+                slot = entry[0]
+                node_id_sub_id = entry[2]
+                if (
+                    isinstance(slot, int)
+                    and isinstance(node_id_sub_id, tuple)
+                    and len(node_id_sub_id) == 2
+                    and all(isinstance(v, int) for v in node_id_sub_id)
+                ):
+                    node_key = (node_id_sub_id[0], node_id_sub_id[1])
+                    node_keys.add(node_key)
+                    ss_node_slots[node_key].add(slot)
+
+        repeating_node_keys = {node_key for node_key, slots in ss_node_slots.items() if len(slots) > 1}
+        return set(), node_keys, set(), repeating_node_keys
+
+    def visualize_tiled_workload_graph(
+        self,
+        tiled_workload: ComputationNodeWorkload,
+        warmup_node_keys: set[tuple[int, int]],
+        steady_state_node_keys: set[tuple[int, int]],
+        cooldown_node_keys: set[tuple[int, int]],
+        repeating_steady_state_node_keys: set[tuple[int, int]],
+    ):
+        """Render the tiled workload graph to a PNG file.
+
+        Colors:
+            - yellow: warmup nodes
+            - green: steady-state nodes
+            - orange: repeating steady-state nodes
+            - purple: cooldown nodes
+            - blue: nodes outside warmup/steady/cooldown
+            - red dashed edge: dependency edge with bits=0
+            - gray edge: data edge with bits>0
+        """
+        try:
+            import pydot
+            from networkx.drawing.nx_pydot import to_pydot  # type: ignore
+        except ImportError:
+            logger.warning("Skipping tiled workload visualization: nx_pydot is not available.")
+            return
+
+        fig_path = os.path.splitext(self.tiled_workload_path)[0] + ".png"
+        dot = to_pydot(tiled_workload)
+        dot.set_rankdir("LR")
+        dot.set_concentrate(True)
+
+        for node in tiled_workload.nodes():
+            dot_nodes = dot.get_node(str(node))
+            if not dot_nodes:
+                continue
+            dot_node = dot_nodes[0]
+            dot_node.set_label(f"{node.name}\\n({node.id}, {node.sub_id})")
+            dot_node.set_shape("box")
+            dot_node.set_style("filled")
+
+            node_key = (node.id, node.sub_id)
+            if node_key in repeating_steady_state_node_keys:
+                dot_node.set_fillcolor("#ff9800")
+                dot_node.set_color("#e65100")
+                dot_node.set_penwidth(2)
+            elif node_key in warmup_node_keys:
+                dot_node.set_fillcolor("#ffd54f")
+                dot_node.set_color("#f57f17")
+                dot_node.set_penwidth(2)
+            elif node_key in steady_state_node_keys:
+                dot_node.set_fillcolor("#04e604")
+                dot_node.set_color("#2e7d32")
+                dot_node.set_penwidth(2)
+            elif node_key in cooldown_node_keys:
+                dot_node.set_fillcolor("#ce93d8")
+                dot_node.set_color("#6a1b9a")
+                dot_node.set_penwidth(2)
+            else:
+                dot_node.set_fillcolor("#a2d5f2")
+
+        zero_bit_edges = 0
+        data_edges = 0
+        for source, target, edge_data in tiled_workload.edges(data=True):
+            dot_edges = dot.get_edge(str(source), str(target))
+            if not dot_edges:
+                continue
+            bits = edge_data.get("bits", 0)
+            if bits == 0:
+                zero_bit_edges += 1
+                for dot_edge in dot_edges:
+                    dot_edge.set_color("#d32f2f")
+                    dot_edge.set_style("dashed")
+                    dot_edge.set_penwidth(2)
+            else:
+                data_edges += 1
+                for dot_edge in dot_edges:
+                    dot_edge.set_color("#78909c")
+                    dot_edge.set_style("solid")
+                    dot_edge.set_penwidth(1)
+
+        legend_cluster = pydot.Cluster("cluster_legend", label="Legend", style="rounded")
+        legend_entries = [
+            ("warmup", "Warmup", "#ffd54f"),
+            ("steady", "Steady State", "#04e604"),
+            ("steady_repeat", "Steady Repeat", "#ff9800"),
+            ("cooldown", "Cooldown", "#ce93d8"),
+            ("other", "Other", "#a2d5f2"),
+        ]
+        for key, label, color in legend_entries:
+            legend_cluster.add_node(
+                pydot.Node(
+                    f"legend_{key}",
+                    label=label,
+                    shape="box",
+                    style="filled",
+                    fillcolor=color,
+                )
+            )
+        edge_legend_src = pydot.Node("legend_edge_src", label="", shape="point", width=0.05)
+        edge_legend_dst_zero = pydot.Node("legend_edge_dst_zero", label="Edge bits=0", shape="plaintext")
+        edge_legend_dst_data = pydot.Node("legend_edge_dst_data", label="Edge bits>0", shape="plaintext")
+        legend_cluster.add_node(edge_legend_src)
+        legend_cluster.add_node(edge_legend_dst_zero)
+        legend_cluster.add_node(edge_legend_dst_data)
+        legend_cluster.add_edge(
+            pydot.Edge("legend_edge_src", "legend_edge_dst_zero", color="#d32f2f", style="dashed", penwidth=2)
+        )
+        legend_cluster.add_edge(
+            pydot.Edge("legend_edge_src", "legend_edge_dst_data", color="#78909c", style="solid", penwidth=1)
+        )
+        dot.add_subgraph(legend_cluster)
+
+        if warmup_node_keys or steady_state_node_keys or cooldown_node_keys:
+            logger.info(
+                "Highlighted phases in tiled workload visualization | warmup=%d steady=%d repeat=%d cooldown=%d",
+                len(warmup_node_keys),
+                len(steady_state_node_keys),
+                len(repeating_steady_state_node_keys),
+                len(cooldown_node_keys),
+            )
+        logger.info(
+            "Styled edges in tiled workload visualization | bits=0 edges=%d data edges=%d", zero_bit_edges, data_edges
+        )
+
+        try:
+            dot.write_png(fig_path)
+            logger.info("Saved tiled workload graph visualization to %s.", fig_path)
+        except Exception:
+            logger.exception("Failed to save tiled workload graph visualization to %s.", fig_path)
 
     def cached_workload_matches(self, tiles: list[ComputationNode], cached_tiles: ComputationNodeWorkload) -> bool:
         """Check if the tiles match the cached tiled workload.
@@ -1020,6 +1250,7 @@ class TiledWorkloadGenerationStage(Stage):
         new_workload.add_edges_from(edges)
         return new_workload
 
+    # TODO: Why is it here ?
     def get_weight_capacities(self):
         # Get the weight capacity of all cores
         weight_capacities: dict[int, int] = {}
@@ -1030,6 +1261,7 @@ class TiledWorkloadGenerationStage(Stage):
             weight_capacities[core.id] = core_weight_capacity
         return weight_capacities
 
+    # TODO: Why is it here ?
     def get_layer_split_factors_k(self):
         # Get for each layer the split factor we need to be able to fit weights on possible cores
         split_factors: dict[ComputationNode, int] = {}

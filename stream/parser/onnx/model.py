@@ -2,6 +2,7 @@ import logging
 from typing import Any
 
 from onnx import NodeProto
+from zigzag.datatypes import Constants
 from zigzag.parser.onnx.utils import parse_onnx_model_from_path
 
 from stream.hardware.architecture.accelerator import Accelerator
@@ -165,11 +166,13 @@ class ONNXModelParser:
             id_of_first_node = node_id
             for node_obj in parser.run():
                 logger.info(
-                    "Parsed %s node %s id %s layer_dim_sizes %s",
+                    "Parsed %s node %s id %s layer_dim_sizes %s operand %s",
                     node.op_type,
                     node.name,
                     node_id,
-                    node_obj.layer_dim_sizes,
+                    getattr(node_obj, "layer_dim_sizes", None),
+                    # getattr(node_obj, "operand_tensors", None),
+                    node_obj.loop_relevancy_info.get_ir_layer_dims(Constants.OUTPUT_LAYER_OP),
                 )
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)

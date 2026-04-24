@@ -61,3 +61,4 @@ plot_memory_usage(scme, section_start_percent, percent_shown, fig_path=memory_fi
 
 # Save json for perfetto visualization (Visualize at http://ui.perfetto.dev/)
 convert_scme_to_perfetto_json(scme, cost_lut, json_path=json_path)
+print(scme.latency, scme.energy)

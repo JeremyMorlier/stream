@@ -149,7 +149,7 @@ class TimeSlotAllocation:
     def get_timeslot_of_node(self, node: SteadyStateNode) -> int:
         slots = [slot for slot, res_map in self._slot_res_to_node.items() if node in res_map.values()]
         if not slots:
-            raise ValueError(f"{node.node_name} not scheduled.")
+            raise ValueError(f"{node.id}: {node.name} not scheduled.")
         return max(slots)
 
     # ...................................................... visualization

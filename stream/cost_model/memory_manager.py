@@ -202,7 +202,9 @@ class MemoryManager:
         capacity = self.top_instance_capacities[top_instance]
         # Sanity check on the tensor we want to add and the memory's capacity
         if capacity < tensor_to_add.size:
-            raise ValueError(f"Trying to add {tensor_to_add} larger than memory capacity of {top_instance}.")
+            raise ValueError(
+                f"Trying to add {tensor_to_add} of size {tensor_to_add.size} larger than memory capacity of {top_instance} of size {capacity}."
+            )
 
         relevant_exceptions = [tensor for tensor in exceptions if tensor in stored_tensors]
         # For the total stored tensors size we also need to take into account all tensors,

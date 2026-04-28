@@ -317,6 +317,14 @@ class TiledWorkloadGenerationStage(Stage):
         inter_cluster_traffic_imbalance_cv = cls._coefficient_of_variation(
             list(inter_cluster_out_bits_per_src.values())
         )
+        unique_output_bits_total = float(
+            sum(max(0, int(getattr(node, "data_produced_unique", 0))) for node in workload.node_list)
+        )
+        # Proxy for halo overhead: communicated bits beyond one-pass unique produced outputs.
+        # This captures overlap-induced duplicates and other replication effects in inter-tile communication.
+        halo_bits_total = max(0.0, total_bits - unique_output_bits_total)
+        halo_overhead_ratio = cls._safe_div(halo_bits_total, unique_output_bits_total)
+        halo_overhead_percent = halo_overhead_ratio * 100.0
         dst_pressures = list(inter_cluster_in_bits_per_dst.values())
         mean_dst_pressure = cls._safe_div(sum(dst_pressures), float(len(dst_pressures)))
         max_dst_pressure = max(dst_pressures) if dst_pressures else 0.0
@@ -383,6 +391,10 @@ class TiledWorkloadGenerationStage(Stage):
             "intra_cluster_bits_ratio": intra_cluster_bits_ratio,
             "inter_cluster_bits_ratio": inter_cluster_bits_ratio,
             "inter_cluster_traffic_imbalance_cv": inter_cluster_traffic_imbalance_cv,
+            "unique_output_bits_total": unique_output_bits_total,
+            "halo_bits_total": halo_bits_total,
+            "halo_overhead_ratio": halo_overhead_ratio,
+            "halo_overhead_percent": halo_overhead_percent,
             "memory_pressure_peak_over_mean": memory_pressure_peak_over_mean,
             "memory_pressure_risk_excess": memory_pressure_risk_excess,
             "fusion_locality_tradeoff_score": fusion_locality_tradeoff_score,

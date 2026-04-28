@@ -149,7 +149,6 @@ class TiledWorkloadGenerationStage(Stage):
 
     def run(self):
         workloads_per_config = self.generate_tiled_workloads_for_configurations()
-        self._write_tiling_configurations_report(workloads_per_config)
         tiled_workloads = {name: tiled for name, _, _, tiled in workloads_per_config}
         original_workloads = {name: original for name, _, original, _ in workloads_per_config}
         logger.info("Generated tiled workloads for configurations: %s", ", ".join(tiled_workloads.keys()))
@@ -200,14 +199,33 @@ class TiledWorkloadGenerationStage(Stage):
         base_workload = pickle_deepcopy(self.workload)
         normalized_configs = self._normalize_tiling_configurations()
         workloads_per_config: list[tuple[str, NODE_TILING_CONFIG_T, ONNXWorkload, ComputationNodeWorkload]] = []
+        report_path = self._get_tiling_report_path()
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        with open(report_path, "w", newline="", encoding="utf-8") as report_file:
+            report_writer = None
 
-        for config_name, node_tilings in normalized_configs:
-            configured_workload = pickle_deepcopy(base_workload)
-            self._apply_node_tilings(configured_workload, node_tilings)
-            tiled_workload_path = self._get_tiled_workload_path_for_config(config_name)
-            tiled_workload = self._generate_tiled_workload_for_workload(configured_workload, tiled_workload_path)
-            workloads_per_config.append((config_name, node_tilings, configured_workload, tiled_workload))
+            for config_name, node_tilings in normalized_configs:
+                configured_workload = pickle_deepcopy(base_workload)
+                self._apply_node_tilings(configured_workload, node_tilings)
+                tiled_workload_path = self._get_tiled_workload_path_for_config(config_name)
+                tiled_workload = self._generate_tiled_workload_for_workload(configured_workload, tiled_workload_path)
+                workloads_per_config.append((config_name, node_tilings, configured_workload, tiled_workload))
+                metrics = self._compute_graph_metrics(tiled_workload)
+                row = {
+                    "configuration_name": config_name,
+                    "configuration": json.dumps(self._serialize_node_tilings(node_tilings), sort_keys=True),
+                    **metrics,
+                }
+                if report_writer is None:
+                    report_writer = csv.DictWriter(report_file, fieldnames=list(row.keys()))
+                    report_writer.writeheader()
+                report_writer.writerow(row)
 
+        logger.info(
+            "Saved tiling-configuration report with %d row(s) to %s.",
+            len(workloads_per_config),
+            report_path,
+        )
         return workloads_per_config
 
     def _write_tiling_configurations_report(
@@ -216,33 +234,9 @@ class TiledWorkloadGenerationStage(Stage):
             tuple[str, NODE_TILING_CONFIG_T, ONNXWorkload, ComputationNodeWorkload]
         ],
     ) -> None:
-        if not workloads_per_config:
-            return
-
-        report_rows: list[dict[str, Any]] = []
-        for config_name, node_tilings, _, tiled_workload in workloads_per_config:
-            metrics = self._compute_graph_metrics(tiled_workload)
-            report_rows.append(
-                {
-                    "configuration_name": config_name,
-                    "configuration": json.dumps(
-                        self._serialize_node_tilings(node_tilings), sort_keys=True
-                    ),
-                    **metrics,
-                }
-            )
-
-        report_path = self._get_tiling_report_path()
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        with open(report_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(report_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(report_rows)
-        logger.info(
-            "Saved tiling-configuration report with %d row(s) to %s.",
-            len(report_rows),
-            report_path,
-        )
+        # Deprecated in favor of incremental writes inside
+        # generate_tiled_workloads_for_configurations.
+        return
 
     def _get_tiling_report_path(self) -> str:
         base, ext = os.path.splitext(self.tiled_workload_path)

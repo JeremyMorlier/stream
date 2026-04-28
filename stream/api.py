@@ -1,6 +1,6 @@
 import logging as _logging
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import gurobipy as gp
 from onnx import ModelProto
@@ -135,6 +135,11 @@ def optimize_allocation_co(  # noqa: PLR0913
     output_path: str,
     skip_if_exists: bool = False,
     temporal_mapping_type: str = "uneven",
+    explore_intra_core_tiling: bool = False,
+    explore_intra_core_tiling_dims: list[str] | None = None,
+    max_explored_tiling_configurations: int | None = None,
+    run_all_tiling_configurations: bool | None = None,
+    tiling_configurations: list[dict[str, Any]] | None = None,
 ) -> StreamCostModelEvaluation:
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
     _sanity_check_gurobi_license()
@@ -166,6 +171,20 @@ def optimize_allocation_co(  # noqa: PLR0913
         scme = pickle_load(scme_path)
         logger.info(f"Loaded SCME from {scme_path}")
     else:
+        tiled_workload_generation_kwargs: dict[str, Any] = {}
+        if explore_intra_core_tiling:
+            tiled_workload_generation_kwargs["explore_intra_core_tiling"] = True
+            if explore_intra_core_tiling_dims is not None:
+                tiled_workload_generation_kwargs["explore_intra_core_tiling_dims"] = explore_intra_core_tiling_dims
+            if max_explored_tiling_configurations is not None:
+                tiled_workload_generation_kwargs["max_explored_tiling_configurations"] = (
+                    max_explored_tiling_configurations
+                )
+        if run_all_tiling_configurations is not None:
+            tiled_workload_generation_kwargs["run_all_tiling_configurations"] = run_all_tiling_configurations
+        if tiling_configurations is not None:
+            tiled_workload_generation_kwargs["tiling_configurations"] = tiling_configurations
+
         mainstage = MainStage(
             [  # Initializes the MainStage as entry point
                 AcceleratorParserStage,  # Parses the accelerator
@@ -189,6 +208,7 @@ def optimize_allocation_co(  # noqa: PLR0913
             cost_lut_post_co_path=cost_lut_post_co_path,
             temporal_mapping_type=temporal_mapping_type,  # required by ZigZagCoreMappingEstimationStage
             operands_to_prefetch=[],  # required by ConstraintOptimizationAllocationStage
+            **tiled_workload_generation_kwargs,
         )
         # Launch the MainStage
         answers = mainstage.run()

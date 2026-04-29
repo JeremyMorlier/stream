@@ -109,7 +109,7 @@ scme = optimize_allocation_co(
     output_path="outputs",
     skip_if_exists=False,
     explore_intra_core_tiling=True,
-    explore_intra_core_tiling_dims=["K", "OY", "D", "OX"],
+    explore_intra_core_tiling_dims=["K", "D"],
     max_explored_tiling_configurations=256,
 )
 

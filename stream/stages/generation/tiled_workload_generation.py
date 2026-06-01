@@ -146,6 +146,23 @@ class TiledWorkloadGenerationStage(Stage):
             self.run_all_tiling_configurations = True
         # If set, select this config name for downstream execution when run_all_tiling_configurations=False.
         self.selected_tiling_configuration: str | None = kwargs.get("selected_tiling_configuration")
+        # Optional DFModel-like co-optimization controls.
+        self.enable_dfmodel_optimization: bool = kwargs.get("enable_dfmodel_optimization", False)
+        self.dfmodel_num_accelerators: int | None = kwargs.get("dfmodel_num_accelerators")
+        self.dfmodel_compute_capacity_flops_per_s: float | None = kwargs.get("dfmodel_compute_capacity_flops_per_s")
+        self.dfmodel_offchip_bandwidth_bits_per_s: float | None = kwargs.get("dfmodel_offchip_bandwidth_bits_per_s")
+        self.dfmodel_max_area_per_accelerator: float | None = kwargs.get("dfmodel_max_area_per_accelerator")
+        self.dfmodel_core_area_per_accelerator: float = float(kwargs.get("dfmodel_core_area_per_accelerator", 0.0))
+        self.dfmodel_memory_area_per_accelerator: float = float(
+            kwargs.get("dfmodel_memory_area_per_accelerator", 0.0)
+        )
+        self.dfmodel_link_bandwidth_bits_per_s: float = float(kwargs.get("dfmodel_link_bandwidth_bits_per_s", 0.0))
+        self.dfmodel_link_area_cost: float = float(kwargs.get("dfmodel_link_area_cost", 0.0))
+        self.dfmodel_area_penalty_weight: float = float(kwargs.get("dfmodel_area_penalty_weight", 0.0))
+        self.dfmodel_offchip_roundtrip_factor: float = float(kwargs.get("dfmodel_offchip_roundtrip_factor", 1.0))
+        self.dfmodel_flops_per_mac: float = float(kwargs.get("dfmodel_flops_per_mac", 2.0))
+        self.dfmodel_optimization_path: str | None = kwargs.get("dfmodel_optimization_path")
+        self.dfmodel_demands_path: str | None = kwargs.get("dfmodel_demands_path")
 
     def run(self):
         workloads_per_config = self.generate_tiled_workloads_for_configurations()
@@ -226,6 +243,8 @@ class TiledWorkloadGenerationStage(Stage):
             len(workloads_per_config),
             report_path,
         )
+        self._write_dfmodel_demands_report(workloads_per_config)
+        self._run_dfmodel_optimization(workloads_per_config)
         return workloads_per_config
 
     def _write_tiling_configurations_report(
@@ -243,6 +262,224 @@ class TiledWorkloadGenerationStage(Stage):
         if not ext:
             ext = ".pickle"
         return f"{base}.configurations_report.csv"
+
+    def _get_dfmodel_demands_path(self) -> str:
+        if self.dfmodel_demands_path is not None:
+            return self.dfmodel_demands_path
+        base, _ = os.path.splitext(self.tiled_workload_path)
+        return f"{base}.dfmodel_demands.json"
+
+    def _get_dfmodel_optimization_path(self) -> str:
+        if self.dfmodel_optimization_path is not None:
+            return self.dfmodel_optimization_path
+        base, _ = os.path.splitext(self.tiled_workload_path)
+        return f"{base}.dfmodel_optimization.json"
+
+    def _get_node_core_id(self, node: ComputationNode, valid_core_ids: list[int]) -> int:
+        chosen = getattr(node, "chosen_core_allocation", None)
+        if isinstance(chosen, int) and chosen in valid_core_ids:
+            return chosen
+        possible = getattr(node, "possible_core_allocation", None)
+        if isinstance(possible, list):
+            for core_id in possible:
+                if core_id in valid_core_ids:
+                    return int(core_id)
+        # Fallback to a stable bucket when no explicit allocation is available.
+        return valid_core_ids[int(node.id) % len(valid_core_ids)]
+
+    def _get_active_accelerator_ids(self) -> list[int]:
+        if self.dfmodel_num_accelerators is not None:
+            if self.dfmodel_num_accelerators <= 0:
+                raise ValueError("dfmodel_num_accelerators must be > 0.")
+            return list(range(self.dfmodel_num_accelerators))
+        accelerator_core_ids = [
+            int(core.id) for core in self.accelerator.cores.node_list if int(core.id) != self.accelerator.offchip_core_id
+        ]
+        if not accelerator_core_ids:
+            raise ValueError("No on-chip accelerator cores found to build DFModel demands.")
+        return sorted(accelerator_core_ids)
+
+    def _extract_dfmodel_demands(
+        self, workload: ComputationNodeWorkload, accelerator_ids: list[int]
+    ) -> tuple[dict[int, float], dict[tuple[int, int], float]]:
+        # Compute demand per accelerator and communication demand per ordered pair.
+        compute_flops_per_accelerator = {acc_id: 0.0 for acc_id in accelerator_ids}
+        traffic_bits_per_pair: dict[tuple[int, int], float] = {}
+        for src in workload.node_list:
+            src_core = self._get_node_core_id(src, accelerator_ids)
+            mac_count = float(getattr(src, "total_mac_count", 0))
+            compute_flops_per_accelerator[src_core] += self.dfmodel_flops_per_mac * mac_count
+
+        for producer, consumer, data in workload.edges(data=True):
+            bits_raw = data.get("bits", 0) if isinstance(data, dict) else 0
+            bits = float(int(bits_raw))
+            if bits <= 0:
+                continue
+            src_core = self._get_node_core_id(producer, accelerator_ids)
+            dst_core = self._get_node_core_id(consumer, accelerator_ids)
+            if src_core == dst_core:
+                continue
+            key = (src_core, dst_core)
+            traffic_bits_per_pair[key] = traffic_bits_per_pair.get(key, 0.0) + bits
+        return compute_flops_per_accelerator, traffic_bits_per_pair
+
+    def _write_dfmodel_demands_report(
+        self,
+        workloads_per_config: list[tuple[str, NODE_TILING_CONFIG_T, ONNXWorkload, ComputationNodeWorkload]],
+    ) -> None:
+        accelerator_ids = self._get_active_accelerator_ids()
+        rows: list[dict[str, Any]] = []
+        for config_name, _, _, tiled_workload in workloads_per_config:
+            flops_per_acc, bits_per_pair = self._extract_dfmodel_demands(tiled_workload, accelerator_ids)
+            rows.append(
+                {
+                    "configuration_name": config_name,
+                    "accelerator_ids": accelerator_ids,
+                    "compute_flops_per_accelerator": {str(k): v for k, v in flops_per_acc.items()},
+                    "traffic_bits_per_ordered_pair": {f"{src}->{dst}": bits for (src, dst), bits in bits_per_pair.items()},
+                }
+            )
+        output = {"rows": rows}
+        path = self._get_dfmodel_demands_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(output, file, indent=2, sort_keys=True)
+        logger.info("Saved DFModel demands report to %s.", path)
+
+    def _run_dfmodel_optimization(
+        self,
+        workloads_per_config: list[tuple[str, NODE_TILING_CONFIG_T, ONNXWorkload, ComputationNodeWorkload]],
+    ) -> None:
+        if not self.enable_dfmodel_optimization:
+            return
+        required = {
+            "dfmodel_compute_capacity_flops_per_s": self.dfmodel_compute_capacity_flops_per_s,
+            "dfmodel_offchip_bandwidth_bits_per_s": self.dfmodel_offchip_bandwidth_bits_per_s,
+            "dfmodel_max_area_per_accelerator": self.dfmodel_max_area_per_accelerator,
+            "dfmodel_link_bandwidth_bits_per_s": self.dfmodel_link_bandwidth_bits_per_s,
+            "dfmodel_link_area_cost": self.dfmodel_link_area_cost,
+        }
+        missing = [name for name, value in required.items() if value is None or (isinstance(value, float) and value <= 0)]
+        if missing:
+            raise ValueError(
+                "DFModel optimization requested but missing/invalid parameters: " + ", ".join(missing)
+            )
+
+        try:
+            import gurobipy as gp
+            from gurobipy import GRB
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("DFModel optimization requires gurobipy to be importable.") from exc
+
+        accelerator_ids = self._get_active_accelerator_ids()
+        configs = [config_name for config_name, _, _, _ in workloads_per_config]
+        demands_by_config: dict[str, dict[str, Any]] = {}
+        for config_name, _, _, tiled_workload in workloads_per_config:
+            flops_per_acc, bits_per_pair = self._extract_dfmodel_demands(tiled_workload, accelerator_ids)
+            demands_by_config[config_name] = {
+                "flops_per_acc": flops_per_acc,
+                "bits_per_pair": bits_per_pair,
+            }
+
+        undirected_pairs = [(a, b) for idx, a in enumerate(accelerator_ids) for b in accelerator_ids[idx + 1 :]]
+        pair_bits_by_config: dict[str, dict[tuple[int, int], float]] = {}
+        for config_name in configs:
+            bits_per_pair = demands_by_config[config_name]["bits_per_pair"]
+            pair_bits_by_config[config_name] = {
+                (a, b): bits_per_pair.get((a, b), 0.0) + bits_per_pair.get((b, a), 0.0) for a, b in undirected_pairs
+            }
+
+        model = gp.Model("dfmodel_co_optimization")
+        model.setParam("OutputFlag", 0)
+
+        z = {cfg: model.addVar(vtype=GRB.BINARY, name=f"z[{cfg}]") for cfg in configs}
+        y = {(a, b): model.addVar(vtype=GRB.BINARY, name=f"y[{a},{b}]") for a, b in undirected_pairs}
+        w = {
+            (cfg, a, b): model.addVar(vtype=GRB.BINARY, name=f"w[{cfg},{a},{b}]")
+            for cfg in configs
+            for (a, b) in undirected_pairs
+        }
+        makespan = model.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name="T")
+
+        model.addConstr(gp.quicksum(z[cfg] for cfg in configs) == 1, name="select_one_config")
+        for cfg in configs:
+            for a, b in undirected_pairs:
+                w_var = w[(cfg, a, b)]
+                model.addConstr(w_var <= z[cfg], name=f"lin_w_le_z[{cfg},{a},{b}]")
+                model.addConstr(w_var <= y[(a, b)], name=f"lin_w_le_y[{cfg},{a},{b}]")
+                model.addConstr(w_var >= z[cfg] + y[(a, b)] - 1, name=f"lin_w_ge_sum_minus1[{cfg},{a},{b}]")
+
+        for acc_id in accelerator_ids:
+            model.addConstr(
+                gp.quicksum(z[cfg] * demands_by_config[cfg]["flops_per_acc"].get(acc_id, 0.0) for cfg in configs)
+                <= self.dfmodel_compute_capacity_flops_per_s * makespan,
+                name=f"compute_capacity[{acc_id}]",
+            )
+
+        for a, b in undirected_pairs:
+            model.addConstr(
+                gp.quicksum(pair_bits_by_config[cfg][(a, b)] * w[(cfg, a, b)] for cfg in configs)
+                <= self.dfmodel_link_bandwidth_bits_per_s * makespan,
+                name=f"link_bw[{a},{b}]",
+            )
+
+        model.addConstr(
+            gp.quicksum(
+                self.dfmodel_offchip_roundtrip_factor
+                * pair_bits_by_config[cfg][(a, b)]
+                * (z[cfg] - w[(cfg, a, b)])
+                for cfg in configs
+                for a, b in undirected_pairs
+            )
+            <= self.dfmodel_offchip_bandwidth_bits_per_s * makespan,
+            name="offchip_bw",
+        )
+
+        per_endpoint_link_area = 0.5 * self.dfmodel_link_area_cost
+        fixed_area = self.dfmodel_core_area_per_accelerator + self.dfmodel_memory_area_per_accelerator
+        for acc_id in accelerator_ids:
+            model.addConstr(
+                fixed_area
+                + gp.quicksum(
+                    per_endpoint_link_area * y[(a, b)] for (a, b) in undirected_pairs if acc_id in (a, b)
+                )
+                <= self.dfmodel_max_area_per_accelerator,
+                name=f"area[{acc_id}]",
+            )
+
+        model.setObjective(
+            makespan + self.dfmodel_area_penalty_weight * gp.quicksum(self.dfmodel_link_area_cost * y[p] for p in y),
+            GRB.MINIMIZE,
+        )
+        model.optimize()
+        if model.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"DFModel optimization did not converge to optimality, status={model.Status}.")
+
+        selected_config = next(cfg for cfg in configs if z[cfg].X > 0.5)
+        selected_links = [(a, b) for (a, b), var in y.items() if var.X > 0.5]
+        result = {
+            "selected_configuration_name": selected_config,
+            "makespan_seconds": float(makespan.X),
+            "selected_links": [{"src": int(a), "dst": int(b)} for a, b in selected_links],
+            "number_of_selected_links": len(selected_links),
+            "objective_value": float(model.ObjVal),
+            "parameters": {
+                "compute_capacity_flops_per_s": self.dfmodel_compute_capacity_flops_per_s,
+                "offchip_bandwidth_bits_per_s": self.dfmodel_offchip_bandwidth_bits_per_s,
+                "max_area_per_accelerator": self.dfmodel_max_area_per_accelerator,
+                "core_area_per_accelerator": self.dfmodel_core_area_per_accelerator,
+                "memory_area_per_accelerator": self.dfmodel_memory_area_per_accelerator,
+                "link_bandwidth_bits_per_s": self.dfmodel_link_bandwidth_bits_per_s,
+                "link_area_cost": self.dfmodel_link_area_cost,
+                "offchip_roundtrip_factor": self.dfmodel_offchip_roundtrip_factor,
+                "flops_per_mac": self.dfmodel_flops_per_mac,
+            },
+        }
+        path = self._get_dfmodel_optimization_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(result, file, indent=2, sort_keys=True)
+        logger.info("Saved DFModel optimization result to %s.", path)
 
     @staticmethod
     def _safe_div(numerator: float, denominator: float) -> float:

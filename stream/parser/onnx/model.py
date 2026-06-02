@@ -172,7 +172,6 @@ class ONNXModelParser:
                     node_id,
                     getattr(node_obj, "layer_dim_sizes", None),
                     # getattr(node_obj, "operand_tensors", None),
-                    node_obj.loop_relevancy_info.get_ir_layer_dims(Constants.OUTPUT_LAYER_OP),
                 )
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)

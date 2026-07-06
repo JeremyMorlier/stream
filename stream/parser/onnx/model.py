@@ -166,12 +166,7 @@ class ONNXModelParser:
             id_of_first_node = node_id
             for node_obj in parser.run():
                 logger.info(
-                    "Parsed %s node %s id %s layer_dim_sizes %s operand %s",
-                    node.op_type,
-                    node.name,
-                    node_id,
-                    getattr(node_obj, "layer_dim_sizes", None),
-                    # getattr(node_obj, "operand_tensors", None),
+                    f"Parsed {node.op_type} node {node.name} id {node_id} layer_dim_sizes {getattr(node_obj, 'layer_dim_sizes', None)}"
                 )
                 # Parsers that yield multiple nodes increment the node id internally, so we must keep count here.
                 workload.add(node_id, node_obj)

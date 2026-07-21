@@ -203,7 +203,8 @@ class MemoryManager:
         # Sanity check on the tensor we want to add and the memory's capacity
         if capacity < tensor_to_add.size:
             raise ValueError(
-                f"Trying to add {tensor_to_add} of size {tensor_to_add.size} larger than memory capacity of {top_instance} of size {capacity}."
+                f"Trying to add {tensor_to_add} {tensor_to_add.size}larger than memory capacity of "
+                f"{top_instance} {capacity}."
             )
 
         relevant_exceptions = [tensor for tensor in exceptions if tensor in stored_tensors]
@@ -236,7 +237,7 @@ class MemoryManager:
         except StopIteration as exc:
             raise ValueError(
                 f"The evictable tensors {evictable_tensors} and their sizes {evictable_tensors_size} are too small to "
-                f"evict a size of {min_size_to_evict}."
+                f"evict a size of {min_size_to_evict} {tensor_to_add} {tensor_to_add.size} {capacity}."
             ) from exc
         tensors_to_evict = evictable_tensors[:idx_satisfying_min_size_to_evict]
         return tensors_to_evict

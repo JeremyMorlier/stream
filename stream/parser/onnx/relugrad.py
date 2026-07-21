@@ -23,7 +23,7 @@ class ReLUGradParser(SimdParser):
         return ComputationNode(
             node_id=self.node_id,
             node_name=self.node.name,
-            op_type="add",
+            op_type="relugrad",
             node_attr=node_attrs,
             mapping_attr=mapping,
         )

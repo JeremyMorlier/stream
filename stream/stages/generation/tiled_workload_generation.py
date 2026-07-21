@@ -249,7 +249,7 @@ class TiledWorkloadGenerationStage(Stage):
             # inter core tiling is ok, also split into these tiles. NOTE: this list is ordered
             tiling_to_split = node.inter_core_tiling + node.intra_core_tiling
         outer_loops = convert_outer_cn_loops(tiling_to_split)  # type: ignore
-
+        logger.warning(f"{node.id} {outer_loops}, {tiling_to_split} {node.intra_core_tiling} {node.inter_core_tiling}")
         # In case no valid intra core tiling is found: add an arbitrary tiling of size 1
         if not outer_loops:
             outer_loops = [TemporalLoop(node.layer_dims[0], 1)]

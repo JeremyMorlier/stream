@@ -337,6 +337,19 @@ class ConstraintOptimizationAllocationStage(Stage):
             if len(get_real_successors(n, sg)) == 0  # type: ignore
         )
         sink_layer_ids = sorted(set(n.id for n in sink_nodes))
+        print(sink_layer_ids)
+        print(len(sg.nodes()))
+        outgoing_sources = set()
+        for n in sg.nodes():
+            for neighbor in self.workload.successors(n):
+                if neighbor not in sg.nodes():
+                    outgoing_sources.add(n)
+                    break
+        print(len(outgoing_sources))
+        if len(outgoing_sources) == 1:
+            print("valid", len(outgoing_sources))
+        else:
+            print("not valid", len(outgoing_sources))
         assert len(sink_layer_ids) == 1, "Expected only one sink layer per layer stack. Update your layer stacks."
         return sorted(sink_nodes)
 
@@ -534,10 +547,48 @@ class ConstraintOptimizationAllocationStage(Stage):
     def get_order_non_steady_state(self, to_compute: set[ComputationNode]):
         return [(n.id, n.sub_id) for n in sorted(to_compute, key=lambda x: (-x.id, -x.sub_id))]
 
+    def make_weakly_connected(self, sub_workload: DNNWorkloadStream) -> DNNWorkloadStream:
+        """
+        Ensures the subgraph is weakly connected by adding missing nodes and edges from the original workload.
+        """
+        # Create a subgraph induced by the specified nodes
+        subgraph = sub_workload.copy()
+        nodes = subgraph.node_list
+        # Find all weakly connected components in the subgraph
+        weakly_connected_components = list(nx.weakly_connected_components(subgraph))
+
+        # If the subgraph is already weakly connected, return it
+        if len(weakly_connected_components) == 1:
+            return subgraph
+
+        # Otherwise, find the minimal set of nodes that connects all specified nodes
+        # This is done by finding the union of all nodes in the weakly connected components
+        # that contain at least one of the specified nodes
+        required_nodes = set()
+        for component in weakly_connected_components:
+            if any(node in nodes for node in component):
+                required_nodes.update(component)
+
+        # Now, find all nodes that are needed to connect the required_nodes
+        # This is done by finding the union of all nodes in the weakly connected components
+        # of the original graph that contain at least one of the required_nodes
+        all_required_nodes = set(required_nodes)
+        for node in required_nodes:
+            for component in nx.weakly_connected_components(self.original_workload):
+                if node in component:
+                    all_required_nodes.update(component)
+                    break  # No need to check other components for this node
+
+        # Create the final subgraph with all required nodes
+        final_subgraph = self.original_workload.subgraph(all_required_nodes).copy()
+
+        return final_subgraph
+
     def schedule_allocation(self, allocation: TimeSlotAllocation) -> StreamCostModelEvaluation:
         # Get the involved layer ids we want to schedule and their core allocations
         # Get the relevant subgraph of the original layer-wise workload
         layer_ids = [node.id for node in allocation.nodes]
+        print(layer_ids)
         relevant_nodes = list(filter(lambda n: n.id in layer_ids, self.original_workload.node_list))
         unpartitioned_sub_workload: DNNWorkloadStream = pickle_deepcopy(self.original_workload.subgraph(relevant_nodes))
 
@@ -556,7 +607,7 @@ class ConstraintOptimizationAllocationStage(Stage):
         # Generate/check inter core mapping for all nodes
         self.update_inter_core_mapping(unpartitioned_sub_workload, allocation)
         scheduling_order = self.get_scheduling_order(allocation)
-
+        unpartitioned_sub_workload = self.make_weakly_connected(unpartitioned_sub_workload.copy())
         loma_lpf_limit = 7
         kwargs = self.kwargs.copy()
         kwargs["loma_lpf_limit"] = loma_lpf_limit
@@ -591,9 +642,12 @@ class ConstraintOptimizationAllocationStage(Stage):
             # Set correct inter core tiling. Replacing the wildcard will signal to the TiledWorkloadGenerationStage
             # to also split in the inter core tiling
             inter_core_tiling = self.replace_wildcard_in_tiling(node.inter_core_tiling, nb_cores)
+            print(inter_core_tiling, node.inter_core_tiling)
             node.inter_core_tiling = inter_core_tiling
             # Check that the length matches the specified inter_core_tiling size
             inter_core_tiling_size = prod([factor for _, factor in inter_core_tiling])
+            print(inter_core_tiling_size, node.possible_core_allocation)
+
             assert len(node.possible_core_allocation) == inter_core_tiling_size, (
                 f"Expected {node} to have {inter_core_tiling_size} "
                 f"possible core allocations, but got {len(node.possible_core_allocation)}."

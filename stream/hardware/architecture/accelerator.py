@@ -118,10 +118,28 @@ class Accelerator:
         """
         if suggested_core is not None:
             storing_instance = self.get_top_instance_of_core(suggested_core, tensor.memory_operand)
-            assert self.contains_tensor(tensor, storing_instance)
-            available_since_timestep = self.memory_manager.top_instance_available_since_timestep[storing_instance][
-                tensor.equality_hash
-            ]
+
+            # If the suggested core's top instance actually contains the tensor, use it.
+            if self.contains_tensor(tensor, storing_instance):
+                available_since_timestep = self.memory_manager.top_instance_available_since_timestep[storing_instance][
+                    tensor.equality_hash
+                ]
+            else:
+                # Fallback: the suggested core doesn't contain the tensor -> find where it actually is.
+                # This mirrors the previous behaviour when no suggested_core was provided.
+                (_, available_since_timesteps) = self.find_tensor_in_top_instances(tensor)
+                if not available_since_timesteps:
+                    # No instance contains the tensor: raise a clearer error
+                    raise RuntimeError(
+                        f"Tensor {tensor} not found in any top memory instance (suggested_core={suggested_core})."
+                    )
+                # Pick the core that has stored the tensor the longest
+                available_since_timestep = min(available_since_timesteps.values())
+                storing_instance = next(
+                    top_instance
+                    for (top_instance, timestep) in available_since_timesteps.items()
+                    if timestep == available_since_timestep
+                )
         else:
             (_, available_since_timesteps) = self.find_tensor_in_top_instances(tensor)
             # Pick the core that has stored the tensor the longest

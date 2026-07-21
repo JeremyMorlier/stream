@@ -1,0 +1,70 @@
+import logging as _logging
+import re
+
+from stream.api import optimize_allocation_co
+from stream.utils import CostModelEvaluationLUT
+from stream.visualization.memory_usage import plot_memory_usage
+from stream.visualization.perfetto import convert_scme_to_perfetto_json
+
+import onnx
+from onnx.shape_inference import infer_shapes_path
+
+_logging_level = _logging.INFO
+_logging_format = "%(asctime)s - %(name)s.%(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
+_logging.basicConfig(level=_logging_level, format=_logging_format)
+
+############################################INPUTS############################################
+accelerator = "stream/inputs/examples/hardware/fusemax.yaml"
+workload_path = "../attention_head.onnx"
+mapping_path = "stream/inputs/attn/mapping.yaml"
+mode = "fused"
+layer_stacks = [tuple(range(0, 12)), tuple(range(12, 22))] + list((i,) for i in range(22, 49))
+##############################################################################################
+
+################################PARSING###############################
+hw_name = accelerator.split("/")[-1].split(".")[0]
+wl_name = re.split(r"/|\.", workload_path)[-1]
+if wl_name == "onnx":
+    wl_name = re.split(r"/|\.", workload_path)[-2]
+experiment_id = f"{hw_name}-{wl_name}-{mode}-constraint_optimization"
+######################################################################
+
+# Shape infer onnx
+
+infer_shapes_path(workload_path, workload_path)  # This will save the inferred model to the same file
+scme = optimize_allocation_co(
+    hardware=accelerator,
+    workload=workload_path,
+    mapping=mapping_path,
+    mode=mode,
+    layer_stacks=layer_stacks,
+    experiment_id=experiment_id,
+    output_path="outputs",
+    skip_if_exists=True,
+)
+
+############PLOTTING#############
+plot_full_schedule = True
+draw_dependencies = True
+plot_data_transfer = True
+section_start_percent = (0,)
+percent_shown = (100,)
+#################################
+
+#########################PLOTTING PATHS##############################
+timeline_fig_path_plotly = f"outputs/{experiment_id}/schedule.html"
+memory_fig_path = f"outputs/{experiment_id}/memory.png"
+json_path = f"outputs/{experiment_id}/scme.json"
+#####################################################################
+
+#####################CostModelEvaluationLUT LOAD#############################
+cost_lut_path = f"outputs/{experiment_id}/cost_lut_post_co.pickle"
+cost_lut = CostModelEvaluationLUT(cost_lut_path)
+#############################################################################
+
+# Plotting memory usage of best SCME
+plot_memory_usage(scme, section_start_percent, percent_shown, fig_path=memory_fig_path)
+
+# Save json for perfetto visualization (Visualize at http://ui.perfetto.dev/)
+convert_scme_to_perfetto_json(scme, cost_lut, json_path=json_path)
+print(scme.latency, scme.energy)

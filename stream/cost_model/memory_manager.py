@@ -236,7 +236,7 @@ class MemoryManager:
         except StopIteration as exc:
             raise ValueError(
                 f"The evictable tensors {evictable_tensors} and their sizes {evictable_tensors_size} are too small to "
-                f"evict a size of {min_size_to_evict}."
+                f"evict a size of {min_size_to_evict} {tensor_to_add} {tensor_to_add.size} {capacity}."
             ) from exc
         tensors_to_evict = evictable_tensors[:idx_satisfying_min_size_to_evict]
         return tensors_to_evict

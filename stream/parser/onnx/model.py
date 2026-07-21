@@ -21,7 +21,7 @@ from stream.parser.onnx.matmul import MatMulParser
 from stream.parser.onnx.mul import MulParser
 from stream.parser.onnx.operator_parser import OnnxOperatorParser
 from stream.parser.onnx.pad import PadParser
-from stream.parser.onnx.pool_grad import AveragePoolGradParser
+from stream.parser.onnx.pool_grad import PoolingGradParser
 from stream.parser.onnx.pooling import PoolingParser
 from stream.parser.onnx.reduce_1d import Reduce1DParser
 from stream.parser.onnx.reducesum import ReduceSumParser
@@ -36,6 +36,7 @@ from stream.parser.onnx.squeeze import SqueezeParser
 from stream.parser.onnx.ssm import SSMParser
 from stream.parser.onnx.transpose import TransposeParser
 from stream.parser.onnx.unsqueeze import UnsqueezeParser
+from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.mapping import InterCoreMappingAttributes
 from stream.workload.onnx_workload import ONNXWorkload
 
@@ -61,6 +62,7 @@ class ONNXModelParser:
         "Add": MulParser,
         "Sub": MulParser,
         "Mul": MulParser,
+        "Sum": MulParser,
         # Special operators
         "SSM": SSMParser,
         "Softmax": SoftmaxParser,
@@ -88,7 +90,7 @@ class ONNXModelParser:
         "InPlaceAccumulatorV2": InPlaceAccumulatorParser,
         "ReluGrad": ReLUGradParser,
         "Pad": PadParser,
-        "AveragePoolGrad": AveragePoolGradParser,
+        "AveragePoolGrad": PoolingGradParser,
         "Split": SplitParser,
         "Slice": SliceParser,
         "Unsqueeze": UnsqueezeParser,

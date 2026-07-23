@@ -1,87 +1,37 @@
-name: generic_array
+name: fusemax_array
 type: compute
 
 memories:
-  rf_I:
-    size: 16
+  rf_pe:
+    size: 256  # 16 entries * 16 bits (arch-2d.yaml: reg_file depth=16, width=16)
     r_cost: 0.4
     w_cost: 0.4
     area: 0
     latency: 1
-    operands: [I1]
+    operands: [I1, I2, O]
     ports:
       - name: r_port_1
         type: read
-        bandwidth_min: 8
+        bandwidth_min: 16
         bandwidth_max: 16
         allocation:
           - I1, tl
-      - name: w_port_1
-        type: write
-        bandwidth_min: 8
-        bandwidth_max: 16
-        allocation:
-          - I1, fh
-    served_dimensions: []
-
-  rf_W:
-    size: 16
-    r_cost: 0.4
-    w_cost: 0.4
-    area: 0
-    latency: 1
-    operands: [I2]
-    ports:
-      - name: r_port_1
-        type: read
-        bandwidth_min: 4
-        bandwidth_max: 16
-        allocation:
           - I2, tl
-      - name: w_port_1
-        type: write
-        bandwidth_min: 4
-        bandwidth_max: 16
-        allocation:
-          - I2, fh
-    served_dimensions: []
-
-  rf_O:
-    size: 16
-    r_cost: 0.4
-    w_cost: 0.4
-    area: 0
-    latency: 1
-    operands: [O]
-    ports:
-      - name: r_port_1
-        type: read
-        bandwidth_min: 16
-        bandwidth_max: 16
-        allocation:
           - O, tl
-      - name: r_port_2
-        type: read
-        bandwidth_min: 16
-        bandwidth_max: 16
-        allocation:
           - O, th
       - name: w_port_1
         type: write
         bandwidth_min: 16
         bandwidth_max: 16
         allocation:
+          - I1, fh
+          - I2, fh
           - O, fh
-      - name: w_port_2
-        type: write
-        bandwidth_min: 16
-        bandwidth_max: 16
-        allocation:
           - O, fl
     served_dimensions: []
 
   sram:
-    size: 16777216
+    size: 134217728
     r_cost: 8192
     w_cost: 8192
     area: 0
@@ -90,8 +40,8 @@ memories:
     ports:
       - name: r_port_1
         type: read
-        bandwidth_min: 256
-        bandwidth_max: 8192
+        bandwidth_min: 4096
+        bandwidth_max: 131072
         allocation:
           - I1, tl
           - I2, tl
@@ -99,8 +49,8 @@ memories:
           - O, th
       - name: w_port_1
         type: write
-        bandwidth_min: 256
-        bandwidth_max: 8192
+        bandwidth_min: 4096
+        bandwidth_max: 131072
         allocation:
           - I1, fh
           - I2, fh
@@ -109,13 +59,14 @@ memories:
     served_dimensions: [D1, D2]
 
 operational_array:
+  input_precision: [16, 16]
   unit_energy: 1.5
   unit_area: 1 # unit
   dimensions: [D1, D2]
   sizes: [256, 256]
 
-dataflows:
-  D1:
-    - D, 256
-  D2:
-    - K, 256
+    #dataflows:
+    #  D1:
+    #    - D, 256
+    #  D2:
+    #    - K, 256

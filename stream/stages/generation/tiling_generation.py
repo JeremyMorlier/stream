@@ -134,7 +134,9 @@ class TilingGenerationStage(Stage):
                     node.layer_dim_sizes[layer_dim] = new_layer_dim_size
                     factor_new = factor
                 else:
+                    # Fix
                     factor_new = factor
+
                 valid_tiling.append((layer_dim, factor_new))
 
         node.intra_core_tiling = valid_tiling

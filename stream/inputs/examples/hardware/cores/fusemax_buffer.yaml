@@ -1,0 +1,38 @@
+name: buffer
+type: compute
+
+memories:
+  sram:
+    size: 134217728
+    r_cost: 8192
+    w_cost: 8192
+    area: 0
+    latency: 1
+    operands: [I1, I2, O]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 4096
+        bandwidth_max: 131072
+        allocation:
+          - I1, tl
+          - I2, tl
+          - O, tl
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 4096
+        bandwidth_max: 131072
+        allocation:
+          - I1, fh
+          - I2, fh
+          - O, fh
+          - O, fl
+    served_dimensions: [D1, D2]
+
+operational_array:
+  input_precision: [0, 0]
+  unit_energy: 0
+  unit_area: 0
+  dimensions: [D1, D2]
+  sizes: [0, 0]

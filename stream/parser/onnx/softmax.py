@@ -7,6 +7,8 @@ from stream.parser.onnx.reduce_1d import Reduce1DParser
 from stream.parser.onnx.simd import SimdParser
 from stream.workload.mapping import InterCoreMappingAttributes
 
+from copy import copy
+
 
 class SoftmaxParser(OnnxComputeOperatorParser):
     """Parses the Softmax operator. Softmax works on full rows and can be computed as follows:
@@ -17,7 +19,7 @@ class SoftmaxParser(OnnxComputeOperatorParser):
     It is split up in four distinct computation nodes.
     """
 
-    NODE_TYPES = ["max", "exp", "sum", "div"]
+    NODE_TYPES = ["Max", "Exp", "Sum", "Div"]
 
     def run(self):
         yield from self.get_nodes()
@@ -34,18 +36,21 @@ class SoftmaxParser(OnnxComputeOperatorParser):
         """
         parser_classes: list[type] = [Reduce1DParser, SoftmaxExpParser, Reduce1DParser, SoftmaxDivParser]
 
-        node_ids = [self.node_id + i for i in range(4)]
-        parsers: list[OnnxComputeOperatorParser] = [
-            parser(
+        parsers: list[OnnxComputeOperatorParser] = []
+
+        for i, parser in enumerate(parser_classes):
+            node_id = self.node_id + i
+            node = copy(self.node)
+            node.name = SoftmaxParser.NODE_TYPES[i]
+            parsers.append(parser(
                 node_id=node_id,
-                node=self.node,
+                node=node,
                 nodes_outputs=self.nodes_outputs,
                 onnx_model=self.onnx_model,
                 all_mappings=self.all_mappings,
                 accelerator=self.accelerator,
-            )
-            for parser, node_id in zip(parser_classes, node_ids, strict=False)
-        ]
+            ))
+
         self.nodes = tuple(next(parser.run()) for parser in parsers)
 
     def get_nodes(self):
@@ -62,7 +67,7 @@ class SoftmaxParser(OnnxComputeOperatorParser):
         """Set the name and operator type of all Computation Nodes that stem from the base ONNX node"""
         for node, node_type in zip(self.nodes, SoftmaxParser.NODE_TYPES, strict=False):
             node.type = node_type
-            node.name += f"-{node_type}/"
+            #node.name += f"-{node_type}/"
 
     def correct_nodes_operand_source(self):
         """Correct the `input_operand_source` and `constant_operands` of all Computation Nodes that stem from the base

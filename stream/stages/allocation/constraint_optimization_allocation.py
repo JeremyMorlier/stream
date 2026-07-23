@@ -6,7 +6,7 @@ from typing import Any, TypeAlias
 
 import networkx as nx
 import numpy as np
-from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
+from zigzag.utils import hash_sha512, pickle_deepcopy, pickle_load, pickle_save
 
 from stream.cost_model.cost_model import StreamCostModelEvaluation
 from stream.cost_model.steady_state_scheduler import SteadyStateScheduler
@@ -450,13 +450,29 @@ class ConstraintOptimizationAllocationStage(Stage):
             total_ss_latency += ss_latency
         logger.info(f"Total steady-state latency across stacks: {total_ss_latency} cycles")
 
+    @staticmethod
+    def get_mapping_hash(to_compute: set[ComputationNode], iterations: int) -> str:
+        """
+        Hash the properties of the steady-state nodes that determine the MILP result (mapping/tiling, core
+        candidates, iteration count), so a cached allocation is only reused if these still match. Without this,
+        a stale allocation from a previous mapping (e.g. a different intra/inter-core tiling factor) could be
+        loaded for a workload it was never solved for.
+        """
+        node_signatures = sorted(
+            (n.static_hash, tuple(sorted(n.possible_core_allocation))) for n in to_compute
+        )
+        return str(hash_sha512((node_signatures, iterations)))[:16]
+
     def find_best_allocation(
         self, to_compute: set[ComputationNode], iterations: int, stack: STACK_T = (0,), time_limit: int = 600
     ) -> TimeSlotAllocation:
         """# TODO: Implement overhead of tensor transfers between cores"""
         # Check if the allocation is already cached, if not: find it
         stack_str = "_".join([str(id) for id in stack])
-        stack_allocations_path = os.path.join(self.allocations_path, f"steady_state-{stack_str}.pickle")
+        mapping_hash = self.get_mapping_hash(to_compute, iterations)
+        stack_allocations_path = os.path.join(
+            self.allocations_path, f"steady_state-{stack_str}-{mapping_hash}.pickle"
+        )
         sg = self.workload.subgraph(to_compute)
         if os.path.exists(stack_allocations_path):
             allocation = pickle_load(stack_allocations_path)

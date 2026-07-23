@@ -292,14 +292,23 @@ class CoalaScheduler:
 
     def pop_best_candidate(self) -> tuple[ComputationNode, int]:
         """
-        Returns the best candidate node to schedule next, based on scheduling order priority.
+        Returns the best candidate node to schedule next.
+        Candidates that can start immediately (their core is already idle by the time their predecessors
+        finish) are preferred over candidates that would need to wait on a busy core, even if the latter
+        rank higher in the scheduling order. This avoids idling a core on a dependency-blocked node while
+        an independent, already-ready node targeting that same core sits lower in scheduling-order rank.
+        Ties (equal earliest start time) fall back to scheduling order priority.
         Removes the candidate from the list.
         """
         if not self.candidates:
             raise ValueError("There are no candidates to schedule.")
         preds_ends, cn_candidates = zip(*self.candidates, strict=False)
         idxs = [self.scheduling_order_lookup[(n.id, n.sub_id)] for n in cn_candidates]
-        best_candidate_idx = idxs.index(min(idxs))
+        earliest_starts = [
+            max(self.cores_idle_from[n.chosen_core_allocation], preds_end)  # type: ignore
+            for n, preds_end in zip(cn_candidates, preds_ends, strict=False)
+        ]
+        best_candidate_idx = min(range(len(cn_candidates)), key=lambda i: (earliest_starts[i], idxs[i]))
         best_candidate = cn_candidates[best_candidate_idx]
         preds_end = preds_ends[best_candidate_idx]
         # Remove the candidate from the list of candidates

@@ -1,8 +1,7 @@
 import logging
 from typing import Any
 
-from onnx import NodeProto
-from zigzag.datatypes import Constants
+from onnx import NodeProto, shape_inference
 from zigzag.parser.onnx.utils import parse_onnx_model_from_path
 
 from stream.hardware.architecture.accelerator import Accelerator
@@ -112,6 +111,7 @@ class ONNXModelParser:
         - iterate through the onnx model and generate the workload consisting of LayerNodes and DummyNodes
         """
         self.onnx_model = parse_onnx_model_from_path(self.onnx_model_path)
+        self.onnx_model = shape_inference.infer_shapes(self.onnx_model)
         self.workload = self.parse_workload()
 
     def get_parser_class(self, node: NodeProto):

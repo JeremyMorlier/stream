@@ -95,7 +95,10 @@ class AcceleratorFactory:
         if len(top_instances_a) != len(top_instances_b):
             return True
         for instance_a, instance_b in zip(top_instances_a, top_instances_b, strict=False):
-            if frozenset(instance_a.__dict__.values()) != frozenset(instance_b.__dict__.values()):
+            # NOTE: don't use `frozenset(instance.__dict__.values())`: each MemoryPort's `__hash__` is its
+            # globally auto-incrementing `port_id`, so two ports parsed from separate (even byte-identical)
+            # yaml files always hash differently, making this comparison always fail.
+            if not instance_a.has_same_performance(instance_b):
                 return True
         return False
 

@@ -1,0 +1,37 @@
+- name: default
+  core_allocation:
+    - 0
+    - 1
+
+- name: MatMul
+  core_allocation:
+    - 0
+  intra_core_tiling:
+    - D, 4
+
+- name: Max
+  core_allocation:
+    - 0
+    - 1
+  intra_core_tiling:
+    - B, 4
+      
+- name: Exp
+  core_allocation:
+    - 0
+    - 1
+  intra_core_tiling:
+    - B, 4
+      
+- name: Sum
+  core_allocation:
+    - 0
+    - 1
+  intra_core_tiling:
+    - B, 4
+      
+- name: Div
+  core_allocation:
+    - 1
+  intra_core_tiling:
+    - B, 4

@@ -12,8 +12,8 @@ _logging.basicConfig(level=_logging_level, format=_logging_format)
 
 ############################################INPUTS############################################
 accelerator = "stream/inputs/examples/hardware/fusemax.yaml"
-workload_path = "../stream_arthur/stream/inputs/testing/workload/attention_head.onnx"
-mapping_path = "../simple_attention_mapping.yaml"
+workload_path = "stream/inputs/testing/workload/attention_head.onnx"
+mapping_path = "stream/inputs/testing/mapping/simple_attention_mapping.yaml"
 mode = "fused"
 layer_stacks = [tuple(range(0, 10))]
 ##############################################################################################

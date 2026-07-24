@@ -157,7 +157,3 @@ docs/make.bat
 
 # json files (for perfetto)
 *.json
-
-# Claude files
-CLAUDE.md
-.claude

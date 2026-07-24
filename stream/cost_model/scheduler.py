@@ -1,7 +1,6 @@
 import logging
 from collections import defaultdict
 from enum import Enum, auto
-from functools import cmp_to_key
 from math import ceil
 from operator import itemgetter
 from typing import TYPE_CHECKING
@@ -76,18 +75,10 @@ class CoalaScheduler:
         self.offchip_top_instances = self.accelerator.get_top_instances_of_core(self.offchip_core)
         self.nb_graph_nodes = g.number_of_nodes()
         self._initialize_scheduling_order_lookup()
-        self._compute_critical_path_lengths()
 
         # Initialize bookkeeping
         self.nb_scheduled_nodes = 0
         self.scheduled_nodes: set[ComputationNode] = set()
-        # Nodes that have already been forced to lose (defer) one earliest_start tie via the
-        # RCPL-based override in pop_best_candidate. Once a node appears here, it may never be
-        # forced to defer via that mechanism again -- all of its future ties fall back to raw
-        # scheduling_order rank. This is a one-shot boolean gate, not a numeric budget: it bounds
-        # the maximum possible push-back for any single node to "at most one competitor's runtime,
-        # exactly once, ever" (see pop_best_candidate for the full rationale).
-        self.rcpl_defer_used: set[ComputationNode] = set()
         self.bw_fraction_to_use_for_tensor: dict[Tensor, float] = {}
         self.candidates = self.get_initial_candidates()
         self.initialize_tensor_priorities()
@@ -107,27 +98,6 @@ class CoalaScheduler:
                 self.scheduling_order_lookup_tiered[layer_id] = {sub_id: idx}
             else:
                 self.scheduling_order_lookup_tiered[layer_id][sub_id] = idx
-
-    def _compute_critical_path_lengths(self):
-        """
-        Precomputes, for every node, the length of the longest remaining path from that node to any
-        sink (including the node's own runtime), using only compute runtimes -- cross-core transfer
-        latency is excluded; that is handled separately by the scheduler's transfer-scheduling logic.
-        This is a purely structural (topology + runtime only) quantity, independent of scheduling_order
-        and of any dynamic core-contention state, so it is computed once here and never changes.
-
-        NOTE: this is intentionally NOT used as a primary sort key, nor as a magnitude-based deferral
-        budget (e.g. CPM total float/slack). A node can have a very large graph-wide structural
-        remaining-critical-path-length while still being the wrong node to keep bumping every single
-        time it happens to tie with something else on the same core. It is used only as a one-shot,
-        non-accumulating, adjacency-gated override in pop_best_candidate's tie-break -- see the comment
-        there for exactly how and why that stays bounded and does not misfire on unrelated ties.
-        """
-        self.remaining_critical_path_length: dict[ComputationNode, int] = {}
-        for node in reversed(list(self.G.topological_sort())):
-            successors = list(self.G.successors(node))
-            downstream = max((self.remaining_critical_path_length[s] for s in successors), default=0)
-            self.remaining_critical_path_length[node] = node.get_runtime() + downstream
 
     def get_initial_candidates(self):
         """
@@ -327,28 +297,7 @@ class CoalaScheduler:
         finish) are preferred over candidates that would need to wait on a busy core, even if the latter
         rank higher in the scheduling order. This avoids idling a core on a dependency-blocked node while
         an independent, already-ready node targeting that same core sits lower in scheduling-order rank.
-
-        Ties on earliest start time are broken with raw scheduling_order rank (idxs), with one narrow,
-        one-shot exception. Background: a node with no (or already-satisfied) predecessors can end up
-        tied with the current best-ready node at many consecutive scheduling decisions in a row, simply
-        because its own earliest_start trivially tracks "whenever the core next frees up". If such a
-        node always loses those ties it can be starved -- pushed far later than needed even though the
-        thing it's losing to didn't structurally need to go first.
-
-        The fix is a one-shot boolean, not a magnitude budget, and it is gated on graph adjacency so it
-        can only ever fire for ties between two candidates that are NOT both feeding a shared successor:
-        - If two tied candidates share a common successor (e.g. two sibling input tiles that both feed
-          the same downstream consumer), their remaining_critical_path_length can differ purely because
-          of how far each has already progressed through its own independent predecessor chain -- that
-          difference says nothing about who should run first for this tie, so such ties are decided by
-          scheduling_order alone, as before.
-        - Otherwise (no shared successor, i.e. genuinely independent/unrelated work competing for the
-          same core), the candidate with the larger remaining_critical_path_length is allowed to jump
-          ahead of the raw scheduling_order winner, but only if scheduling_order actually disagreed (the
-          override changes the outcome) and the candidate being forced to defer has not already used its
-          one-shot allowance (self.rcpl_defer_used). Once used, that node's future ties fall back to
-          plain scheduling_order rank, with no further RCPL-based deferral -- bounding the worst-case
-          push-back for any node to losing exactly one tie, by at most one competitor's runtime, ever.
+        Ties (equal earliest start time) fall back to scheduling order priority.
         Removes the candidate from the list.
         """
         if not self.candidates:
@@ -359,43 +308,9 @@ class CoalaScheduler:
             max(self.cores_idle_from[n.chosen_core_allocation], preds_end)  # type: ignore
             for n, preds_end in zip(cn_candidates, preds_ends, strict=False)
         ]
-        remaining_cp = [self.remaining_critical_path_length[n] for n in cn_candidates]
-        successors_of = [frozenset(self.G.successors(n)) for n in cn_candidates]
-
-        def shares_a_successor(i: int, j: int) -> bool:
-            return bool(successors_of[i] & successors_of[j])
-
-        def cmp(i: int, j: int) -> int:
-            if earliest_starts[i] != earliest_starts[j]:
-                return -1 if earliest_starts[i] < earliest_starts[j] else 1
-            idx_says_i_first = idxs[i] < idxs[j]
-            baseline_winner = i if idx_says_i_first else j
-            if remaining_cp[i] != remaining_cp[j] and not shares_a_successor(i, j):
-                rcpl_winner, rcpl_loser = (i, j) if remaining_cp[i] > remaining_cp[j] else (j, i)
-                overrides_baseline = rcpl_winner != baseline_winner
-                loser_node = cn_candidates[rcpl_loser]
-                if overrides_baseline and loser_node not in self.rcpl_defer_used:
-                    return -1 if rcpl_winner == i else 1
-            return -1 if baseline_winner == i else 1
-
-        order = sorted(range(len(cn_candidates)), key=cmp_to_key(cmp))
-        best_candidate_idx = order[0]
+        best_candidate_idx = min(range(len(cn_candidates)), key=lambda i: (earliest_starts[i], idxs[i]))
         best_candidate = cn_candidates[best_candidate_idx]
         preds_end = preds_ends[best_candidate_idx]
-        # If the winner was only chosen because of the RCPL one-shot override (i.e. scheduling_order
-        # alone would have picked a different, tied, non-shared-successor candidate with smaller RCPL),
-        # permanently mark that overridden candidate as having used its one allowed deferral. It can
-        # still lose future ties, but only via plain scheduling_order rank from now on.
-        for i, n in enumerate(cn_candidates):
-            if i == best_candidate_idx or earliest_starts[i] != earliest_starts[best_candidate_idx]:
-                continue
-            if shares_a_successor(i, best_candidate_idx):
-                continue
-            idx_says_n_first = idxs[i] < idxs[best_candidate_idx]
-            if not idx_says_n_first:
-                continue  # scheduling_order already agreed n should lose here; no override happened
-            if remaining_cp[i] < remaining_cp[best_candidate_idx]:
-                self.rcpl_defer_used.add(n)
         # Remove the candidate from the list of candidates
         del self.candidates[best_candidate_idx]
         return best_candidate, preds_end

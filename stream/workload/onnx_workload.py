@@ -1,9 +1,28 @@
+import logging
 from typing import Any
 
+import pydot
+from networkx.drawing.nx_pydot import to_pydot  # type: ignore
 from zigzag.utils import DiGraphWrapper
 
 from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.node import Node
+
+logger = logging.getLogger(__name__)
+
+# Cycled through by layer id when coloring nodes in `ComputationNodeWorkload.visualize_to_file`
+_LAYER_COLOR_PALETTE = (
+    "#a2d5f2",
+    "#ffcb9a",
+    "#c2f0c2",
+    "#eaff9a",
+    "#f2a2d5",
+    "#d5a2f2",
+    "#a2f2d5",
+    "#f2d5a2",
+    "#c2c2f0",
+    "#f0c2c2",
+)
 
 
 class ONNXWorkload(DiGraphWrapper[Node]):
@@ -79,3 +98,59 @@ class ComputationNodeWorkload(DiGraphWrapper[ComputationNode]):
 
     def get_subgraph(self, nodes: list[ComputationNode]) -> "ComputationNodeWorkload":
         return self.subgraph(nodes)  # type: ignore
+
+    def visualize_to_file(self, filepath: str = "tiled_workload_graph.dot"):
+        """Visualize the tiled workload graph using Graphviz and save it to a DOT file.
+
+        Nodes are laid out left to right in topological order, and vertically grouped by
+        chosen_core_allocation (stacked top-to-bottom). Nodes are colored by the id of the
+        layer they were tiled from.
+        """
+        dot = to_pydot(self)
+        dot.set_rankdir("LR")
+        dot.set_concentrate(True)
+
+        # Group nodes by chosen core allocation (vertical stacking of clusters)
+        core_to_nodes: dict[int | None, list[ComputationNode]] = {}
+        for node in self.nodes():
+            core_to_nodes.setdefault(node.chosen_core_allocation, []).append(node)
+        sorted_cores = sorted(core_to_nodes.keys(), key=lambda c: (c is None, c))
+
+        cluster_heads: list[str] = []
+        for core in sorted_cores:
+            nodes = core_to_nodes[core]
+            cluster = pydot.Cluster(
+                graph_name=f"core_{core}",
+                label=f"Core {core}" if core is not None else "Unallocated",
+                style="dashed",
+            )
+            for node in nodes:
+                cluster.add_node(dot.get_node(str(node))[0])
+            dot.add_subgraph(cluster)
+            cluster_heads.append(str(nodes[0]))
+
+        # Add invisible edges between cluster heads to stack clusters vertically
+        for upper, lower in zip(cluster_heads, cluster_heads[1:], strict=False):
+            dot.add_edge(pydot.Edge(upper, lower, style="invis"))
+
+        # Color nodes by the id of the layer they were tiled from
+        layer_ids = sorted(set(node.id for node in self.nodes()))
+        layer_id_to_color = {
+            layer_id: _LAYER_COLOR_PALETTE[i % len(_LAYER_COLOR_PALETTE)] for i, layer_id in enumerate(layer_ids)
+        }
+
+        for node in self.nodes():
+            n = dot.get_node(str(node))[0]
+            n.set_label(f"{node.short_name}\\n({node.id},{node.sub_id})")
+            n.set_shape("box")
+            n.set_style("filled")
+            n.set_fillcolor(layer_id_to_color[node.id])
+
+        # Highlight edges that carry no data (e.g. intra-core tiling edges with bits == 0)
+        for u, v, data in self.edges(data=True):
+            if data.get("bits") == 0:
+                for e in dot.get_edge(str(u), str(v)):
+                    e.set_color("red")
+
+        dot.write_raw(filepath)
+        logger.info(f"Tiled workload graph saved to {filepath}")

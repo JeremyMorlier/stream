@@ -172,6 +172,9 @@ class TiledWorkloadGenerationStage(Stage):
 
         logger.info(f"Finer graph: {tiled_workload}.")
 
+        tiled_workload_fig_path = os.path.splitext(self.tiled_workload_path)[0] + ".dot"
+        tiled_workload.visualize_to_file(tiled_workload_fig_path)
+
         kwargs = self.kwargs.copy()
         kwargs["original_workload"] = pickle_deepcopy(self.workload)
         kwargs["workload"] = tiled_workload

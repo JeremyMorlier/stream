@@ -29,6 +29,9 @@ dependencies = [
     'plotly',
     'pandas',
     'gurobipy',
+    "pydot>=4.0.1",
+    "torch>=2.13.0",
+    "graphviz>=0.21",
 ]
 requires-python = ">=3.11"
 

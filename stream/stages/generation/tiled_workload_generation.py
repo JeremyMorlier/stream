@@ -179,6 +179,7 @@ class TiledWorkloadGenerationStage(Stage):
         kwargs["original_workload"] = pickle_deepcopy(self.workload)
         kwargs["workload"] = tiled_workload
         kwargs["accelerator"] = self.accelerator
+        kwargs["tiled_workload_path"] = self.tiled_workload_path
 
         if "scheduling_order" not in kwargs:
             kwargs["scheduling_order"] = self.get_scheduling_order(tiled_workload)

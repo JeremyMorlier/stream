@@ -1,4 +1,5 @@
 import array
+import csv
 import functools
 import hashlib
 import logging
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 INTRA_CANDIDATE_T = int
 INTER_CANDIDATE_T = "tuple[LayerDim, int | Literal['*']] | None"
+MAX_TILES_PER_LAYER = 1000
 
 
 @dataclass
@@ -67,6 +69,19 @@ def prime_divisors(n: int) -> list[int]:
     return sorted(d for d in divisors if d > 1)
 
 
+def prime_factors(n: int) -> set[int]:
+    factors: set[int] = set()
+    d = 2
+    while d * d <= n:
+        while n % d == 0:
+            factors.add(d)
+            n //= d
+        d += 1
+    if n > 1:
+        factors.add(n)
+    return factors
+
+
 def _candidate_key(individual: "array.array | list[int]") -> str:
     """Deterministic, content-addressed identifier for a GA individual: identical gene values always map to
     the same key regardless of object identity, so it stays valid even after DEAP mutates an individual's
@@ -97,11 +112,184 @@ def _decode_individual(
     return dict(per_node)
 
 
+def _candidate_tiling_factor(gene: TilingGene, candidate_index: int) -> int:
+    """Return the numeric tile factor contributed by a selected gene candidate.
+    A no-op candidate (`1` for intra or `None` for inter) contributes 1. CO wildcard inter-core choices are not
+    concrete during tiling exploration, so they do not increase the fixed tile count checked here."""
+    choice = gene.candidates[candidate_index]
+    if gene.kind == "intra":
+        return int(choice)
+    if choice is None:
+        return 1
+    _dim, factor = choice
+    return factor if isinstance(factor, int) else 1
+
+
+def _tile_counts_by_node(individual: "array.array | list[int]", genes: list[TilingGene]) -> dict[int, int]:
+    tile_counts: dict[int, int] = defaultdict(lambda: 1)
+    for gene, value in zip(genes, individual, strict=True):
+        tile_counts[gene.node_id] *= _candidate_tiling_factor(gene, value)
+    return dict(tile_counts)
+
+
+def _intra_tile_counts_by_node(individual: "array.array | list[int]", genes: list[TilingGene]) -> dict[int, int]:
+    intra_tile_counts: dict[int, int] = defaultdict(lambda: 1)
+    for gene, value in zip(genes, individual, strict=True):
+        if gene.kind == "intra":
+            intra_tile_counts[gene.node_id] *= _candidate_tiling_factor(gene, value)
+    return dict(intra_tile_counts)
+
+
+def _respects_tile_limit(individual: "array.array | list[int]", genes: list[TilingGene]) -> bool:
+    return all(tile_count <= MAX_TILES_PER_LAYER for tile_count in _tile_counts_by_node(individual, genes).values())
+
+
+def _has_divisible_minimum_intra_core_product(individual: "array.array | list[int]", genes: list[TilingGene]) -> bool:
+    intra_tile_counts = _intra_tile_counts_by_node(individual, genes)
+    if not intra_tile_counts:
+        return True
+
+    min_tile_count = min(intra_tile_counts.values())
+    return min_tile_count > 1 and all(tile_count % min_tile_count == 0 for tile_count in intra_tile_counts.values())
+
+
+def _respects_tiling_constraints(individual: "array.array | list[int]", genes: list[TilingGene]) -> bool:
+    return _respects_tile_limit(individual, genes) and _has_divisible_minimum_intra_core_product(individual, genes)
+
+
+def _repair_tile_limit(individual: "array.array | list[int]", genes: list[TilingGene]):
+    """Reduce selected tiling factors until every layer stays within MAX_TILES_PER_LAYER.
+    Candidate index 0 is the no-op candidate for both intra and inter genes."""
+    while True:
+        tile_counts = _tile_counts_by_node(individual, genes)
+        invalid_node_ids = [node_id for node_id, tile_count in tile_counts.items() if tile_count > MAX_TILES_PER_LAYER]
+        if not invalid_node_ids:
+            return individual
+
+        for node_id in invalid_node_ids:
+            selected_gene_indices = [
+                i
+                for i, gene in enumerate(genes)
+                if gene.node_id == node_id and _candidate_tiling_factor(gene, individual[i]) > 1
+            ]
+            if not selected_gene_indices:
+                return individual
+
+            gene_index = max(
+                selected_gene_indices,
+                key=lambda i: _candidate_tiling_factor(genes[i], individual[i]),
+            )
+            individual[gene_index] = 0
+
+
+def _common_available_intra_primes(genes: list[TilingGene]) -> set[int]:
+    primes_by_node: dict[int, set[int]] = defaultdict(set)
+    for gene in genes:
+        if gene.kind != "intra":
+            continue
+        for candidate_index in range(len(gene.candidates)):
+            factor = _candidate_tiling_factor(gene, candidate_index)
+            primes_by_node[gene.node_id].update(prime_factors(factor))
+
+    if not primes_by_node:
+        return set()
+    return set.intersection(*primes_by_node.values())
+
+
+def _repair_divisible_minimum_intra_core_product(individual: "array.array | list[int]", genes: list[TilingGene]):
+    """Try to make every layer's intra-core tiling product equal to a shared factor larger than 1.
+    Equal products satisfy the stricter condition that the minimum product divides every other product."""
+    if _has_divisible_minimum_intra_core_product(individual, genes):
+        return individual
+
+    common_primes = _common_available_intra_primes(genes)
+    if not common_primes:
+        return individual
+
+    target_prime = random.choice(sorted(common_primes))
+    node_ids = {gene.node_id for gene in genes if gene.kind == "intra"}
+    for node_id in node_ids:
+        for gene_index, gene in enumerate(genes):
+            if gene.kind == "intra" and gene.node_id == node_id:
+                individual[gene_index] = 0
+
+        tile_counts = _tile_counts_by_node(individual, genes)
+        valid_replacements: list[tuple[int, int]] = []
+        for gene_index, gene in enumerate(genes):
+            if gene.kind != "intra" or gene.node_id != node_id:
+                continue
+
+            old_factor = _candidate_tiling_factor(gene, individual[gene_index])
+            for candidate_index in range(len(gene.candidates)):
+                new_factor = _candidate_tiling_factor(gene, candidate_index)
+                if new_factor % target_prime != 0:
+                    continue
+                new_tile_count = tile_counts[node_id] // old_factor * new_factor
+                if new_tile_count <= MAX_TILES_PER_LAYER:
+                    valid_replacements.append((gene_index, candidate_index))
+
+        if not valid_replacements:
+            continue
+
+        gene_index, candidate_index = min(
+            valid_replacements,
+            key=lambda replacement: _candidate_tiling_factor(genes[replacement[0]], replacement[1]),
+        )
+        individual[gene_index] = candidate_index
+    return individual
+
+
+def _repair_tiling_constraints(individual: "array.array | list[int]", genes: list[TilingGene]):
+    """Best-effort repair for the hard tiling constraints used by the GA."""
+    for _ in range(len(genes) + 1):
+        if _respects_tiling_constraints(individual, genes):
+            return individual
+        _repair_tile_limit(individual, genes)
+        _repair_divisible_minimum_intra_core_product(individual, genes)
+    return individual
+
+
 def _load_cached_result(tiling_candidates_dir: str, key: str) -> tuple[Any, dict[str, Any]] | None:
     result_path = f"{tiling_candidates_dir}/candidate_{key}/result.pickle"
     if not os.path.exists(result_path):
         return None
     return pickle_load(result_path)
+
+
+def _write_candidate_results_csv(
+    csv_path: str,
+    candidate_records: dict[str, tuple[tuple[int, ...], float]],
+    genes: list[TilingGene],
+    tiling_candidates_dir: str,
+) -> None:
+    csv_dir = os.path.dirname(csv_path)
+    if csv_dir:
+        os.makedirs(csv_dir, exist_ok=True)
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["candidate_index", "tiling_config", "fitness", "latency", "energy", "status"])
+        for key, (individual, fitness) in candidate_records.items():
+            cached = _load_cached_result(tiling_candidates_dir, key)
+            tiling_config = _decode_individual(list(individual), genes)
+            if cached is None:
+                status = (
+                    "invalid_constraints" if not _respects_tiling_constraints(list(individual), genes) else "failed"
+                )
+                writer.writerow([key, tiling_config, fitness, "", "", status])
+                continue
+
+            scme, extra_info = cached
+            writer.writerow(
+                [
+                    key,
+                    extra_info.get("tiling_config", tiling_config),
+                    fitness,
+                    scme.latency,
+                    scme.energy,
+                    "ok",
+                ]
+            )
+    logger.info(f"TilingExplorationStage: saved all candidate results to {csv_path}.")
 
 
 def _evaluate_tiling_individual(  # noqa: PLR0913
@@ -124,6 +312,14 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     key = _candidate_key(individual)
     candidate_dir = f"{tiling_candidates_dir}/candidate_{key}"
     result_path = f"{candidate_dir}/result.pickle"
+
+    if not _respects_tiling_constraints(individual, genes):
+        logger.info(
+            f"TilingExplorationStage: candidate {key} violates tiling constraints "
+            f"(max {MAX_TILES_PER_LAYER} tiles/layer and minimum intra-core product divides all others), "
+            "penalizing it."
+        )
+        return (float("inf"),)
 
     if os.path.exists(result_path):
         cached_scme, _cached_extra_info = pickle_load(result_path)
@@ -178,7 +374,7 @@ class TilingExplorationStage(Stage):
     individual.
     """
 
-    LARGE_SEARCH_SPACE_WARNING_THRESHOLD = 50
+    LARGE_SEARCH_SPACE_WARNING_THRESHOLD = 1000
 
     def __init__(  # noqa: PLR0913
         self,
@@ -193,6 +389,7 @@ class TilingExplorationStage(Stage):
         max_workers: int | None = None,
         nb_tiling_ga_generations: int = 4,
         nb_tiling_ga_individuals: int = 8,
+        candidate_results_csv_path: str | None = None,
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
@@ -205,6 +402,9 @@ class TilingExplorationStage(Stage):
         self.max_workers = max_workers
         self.nb_tiling_ga_generations = nb_tiling_ga_generations
         self.nb_tiling_ga_individuals = nb_tiling_ga_individuals
+        self.candidate_results_csv_path = candidate_results_csv_path or os.path.join(
+            tiling_candidates_dir, "candidate_results.csv"
+        )
 
     def run(self):  # noqa: PLR0915
         # CO resolves inter-core tiling itself (via a wildcard) to match whatever core split it settles on, and
@@ -232,11 +432,22 @@ class TilingExplorationStage(Stage):
                 nullcontext(),
             )
             cached = _load_cached_result(self.tiling_candidates_dir, _candidate_key(empty_individual))
+            fitness = float("inf") if cached is None else getattr(cached[0], self.sort_key)
+            _write_candidate_results_csv(
+                self.candidate_results_csv_path,
+                {_candidate_key(empty_individual): (tuple(empty_individual), fitness)},
+                genes,
+                self.tiling_candidates_dir,
+            )
             if cached is not None:
                 yield cached
             return
 
         logger.info(f"TilingExplorationStage: {len(genes)} tiling decision point(s) (genes) built.")
+        logger.info(
+            f"TilingExplorationStage: limiting tiled workload generation to {MAX_TILES_PER_LAYER} tiles/layer "
+            "and requiring the minimum intra-core tiling product to divide every other layer's product."
+        )
         total_evaluations = self.nb_tiling_ga_individuals * self.nb_tiling_ga_generations
         if total_evaluations > self.LARGE_SEARCH_SPACE_WARNING_THRESHOLD:
             logger.warning(
@@ -251,7 +462,16 @@ class TilingExplorationStage(Stage):
             creator.create("TilingIndividual", array.array, typecode="i", fitness=creator.TilingFitnessMin)
 
         def _random_individual():
-            return creator.TilingIndividual(random.randrange(len(gene.candidates)) for gene in genes)
+            individual = creator.TilingIndividual(random.randrange(len(gene.candidates)) for gene in genes)
+            return _repair_tiling_constraints(individual, genes)
+
+        def _mate(individual_1, individual_2):
+            if len(individual_1) < 2:
+                return individual_1, individual_2
+            tools.cxTwoPoint(individual_1, individual_2)
+            _repair_tiling_constraints(individual_1, genes)
+            _repair_tiling_constraints(individual_2, genes)
+            return individual_1, individual_2
 
         def _mutate(individual):
             for i, gene in enumerate(genes):
@@ -259,12 +479,13 @@ class TilingExplorationStage(Stage):
                     valid_replacements = [v for v in range(len(gene.candidates)) if v != individual[i]]
                     if valid_replacements:
                         individual[i] = random.choice(valid_replacements)
+            _repair_tiling_constraints(individual, genes)
             return (individual,)
 
         toolbox = base.Toolbox()
         toolbox.register("individual", _random_individual)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-        toolbox.register("mate", tools.cxTwoPoint)
+        toolbox.register("mate", _mate)
         toolbox.register("mutate", _mutate)
         toolbox.register("select", tools.selTournament, tournsize=3)
 
@@ -278,6 +499,7 @@ class TilingExplorationStage(Stage):
         with mp_context.Manager() as manager:
             scme_lock = manager.Lock()
             with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=mp_context) as executor:
+                candidate_records: dict[str, tuple[tuple[int, ...], float]] = {}
                 toolbox.register(
                     "evaluate",
                     functools.partial(
@@ -292,6 +514,7 @@ class TilingExplorationStage(Stage):
                         scme_lock=scme_lock,
                     ),
                 )
+
                 def _dedup_map(func, individuals):
                     """DEAP's eaSimple calls toolbox.map(toolbox.evaluate, invalid_ind) once per generation
                     (and once for the initial population) -- registering this wrapper around the executor's
@@ -311,6 +534,9 @@ class TilingExplorationStage(Stage):
                             first_index_for_key[key] = len(unique_individuals)
                             unique_individuals.append(ind)
                     unique_results = list(executor.map(func, unique_individuals))
+                    for individual, result in zip(unique_individuals, unique_results, strict=True):
+                        key = _candidate_key(individual)
+                        candidate_records[key] = (tuple(individual), result[0])
                     return [unique_results[first_index_for_key[key]] for key in keys]
 
                 toolbox.register("map", _dedup_map)
@@ -330,6 +556,13 @@ class TilingExplorationStage(Stage):
                     stats=statistics,
                     halloffame=hall_of_fame,
                     verbose=True,
+                )
+
+                _write_candidate_results_csv(
+                    self.candidate_results_csv_path,
+                    candidate_records,
+                    genes,
+                    self.tiling_candidates_dir,
                 )
 
                 seen_keys: set[str] = set()

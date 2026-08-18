@@ -111,6 +111,8 @@ scme, all_results = optimize_tiling(
     skip_if_exists=False,
     profile=True,
     max_workers=4,
+    nb_tiling_ga_generations=40,
+    nb_tiling_ga_individuals=8,
 )
 print(f"Evaluated {len(all_results)} tiling candidate(s).")
 

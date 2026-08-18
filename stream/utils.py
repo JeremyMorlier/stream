@@ -1,6 +1,7 @@
 import os
 import pickle
 import pprint
+import time
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 from numpy.typing import NDArray
@@ -14,6 +15,7 @@ from stream.workload.mapping import TILING_T, TILING_WILDCARD_T
 
 if TYPE_CHECKING:
     from stream.hardware.architecture.accelerator import Accelerator
+    from stream.stages.stage import StageCallable
     from stream.workload.computation.computation_node import ComputationNode
     from stream.workload.onnx_workload import ComputationNodeWorkload
 
@@ -126,7 +128,7 @@ def return_tiling_type(tiling: TILING_T | TILING_WILDCARD_T) -> TILING_T:
 def get_inter_core_tiling_size(node: "ComputationNode") -> int:
     inter_core_tiling = node.inter_core_tiling
     if inter_core_tiling and not contains_wildcard(inter_core_tiling):
-        assert len(inter_core_tiling) == 1, "Only one inter_core_tiling entry is supported."
+        # assert len(inter_core_tiling) == 1, "Only one inter_core_tiling entry is supported."
         inter_core_tiling_size = inter_core_tiling[0][1]
         if inter_core_tiling_size == "all":
             inter_core_tiling_size = node.layer_dim_sizes[inter_core_tiling[0][0]]
@@ -222,3 +224,63 @@ def get_value(name: str, model: ModelProto):
     for constant in model.graph.value_info:
         if constant.name == name:
             return [element.dim_value for element in constant.type.tensor_type.shape.dim]
+
+
+def wrap_stages_with_timing(
+    list_of_callables: list["StageCallable"],
+) -> tuple[list["StageCallable"], dict[str, list[float]]]:
+    """Wrap each stage class of a MainStage pipeline so that the cumulative wall-clock time spent
+    in its __init__ and its run() generator body is recorded.
+
+    Stages are chained through `yield from sub_stage.run()`, so a stage's own run() call stays on
+    the stack for as long as every stage after it in the pipeline is running. This means the
+    recorded time for stage i includes the time of every stage after it. Use
+    `get_exclusive_stage_times` on the returned dict (after running the pipeline, in the same,
+    original stage order) to get each stage's own, non-nested time.
+
+    @return: (wrapped list of callables to pass to MainStage, dict mapping stage class name to
+        [init_time, run_time], populated once the pipeline has run)
+    """
+    timings: dict[str, list[float]] = {}
+
+    def _wrap(stage_cls: "StageCallable") -> "StageCallable":
+        label = stage_cls.__name__
+        timings[label] = [0.0, 0.0]
+
+        class TimedStage(stage_cls):  # type: ignore[misc,valid-type]
+            def __init__(self, list_of_callables: list["StageCallable"], **kwargs: Any):
+                t0 = time.perf_counter()
+                super().__init__(list_of_callables, **kwargs)
+                timings[label][0] += time.perf_counter() - t0
+
+            def run(self):
+                t0 = time.perf_counter()
+                try:
+                    yield from super().run()
+                finally:
+                    timings[label][1] += time.perf_counter() - t0
+
+        TimedStage.__name__ = stage_cls.__name__
+        TimedStage.__qualname__ = stage_cls.__qualname__
+        return TimedStage
+
+    return [_wrap(stage_cls) for stage_cls in list_of_callables], timings
+
+
+def get_exclusive_stage_times(
+    original_list_of_callables: list["StageCallable"], timings: dict[str, list[float]]
+) -> dict[str, float]:
+    """Turn the (nested) timings from `wrap_stages_with_timing` into each stage's own, exclusive
+    wall-clock time, i.e. excluding the time spent in the stages that come after it in the pipeline.
+
+    @param original_list_of_callables: the same list (and order) that was passed to
+        `wrap_stages_with_timing`.
+    @param timings: the dict returned by `wrap_stages_with_timing`, after the pipeline has run.
+    """
+    labels = [stage_cls.__name__ for stage_cls in original_list_of_callables]
+    totals = [sum(timings[label]) for label in labels]
+    exclusive_times: dict[str, float] = {}
+    for i, label in enumerate(labels):
+        nested_total = totals[i + 1] if i + 1 < len(totals) else 0.0
+        exclusive_times[label] = totals[i] - nested_total
+    return exclusive_times

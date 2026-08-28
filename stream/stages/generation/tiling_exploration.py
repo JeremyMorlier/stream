@@ -19,6 +19,7 @@ from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
 
 from stream.hardware.architecture.accelerator import Accelerator
 from stream.stages.stage import MainStage, Stage, StageCallable
+from stream.utils import accumulate_stage_timings, get_exclusive_stage_times, wrap_stages_with_timing_for_workers
 from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.mapping import TILING_T, TILING_WILDCARD_T
 from stream.workload.onnx_workload import ONNXWorkload
@@ -38,7 +39,7 @@ class TilingGene:
       have any number of intra-tiled dimensions simultaneously (already supported by the framework).
     - `kind="inter"`: one gene per *layer* (not per dimension); `dim` is `None` since the dimension itself is
       part of each candidate; `candidates[i]` is `None` (no inter split for this layer) or `(dim, factor)`
-      where `factor` is an integer prime divisor or `"*"` (wildcard, CO-only). Combining the dimension choice
+      where `factor` is an integer prime divisor. Combining the dimension choice
       into a single per-layer gene guarantees at most one inter-tiled dimension per layer -- required because
       the framework (`GroupIdManager`, `stream.utils.get_inter_core_tiling_size`) only ever considers a
       single `inter_core_tiling` entry; giving a layer more than one causes group-id/core-allocation
@@ -114,8 +115,7 @@ def _decode_individual(
 
 def _candidate_tiling_factor(gene: TilingGene, candidate_index: int) -> int:
     """Return the numeric tile factor contributed by a selected gene candidate.
-    A no-op candidate (`1` for intra or `None` for inter) contributes 1. CO wildcard inter-core choices are not
-    concrete during tiling exploration, so they do not increase the fixed tile count checked here."""
+    A no-op candidate (`1` for intra or `None` for inter) contributes 1."""
     choice = gene.candidates[candidate_index]
     if gene.kind == "intra":
         return int(choice)
@@ -302,6 +302,7 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     scme_path: str,
     sort_key: str,
     scme_lock: "AcquirerProxy | nullcontext[None]",
+    profile: bool = False,
 ) -> tuple[float]:
     """Runs in a worker process: decodes one GA individual into per-layer tiling, evaluates it through the
     full downstream pipeline, and atomically updates the shared best-so-far `scme_path` under `scme_lock` --
@@ -337,22 +338,34 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     os.makedirs(candidate_dir, exist_ok=True)
     kwargs["tiled_workload_path"] = f"{candidate_dir}/tiled_workload.pickle"
     kwargs["cost_lut_path"] = f"{candidate_dir}/cost_lut.pickle"
-    if "allocations_path" in kwargs_template:  # CO-only, present when allocation_strategy == "co"
-        kwargs["allocations_path"] = f"{candidate_dir}/waco/"
-        os.makedirs(kwargs["allocations_path"], exist_ok=True)
-        kwargs["tiled_workload_post_co_path"] = f"{candidate_dir}/tiled_workload_post_co.pickle"
-        kwargs["cost_lut_post_co_path"] = f"{candidate_dir}/cost_lut_post_co.pickle"
+    stage_timings: dict[str, list[float]] = {}
+    if profile:
+        kwargs["_stage_timings"] = stage_timings
 
     try:
         sub_mainstage = MainStage(list_of_callables, **kwargs)
         # The pipeline's real result is always the first yielded answer (see e.g. TiledWorkloadGenerationStage,
         # which yields a trailing `(None, None)` after forwarding the chain).
-        scme = sub_mainstage.run()[0][0]
+        scme, sub_extra_info = sub_mainstage.run()[0]
     except Exception:
         logger.exception(f"TilingExplorationStage: candidate {key} failed, penalizing it.")
         return (float("inf"),)
 
+    logger.info(f"TilingExplorationStage: candidate {key} evaluated ({sort_key}={getattr(scme, sort_key):.6g}).")
+
+    if profile:
+        # Read back by the parent process (see TilingExplorationStage.run) to aggregate per-candidate stage
+        # timings across every worker process, the same way `result.pickle` is used for the SCME itself.
+        pickle_save(stage_timings, f"{candidate_dir}/stage_timings.pickle")  # type: ignore
+
     extra_info = {"tiling_config": per_node, "candidate_index": key}
+    # CoreArchitectureExplorationStage (if present in the per-candidate chain) yields its own extra_info with
+    # the winning core design's identifying keys -- surface it here so it isn't silently dropped.
+    if isinstance(sub_extra_info, dict) and "core_node_ids" in sub_extra_info:
+        extra_info["core_config"] = {
+            "candidate_index": sub_extra_info.get("candidate_index"),
+            "core_node_ids": sub_extra_info.get("core_node_ids"),
+        }
     pickle_save((scme, extra_info), result_path)  # type: ignore
 
     with scme_lock:
@@ -390,6 +403,7 @@ class TilingExplorationStage(Stage):
         nb_tiling_ga_generations: int = 4,
         nb_tiling_ga_individuals: int = 8,
         candidate_results_csv_path: str | None = None,
+        profile: bool = False,
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
@@ -405,17 +419,29 @@ class TilingExplorationStage(Stage):
         self.candidate_results_csv_path = candidate_results_csv_path or os.path.join(
             tiling_candidates_dir, "candidate_results.csv"
         )
+        self.profile = profile
+        # Populated as candidates are evaluated (see run()): summed [init_time, run_time] per per-candidate
+        # stage, across every unique candidate evaluated by this GA run.
+        self.candidate_stage_timings: dict[str, list[float]] = {}
+        self.profiled_candidate_count = 0
 
     def run(self):  # noqa: PLR0915
-        # CO resolves inter-core tiling itself (via a wildcard) to match whatever core split it settles on, and
-        # asserts an exact match against the mapping's core_allocation length for any non-wildcard value — so a
-        # swept fixed inter-core factor is only safe under GA. See ConstraintOptimizationAllocationStage.
-        is_co_pipeline = "allocations_path" in self.kwargs
-        genes = self._build_genes(sweep_inter_core_tiling=not is_co_pipeline)
+        genes = self._build_genes()
 
         kwargs_template = self.kwargs.copy()
         kwargs_template["accelerator"] = self.accelerator
         kwargs_template["layer_stacks"] = self.layer_stacks
+        # sort_key is consumed as our own named __init__ param above, so it wouldn't otherwise reach the
+        # per-candidate pipeline -- forward it explicitly so e.g. CoreArchitectureExplorationStage (if present
+        # in the per-candidate chain) picks its own best candidate by the same key.
+        kwargs_template["sort_key"] = self.sort_key
+
+        # Stages from here on run once per evaluated candidate, inside worker processes spawned below (or
+        # inline, in the no-genes case) -- wrap them with the picklable per-worker timer rather than
+        # `wrap_stages_with_timing` (its closures can't be pickled to send to a worker process).
+        list_of_callables_for_candidates = (
+            wrap_stages_with_timing_for_workers(self.list_of_callables) if self.profile else self.list_of_callables
+        )
 
         if not genes:
             logger.info("TilingExplorationStage: no tiling decision points found; running the pipeline unchanged.")
@@ -424,21 +450,31 @@ class TilingExplorationStage(Stage):
                 empty_individual,
                 genes,
                 self.workload,
-                self.list_of_callables,
+                list_of_callables_for_candidates,
                 kwargs_template,
                 self.tiling_candidates_dir,
                 self.scme_path,
                 self.sort_key,
                 nullcontext(),
+                profile=self.profile,
             )
             cached = _load_cached_result(self.tiling_candidates_dir, _candidate_key(empty_individual))
             fitness = float("inf") if cached is None else getattr(cached[0], self.sort_key)
+            candidate_records = {_candidate_key(empty_individual): (tuple(empty_individual), fitness)}
             _write_candidate_results_csv(
                 self.candidate_results_csv_path,
-                {_candidate_key(empty_individual): (tuple(empty_individual), fitness)},
+                candidate_records,
                 genes,
                 self.tiling_candidates_dir,
             )
+            if self.profile:
+                candidate_dir = f"{self.tiling_candidates_dir}/candidate_{_candidate_key(empty_individual)}"
+                timings_path = f"{candidate_dir}/stage_timings.pickle"
+                if os.path.exists(timings_path):
+                    accumulate_stage_timings(self.candidate_stage_timings, pickle_load(timings_path))
+                    self.profiled_candidate_count += 1
+                self._log_candidate_stage_timings()
+            self._save_search_summary(genes, candidate_records, [], [])
             if cached is not None:
                 yield cached
             return
@@ -506,12 +542,13 @@ class TilingExplorationStage(Stage):
                         _evaluate_tiling_individual,
                         genes=genes,
                         workload=self.workload,
-                        list_of_callables=self.list_of_callables,
+                        list_of_callables=list_of_callables_for_candidates,
                         kwargs_template=kwargs_template,
                         tiling_candidates_dir=self.tiling_candidates_dir,
                         scme_path=self.scme_path,
                         sort_key=self.sort_key,
                         scme_lock=scme_lock,
+                        profile=self.profile,
                     ),
                 )
 
@@ -533,10 +570,19 @@ class TilingExplorationStage(Stage):
                         if key not in first_index_for_key:
                             first_index_for_key[key] = len(unique_individuals)
                             unique_individuals.append(ind)
+                    logger.info(
+                        f"TilingExplorationStage: batch of {len(individuals)} individual(s), "
+                        f"{len(unique_individuals)} unique after dedup."
+                    )
                     unique_results = list(executor.map(func, unique_individuals))
                     for individual, result in zip(unique_individuals, unique_results, strict=True):
                         key = _candidate_key(individual)
                         candidate_records[key] = (tuple(individual), result[0])
+                        if self.profile:
+                            timings_path = f"{self.tiling_candidates_dir}/candidate_{key}/stage_timings.pickle"
+                            if os.path.exists(timings_path):
+                                accumulate_stage_timings(self.candidate_stage_timings, pickle_load(timings_path))
+                                self.profiled_candidate_count += 1
                     return [unique_results[first_index_for_key[key]] for key in keys]
 
                 toolbox.register("map", _dedup_map)
@@ -547,7 +593,11 @@ class TilingExplorationStage(Stage):
                 statistics.register("min", lambda values: min(v[0] for v in values))
                 statistics.register("avg", lambda values: sum(v[0] for v in values) / len(values))
 
-                algorithms.eaSimple(
+                # verbose=False only suppresses DEAP's own print(logbook.stream) call -- Logbook.record(...) is
+                # still invoked every generation regardless, so capturing and logging it ourselves below is
+                # behavior-neutral for the GA and routes per-generation stats through the app's real logger
+                # instead of bypassing it via stdout.
+                population, logbook = algorithms.eaSimple(
                     population,
                     toolbox,
                     cxpb=0.5,
@@ -555,8 +605,13 @@ class TilingExplorationStage(Stage):
                     ngen=self.nb_tiling_ga_generations,
                     stats=statistics,
                     halloffame=hall_of_fame,
-                    verbose=True,
+                    verbose=False,
                 )
+                for record in logbook:
+                    logger.info(
+                        f"TilingExplorationStage: generation {record['gen']}: "
+                        f"nevals={record['nevals']} min={record['min']:.6g} avg={record['avg']:.6g}"
+                    )
 
                 _write_candidate_results_csv(
                     self.candidate_results_csv_path,
@@ -564,13 +619,22 @@ class TilingExplorationStage(Stage):
                     genes,
                     self.tiling_candidates_dir,
                 )
+                self._log_candidate_stage_timings()
 
                 seen_keys: set[str] = set()
+                hall_of_fame_summary: list[dict[str, Any]] = []
                 for individual in hall_of_fame:
                     key = _candidate_key(individual)
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
+                    hall_of_fame_summary.append(
+                        {
+                            "candidate_index": key,
+                            "tiling": tuple(individual),
+                            "fitness": tuple(individual.fitness.values),
+                        }
+                    )
                     cached = _load_cached_result(self.tiling_candidates_dir, key)
                     if cached is None:
                         continue
@@ -581,7 +645,51 @@ class TilingExplorationStage(Stage):
                     )
                     yield scme, extra_info
 
-    def _build_genes(self, sweep_inter_core_tiling: bool) -> list[TilingGene]:
+                self._save_search_summary(genes, candidate_records, hall_of_fame_summary, list(logbook))
+
+    def _save_search_summary(
+        self,
+        genes: list[TilingGene],
+        candidate_records: dict[str, tuple[tuple[int, ...], float]],
+        hall_of_fame_summary: list[dict[str, Any]],
+        logbook_records: list[dict[str, Any]],
+    ) -> None:
+        """Persist every variable/result describing this search in one plain-data pickle so the run stays
+        inspectable afterward. Deliberately plain data only (tuples/dicts/floats) rather than raw DEAP
+        `creator`-built objects (individuals, `HallOfFame`): those classes are registered at runtime via
+        `creator.create(...)`, so unpickling them later in a fresh process that hasn't made the same call would
+        raise `AttributeError` -- `tools.Logbook` itself is already a plain list of dict records, so it's saved
+        as-is."""
+        summary_path = os.path.join(self.tiling_candidates_dir, "tiling_search_summary.pickle")
+        summary = {
+            "genes": genes,
+            "candidate_records": candidate_records,
+            "hall_of_fame": hall_of_fame_summary,
+            "logbook": logbook_records,
+        }
+        pickle_save(summary, summary_path)  # type: ignore
+        logger.info(f"TilingExplorationStage: saved search summary to {summary_path}.")
+
+    def _log_candidate_stage_timings(self) -> None:
+        """Log the per-candidate pipeline's stage timing breakdown, summed (exclusively) across every unique
+        candidate evaluated so far, ranked by total time descending -- i.e. the stage most worth optimizing
+        first. No-op unless `profile=True` and at least one candidate has actually run its pipeline (cached
+        candidates, and ones rejected for violating tiling constraints, never populate `_stage_timings`)."""
+        if not self.profile or not self.candidate_stage_timings:
+            return
+        exclusive_times = get_exclusive_stage_times(self.list_of_callables, self.candidate_stage_timings)
+        total_time = sum(exclusive_times.values())
+        logger.info(
+            "TilingExplorationStage: per-candidate stage timing breakdown across %d evaluated candidate(s) "
+            "(total %.2fs):",
+            self.profiled_candidate_count,
+            total_time,
+        )
+        for label, exclusive_time in sorted(exclusive_times.items(), key=lambda item: item[1], reverse=True):
+            percent = 100 * exclusive_time / total_time if total_time else 0.0
+            logger.info("  %-38s %8.3fs (%5.1f%%)", label, exclusive_time, percent)
+
+    def _build_genes(self) -> list[TilingGene]:
         """Build tiling decision points for every layer: one independent "intra" gene per dimension (every
         dimension of every layer except batch `B` and group `G` — matching the exclusion convention already
         used elsewhere, e.g. the fallback dimension pick in `TilingGenerationStage.get_fusion_partition_dim`),
@@ -610,11 +718,7 @@ class TilingExplorationStage(Stage):
             inter_candidates: list[INTER_CANDIDATE_T] = [None]
             for dim in relevant_dims:
                 size = node.layer_dim_sizes[dim]
-                if sweep_inter_core_tiling:
-                    inter_candidates += [(dim, factor) for factor in prime_divisors(size) if factor <= nb_cores]
-                else:
-                    # Let the allocation stage (CO) resolve the actual split itself.
-                    inter_candidates.append((dim, "*"))
+                inter_candidates += [(dim, factor) for factor in prime_divisors(size) if factor <= nb_cores]
             if len(inter_candidates) > 1:
                 genes.append(TilingGene(node_id=node.id, kind="inter", dim=None, candidates=inter_candidates))
         return genes

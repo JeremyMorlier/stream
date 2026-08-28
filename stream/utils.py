@@ -284,3 +284,66 @@ def get_exclusive_stage_times(
         nested_total = totals[i + 1] if i + 1 < len(totals) else 0.0
         exclusive_times[label] = totals[i] - nested_total
     return exclusive_times
+
+
+_TIMED_WORKER_STAGE_CACHE: dict[type, type] = {}
+
+
+def _get_timed_worker_stage(stage_cls: type) -> type:
+    """Build (and cache) a subclass of `stage_cls` that records its own cumulative init/run time into
+    `self.kwargs["_stage_timings"]` instead of a closure, so -- unlike the `TimedStage` produced by
+    `wrap_stages_with_timing` -- it can be pickled by reference (module + qualname) and sent to worker
+    processes, e.g. as part of the per-candidate pipeline evaluated inside `TilingExplorationStage`'s
+    `ProcessPoolExecutor`. The dict itself must be supplied by the caller via kwargs; it is looked up by
+    reference on every stage in the chain since `Stage.__init__` stores the same dict object (not a copy)
+    on `self.kwargs`."""
+    if stage_cls in _TIMED_WORKER_STAGE_CACHE:
+        return _TIMED_WORKER_STAGE_CACHE[stage_cls]
+
+    label = stage_cls.__name__
+
+    class TimedWorkerStage(stage_cls):  # type: ignore[misc,valid-type]
+        def __init__(self, list_of_callables: list["StageCallable"], **kwargs: Any):
+            t0 = time.perf_counter()
+            super().__init__(list_of_callables, **kwargs)
+            stage_timings = self.kwargs.get("_stage_timings")
+            if stage_timings is not None:
+                stage_timings.setdefault(label, [0.0, 0.0])[0] += time.perf_counter() - t0
+
+        def run(self):
+            stage_timings = self.kwargs.get("_stage_timings")
+            t0 = time.perf_counter()
+            try:
+                yield from super().run()
+            finally:
+                if stage_timings is not None:
+                    stage_timings.setdefault(label, [0.0, 0.0])[1] += time.perf_counter() - t0
+
+    qualname = f"_TimedWorkerStage_{label}"
+    TimedWorkerStage.__name__ = label
+    TimedWorkerStage.__qualname__ = qualname
+    TimedWorkerStage.__module__ = __name__
+    globals()[qualname] = TimedWorkerStage  # required for pickling this dynamically created class by reference
+    _TIMED_WORKER_STAGE_CACHE[stage_cls] = TimedWorkerStage
+    return TimedWorkerStage
+
+
+def wrap_stages_with_timing_for_workers(list_of_callables: list["StageCallable"]) -> list["StageCallable"]:
+    """Like `wrap_stages_with_timing`, but produces stage classes that stay picklable so they can be sent to
+    worker processes. Callers must pass a fresh `{}` as `_stage_timings` in the kwargs used to run the
+    wrapped pipeline; it is populated in place with `{stage_name: [init_time, run_time]}` as the pipeline
+    runs, and can be reduced with `get_exclusive_stage_times` (pass the original, unwrapped
+    `list_of_callables` for correct labels) and merged across runs with `accumulate_stage_timings`.
+    """
+    return [_get_timed_worker_stage(stage_cls) for stage_cls in list_of_callables]
+
+
+def accumulate_stage_timings(total: dict[str, list[float]], addition: dict[str, list[float]]) -> None:
+    """Add a per-run `_stage_timings` dict (as produced by a `wrap_stages_with_timing_for_workers` pipeline)
+    into a running `total`, in place. Summing exclusive times computed independently per run is equivalent to
+    computing exclusive times once on the summed totals, so `total` can be reduced with
+    `get_exclusive_stage_times` after accumulating every run."""
+    for label, (init_time, run_time) in addition.items():
+        acc = total.setdefault(label, [0.0, 0.0])
+        acc[0] += init_time
+        acc[1] += run_time

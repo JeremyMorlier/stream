@@ -22,7 +22,7 @@ classifiers = [
 ]
 keywords = ["stream", "multi-core", "accelerator", "layer-fused", "scheduling", "zigzag", "dse", "design-space-exploration", "machine-learning", "deep-learning", "mapping"]
 dependencies = [
-    'zigzag-dse',
+    "zigzag-dse",
     'rtree',
     'deap',
     'brokenaxes',
@@ -38,6 +38,9 @@ requires-python = ">=3.11"
 
 [project.optional-dependencies]
 dev = ["bumpver", "pip-tools", "build", "twine", "pre-commit"]
+profiling = [
+    "snakeviz>=2.2.2",
+]
 
 [project.urls]
 Homepage = "https://github.com/ZigZag-Project/stream"
@@ -68,3 +71,6 @@ fix = true
 lint.select = ["E", "F", "W", "I", "PL", "N", "UP", "B"]
 lint.ignore = ["D401", "N806"]
 lint.pylint.max-args = 8
+
+[tool.uv.sources]
+zigzag-dse = { git = "https://github.com/JeremyMorlier/zigzag", branch = "CactiBatch" }

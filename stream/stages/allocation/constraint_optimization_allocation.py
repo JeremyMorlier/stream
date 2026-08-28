@@ -338,18 +338,6 @@ class ConstraintOptimizationAllocationStage(Stage):
         )
         sink_layer_ids = sorted(set(n.id for n in sink_nodes))
         print(sink_layer_ids)
-        print(len(sg.nodes()))
-        outgoing_sources = set()
-        for n in sg.nodes():
-            for neighbor in self.workload.successors(n):
-                if neighbor not in sg.nodes():
-                    outgoing_sources.add(n)
-                    break
-        print(len(outgoing_sources))
-        if len(outgoing_sources) == 1:
-            print("valid", len(outgoing_sources))
-        else:
-            print("not valid", len(outgoing_sources))
         assert len(sink_layer_ids) == 1, "Expected only one sink layer per layer stack. Update your layer stacks."
         return sorted(sink_nodes)
 
@@ -670,6 +658,7 @@ class ConstraintOptimizationAllocationStage(Stage):
             for node in filter(lambda n: n.id == layer_id_not_in_ss, sub_workload.node_list):
                 node.chosen_core_allocation = node.core_allocation[0]
                 node.possible_core_allocation = node.core_allocation
+                print(node.chosen_core_allocation, node.possible_core_allocation, node.name, node.id)
                 layer_ids.insert(layer_ids_idx, layer_id_not_in_ss)
                 core_ids.insert(layer_ids_idx, node.core_allocation)
                 logger.warning(f"{node} not in steady state allocation; allocated to: {node.core_allocation[0]}.")
@@ -681,6 +670,7 @@ class ConstraintOptimizationAllocationStage(Stage):
         for n in workload.node_list:
             cores = allocation.get_resources_for_node_id(n.id)
             n.possible_core_allocation = list(core.id for core in cores)  # type: ignore
+            print(list(core.id for core in cores), n.name, n.id)
 
     def replace_wildcard_in_tiling(self, tiling: TILING_WILDCARD_T | TILING_T, nb_cores_split: int):
         """The user can define a wildcard `*` in the inter core tiling, meaning that the value found by the CO

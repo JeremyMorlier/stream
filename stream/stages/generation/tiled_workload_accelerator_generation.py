@@ -1,6 +1,7 @@
 import logging
 import os
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any
 
 import yaml
@@ -19,6 +20,112 @@ logger = logging.getLogger(__name__)
 TPU_CORE_YAML_PATH = "stream/inputs/examples/hardware/cores/tpu_like.yaml"
 OFFCHIP_CORE_YAML_PATH = "stream/inputs/examples/hardware/cores/offchip.yaml"
 OFFCHIP_BUS_BANDWIDTH = 128.0
+
+
+def validate_core_yaml(core_yaml_path: str) -> dict[str, Any]:
+    validator = CoreValidator(open_yaml(core_yaml_path))
+    if not validator.validate():
+        raise ValueError(f"Core file {core_yaml_path} failed validation.")
+    return validator.normalized_data
+
+
+def load_offchip_core_data() -> dict[str, Any]:
+    return validate_core_yaml(OFFCHIP_CORE_YAML_PATH)
+
+
+def get_original_nodes(original_workload: ONNXWorkload) -> list[ComputationNode]:
+    return [node for node in original_workload.topological_sort() if isinstance(node, ComputationNode)]
+
+
+def get_tiles_by_original_node(
+    workload: ComputationNodeWorkload, original_nodes: list[ComputationNode]
+) -> dict[ComputationNode, list[ComputationNode]]:
+    tiles = [node for node in workload.node_list if isinstance(node, ComputationNode)]
+    return {
+        original_node: [tile for tile in tiles if tile.id == original_node.id] for original_node in original_nodes
+    }
+
+
+@dataclass
+class GroupDedicatedTopology:
+    """The shape derived from a tiled workload: one dedicated core id (or block of ids, for inter-core-tiled
+    layers) per original workload node, plus one shared offchip core reachable over a bus, and the point-to-
+    point links needed between cores that actually exchange data. Shared by `TiledWorkloadAcceleratorGenerationStage`
+    (which fills every dedicated core with the same fixed template) and `CoreArchitectureExplorationStage`
+    (which fills each original node's dedicated cores with its own searched core design)."""
+
+    node_core_ids: dict[int, list[int]]  # keyed by ORIGINAL node id -- picklable/stable across processes
+    offchip_core_id: int
+    bus_connection: dict[str, Any]
+    link_connections: list[dict[str, Any]]
+    original_nodes: list[ComputationNode]
+
+
+def derive_group_dedicated_topology(
+    workload: ComputationNodeWorkload, original_workload: ONNXWorkload
+) -> GroupDedicatedTopology:
+    """Build one dedicated core (or block of cores, for inter-core-tiled layers) per `(original node, group)`
+    pair, i.e. one core per inter-core-tiling slice (tiles sharing a group always share a core, since intra-core
+    tiling never changes group), plus one shared offchip core reachable by every dedicated core over a bus (see
+    tpu_like_quad_core.yaml). Tile-to-tile edges with bits > 0 become point-to-point links between the
+    corresponding cores, bandwidth summed from all tile-edges mapping to that core pair; edges with bits == 0
+    (same-core ordering edges) are dropped.
+
+    Since every (node, group) pair now has an exclusive core, each tile's core allocation is pinned directly to
+    that core (as a side effect on `workload`) so downstream stages don't try to resolve an allocation against
+    the old hardware's core ids."""
+    original_nodes = get_original_nodes(original_workload)
+    tiles_by_original = get_tiles_by_original_node(workload, original_nodes)
+    id_to_original_node = {node.id: node for node in original_nodes}
+
+    node_core_ids: dict[int, list[int]] = {}
+    next_core_id = 0
+    for original_node in original_nodes:
+        k = get_inter_core_tiling_size(original_node)
+        node_core_ids[original_node.id] = list(range(next_core_id, next_core_id + k))
+        next_core_id += k
+    offchip_core_id = next_core_id
+
+    for original_node, tiles in tiles_by_original.items():
+        core_ids = node_core_ids[original_node.id]
+        for tile in tiles:
+            tile.possible_core_allocation = core_ids
+            tile.set_chosen_core_allocation(core_ids[tile.group])
+
+    core_pair_bits: dict[tuple[int, int], int] = defaultdict(int)
+    for producer_tile, consumer_tile, data in workload.edges(data=True):
+        bits = data.get("bits", 0)
+        if bits == 0:
+            continue
+        producer_node = id_to_original_node[producer_tile.id]
+        consumer_node = id_to_original_node[consumer_tile.id]
+        if producer_node is consumer_node:
+            continue
+        core_a = node_core_ids[producer_node.id][producer_tile.group]
+        core_b = node_core_ids[consumer_node.id][consumer_tile.group]
+        core_pair_bits[(core_a, core_b)] += bits
+
+    bus_connection = {
+        "type": "bus",
+        "cores": list(range(offchip_core_id + 1)),
+        "bandwidth": OFFCHIP_BUS_BANDWIDTH,
+    }
+    link_connections = [
+        {"type": "link", "cores": [core_a, core_b], "bandwidth": bits}
+        for (core_a, core_b), bits in core_pair_bits.items()
+    ]
+    logger.info(
+        f"Derived group-dedicated topology: {len(original_nodes)} original nodes, "
+        f"{offchip_core_id} dedicated cores, 1 offchip core, {len(link_connections)} core-to-core links."
+    )
+
+    return GroupDedicatedTopology(
+        node_core_ids=node_core_ids,
+        offchip_core_id=offchip_core_id,
+        bus_connection=bus_connection,
+        link_connections=link_connections,
+        original_nodes=original_nodes,
+    )
 
 
 class TiledWorkloadAcceleratorGenerationStage(Stage):
@@ -52,68 +159,16 @@ class TiledWorkloadAcceleratorGenerationStage(Stage):
 
     @staticmethod
     def validate_core_yaml(core_yaml_path: str) -> dict[str, Any]:
-        validator = CoreValidator(open_yaml(core_yaml_path))
-        if not validator.validate():
-            raise ValueError(f"Core file {core_yaml_path} failed validation.")
-        return validator.normalized_data
+        return validate_core_yaml(core_yaml_path)
 
     def build_group_dedicated_accelerator(self) -> Accelerator:
-        """Build a new Accelerator with one dedicated `tpu_like` core per `(original node, group)` pair, i.e. one
-        core per inter-core-tiling slice (tiles sharing a group always share a core, since intra-core tiling never
-        changes group), plus one shared `offchip` core reachable by every dedicated core over a bus (see
-        tpu_like_quad_core.yaml). Tile-to-tile edges with bits > 0 become point-to-point links between the
-        corresponding cores, bandwidth summed from all tile-edges mapping to that core pair; edges with bits == 0
-        (same-core ordering edges) are dropped.
-
-        Since every (node, group) pair now has an exclusive core, each tile's core allocation is pinned directly
-        to that core so downstream stages don't try to resolve an allocation against the old hardware's core ids."""
-        original_nodes = self.get_original_nodes()
-        tiles_by_original = self.get_tiles_by_original_node(original_nodes)
-        id_to_original_node = {node.id: node for node in original_nodes}
-
-        node_core_ids: dict[ComputationNode, list[int]] = {}
-        next_core_id = 0
-        for original_node in original_nodes:
-            k = get_inter_core_tiling_size(original_node)
-            node_core_ids[original_node] = list(range(next_core_id, next_core_id + k))
-            next_core_id += k
-        offchip_core_id = next_core_id
-
-        for original_node, tiles in tiles_by_original.items():
-            core_ids = node_core_ids[original_node]
-            for tile in tiles:
-                tile.possible_core_allocation = core_ids
-                tile.set_chosen_core_allocation(core_ids[tile.group])
-
-        core_pair_bits: dict[tuple[int, int], int] = defaultdict(int)
-        for producer_tile, consumer_tile, data in self.workload.edges(data=True):
-            bits = data.get("bits", 0)
-            if bits == 0:
-                continue
-            producer_node = id_to_original_node[producer_tile.id]
-            consumer_node = id_to_original_node[consumer_tile.id]
-            if producer_node is consumer_node:
-                continue
-            core_a = node_core_ids[producer_node][producer_tile.group]
-            core_b = node_core_ids[consumer_node][consumer_tile.group]
-            core_pair_bits[(core_a, core_b)] += bits
+        """Build a new Accelerator with one dedicated `tpu_like` core per `(original node, group)` pair -- see
+        `derive_group_dedicated_topology` for how the topology (core ids, offchip core, links) is derived."""
+        topology = derive_group_dedicated_topology(self.workload, self.original_workload)
+        offchip_core_id = topology.offchip_core_id
 
         tpu_core_data = self.validate_core_yaml(TPU_CORE_YAML_PATH)
-        offchip_core_data = self.validate_core_yaml(OFFCHIP_CORE_YAML_PATH)
-
-        bus_connection = {
-            "type": "bus",
-            "cores": list(range(offchip_core_id + 1)),
-            "bandwidth": OFFCHIP_BUS_BANDWIDTH,
-        }
-        link_connections = [
-            {"type": "link", "cores": [core_a, core_b], "bandwidth": bits}
-            for (core_a, core_b), bits in core_pair_bits.items()
-        ]
-        logger.info(
-            f"Building group-dedicated accelerator: {len(original_nodes)} original nodes, "
-            f"{offchip_core_id} dedicated cores, 1 offchip core, {len(link_connections)} core-to-core links."
-        )
+        offchip_core_data = load_offchip_core_data()
 
         accelerator_data = {
             "name": f"{self.accelerator.name}_grouped",
@@ -121,21 +176,12 @@ class TiledWorkloadAcceleratorGenerationStage(Stage):
             "offchip_core_id": offchip_core_id,
             "unit_energy_cost": 0,
             "core_memory_sharing": [],
-            "core_connectivity": [bus_connection, *link_connections],
+            "core_connectivity": [topology.bus_connection, *topology.link_connections],
         }
-        self.save_accelerator_yaml(offchip_core_id, bus_connection, link_connections, accelerator_data["name"])
+        self.save_accelerator_yaml(
+            offchip_core_id, topology.bus_connection, topology.link_connections, accelerator_data["name"]
+        )
         return AcceleratorFactory(accelerator_data).create()
-
-    def get_original_nodes(self) -> list[ComputationNode]:
-        return [node for node in self.original_workload.topological_sort() if isinstance(node, ComputationNode)]
-
-    def get_tiles_by_original_node(
-        self, original_nodes: list[ComputationNode]
-    ) -> dict[ComputationNode, list[ComputationNode]]:
-        tiles = [node for node in self.workload.node_list if isinstance(node, ComputationNode)]
-        return {
-            original_node: [tile for tile in tiles if tile.id == original_node.id] for original_node in original_nodes
-        }
 
     def save_accelerator_yaml(
         self,

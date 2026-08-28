@@ -70,7 +70,6 @@ workload_path = bottleneck_onnx_path
 mapping_path = "stream/inputs/examples/mapping/tpu_like_quad_core_ga.yaml"
 mode = "fused"
 layer_stacks = [tuple(range(nb_bottleneck_nodes))]
-allocation_strategy = "ga"
 nb_ga_generations = 2
 nb_ga_individuals = 2
 ##############################################################################################
@@ -80,7 +79,7 @@ hw_name = accelerator.split("/")[-1].split(".")[0]
 wl_name = re.split(r"/|\.", workload_path)[-1]
 if wl_name == "onnx":
     wl_name = re.split(r"/|\.", workload_path)[-2]
-experiment_id = f"{hw_name}-{wl_name}-{mode}-tiling_bottleneck"
+experiment_id = f"{hw_name}-{wl_name}-{mode}-tiling_bottleneck3"
 ######################################################################
 
 ##############PLOTTING###############
@@ -103,7 +102,6 @@ scme, all_results = optimize_tiling(
     mapping=mapping_path,
     mode=mode,
     layer_stacks=layer_stacks,
-    allocation_strategy=allocation_strategy,
     nb_ga_generations=nb_ga_generations,
     nb_ga_individuals=nb_ga_individuals,
     experiment_id=experiment_id,
@@ -111,8 +109,12 @@ scme, all_results = optimize_tiling(
     skip_if_exists=False,
     profile=True,
     max_workers=4,
-    nb_tiling_ga_generations=40,
-    nb_tiling_ga_individuals=8,
+    nb_tiling_ga_generations=1,
+    nb_tiling_ga_individuals=2,
+    nb_core_ga_generations=4,
+    nb_core_ga_individuals=4,
+    core_max_workers=4,
+    core_pareto_points=4,
 )
 print(f"Evaluated {len(all_results)} tiling candidate(s).")
 

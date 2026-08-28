@@ -10,12 +10,13 @@ from zigzag.mapping.temporal_mapping import TemporalMappingType
 from zigzag.utils import pickle_load, pickle_save
 
 from stream.cost_model.cost_model import StreamCostModelEvaluation
+from stream.hardware.architecture.cacti_precompute import install_cacti_monkeypatch, precompute_cacti_design_space
 from stream.stages.allocation.constraint_optimization_allocation import ConstraintOptimizationAllocationStage
 from stream.stages.allocation.genetic_algorithm_allocation import GeneticAlgorithmAllocationStage
 from stream.stages.estimation.zigzag_core_mapping_estimation import ZigZagCoreMappingEstimationStage
+from stream.stages.generation.core_architecture_exploration import CoreArchitectureExplorationStage, CoreParamRanges
 from stream.stages.generation.layer_stacks_generation import LayerStacksGenerationStage
 from stream.stages.generation.scheduling_order_generation import SchedulingOrderGenerationStage
-from stream.stages.generation.tiled_workload_accelerator_generation import TiledWorkloadAcceleratorGenerationStage
 from stream.stages.generation.tiled_workload_generation import TiledWorkloadGenerationStage
 from stream.stages.generation.tiling_exploration import TilingExplorationStage
 from stream.stages.generation.tiling_generation import TilingGenerationStage
@@ -218,13 +219,12 @@ def optimize_allocation_co(  # noqa: PLR0913
     return scme
 
 
-def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
+def optimize_tiling(  # noqa: PLR0913, PLR0915
     hardware: str,
     workload: str,
     mapping: str,
     mode: Literal["lbl"] | Literal["fused"],
     layer_stacks: list[tuple[int, ...]],
-    allocation_strategy: Literal["ga", "co"],
     experiment_id: str,
     output_path: str,
     skip_if_exists: bool = False,
@@ -236,6 +236,13 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
     sort_key: Literal["latency", "energy"] = "latency",
     max_workers: int | None = None,
     profile: bool = False,
+    nb_core_ga_generations: int = 4,
+    nb_core_ga_individuals: int = 8,
+    core_max_workers: int | None = 1,
+    core_pareto_points: int = 10,
+    core_max_pareto_schedules: int = 10_000,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
 ) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
     """Search per-layer, per-dimension intra-/inter-core tiling assignments on a fixed hardware and workload
     using a genetic algorithm, running the full pipeline (tiling -> cost estimation -> allocation) once per
@@ -249,11 +256,16 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
     atomically updates the shared `scme.pickle` under a lock as soon as it finds a result better than the
     current best, so the best-so-far survives even if the search is interrupted partway through.
 
+    For each candidate, the fixed-template accelerator generation is replaced by
+    `CoreArchitectureExplorationStage`, which searches a customized hardware design *per unique tile* (memory
+    sizes, bandwidths, operational-array sizes) with a genuine multi-objective (NSGA2) genetic algorithm over
+    `(latency, energy, area)` -- `area` via `Core.get_area()`, `latency`/`energy` from the
+    `CostModelEvaluation` ZigZag returns for that tile on that candidate core. Each unique tile's top
+    `core_pareto_points` Pareto-front designs are also evaluated on every *other* unique tile and everything is
+    logged to a candidate-results CSV (see `CoreArchitectureExplorationStage`'s docstring). Runs once per
+    tiling-GA individual, nested inside `TilingExplorationStage`'s own worker processes.
+
     Args:
-        allocation_strategy: which allocation stage to run per candidate, "ga" for GeneticAlgorithmAllocationStage
-            or "co" for ConstraintOptimizationAllocationStage. Note: inter-core tiling is only swept under "ga" —
-            under "co" it is left as a wildcard for `ConstraintOptimizationAllocationStage` to resolve itself,
-            since it asserts an exact match against the mapping's core_allocation length for any fixed value.
         nb_tiling_ga_generations: number of generations for the outer tiling-search genetic algorithm run by
             `TilingExplorationStage`. Independent of `nb_ga_generations`, which only sizes the inner
             per-candidate `GeneticAlgorithmAllocationStage` core-allocation search.
@@ -261,10 +273,28 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
             `nb_ga_individuals`, for the same reason as above.
         max_workers: number of worker processes to evaluate candidates in parallel. Defaults to
             `os.process_cpu_count()` (via `ProcessPoolExecutor`'s own default) when None.
+        nb_core_ga_generations: number of generations for the inner per-tile core-architecture NSGA2 search.
+        nb_core_ga_individuals: population size for the inner per-tile core-architecture NSGA2 search (rounded
+            up to a multiple of 4 if needed).
+        core_max_workers: number of worker processes for the inner core-architecture search's own
+            `ProcessPoolExecutor`. Defaults to 1 since this search already runs nested inside each tiling
+            candidate's own worker process; raise it only if `max_workers`/`nb_tiling_ga_individuals` are kept
+            low enough to avoid oversubscribing the machine.
+        core_pareto_points: number of representative designs selected from each unique tile's Pareto front for
+            the cross-tile evaluation sweep.
+        core_max_pareto_schedules: cap on the number of full per-tile-design combinations
+            (`prod(len(front) for front in per_tile_pareto_fronts)`) `CoreArchitectureExplorationStage` will
+            enumerate and persist as candidate "schedules" for later offline evaluation. If the actual
+            combination count would exceed this, enumeration is skipped (logged) and only the single best
+            design per tile is used to build the real accelerator, same as always.
+        core_param_ranges: optional overrides for the core-architecture search's per-parameter bounds, using the
+            same keyword names as `core_generator.random_core_dict` (e.g. `rf_size_range`, `sram_bandwidth_choices`).
+        cacti_precompute_workers: number of worker processes used to precompute the entire CACTI memory design
+            space `core_param_ranges` can produce, once, before the search starts (see
+            `stream.hardware.architecture.cacti_precompute`). Defaults to every available core when None, since
+            this precompute runs once, serially before any GA parallelism, unlike `core_max_workers`.
     """
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
-    if allocation_strategy == "co":
-        _sanity_check_gurobi_license()
 
     # Create experiment_id path
     os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
@@ -273,6 +303,7 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
     tiling_candidates_dir = f"{output_path}/{experiment_id}/tiling_search"
     scme_path = f"{output_path}/{experiment_id}/scme.pickle"
     results_csv_path = f"{output_path}/{experiment_id}/tiling_search_results.csv"
+    candidate_results_csv_path = f"{output_path}/{experiment_id}/tiling_search_all_candidates.csv"
 
     # Get logger
     logger = _logging.getLogger(__name__)
@@ -291,29 +322,17 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
         logger.info(f"Loaded SCME from {scme_path}")
         return scme, []
 
-    allocation_stage_kwargs: dict[str, Any]
-    # NOTE: GA and CO use different downstream stage chains (see optimize_allocation_ga/optimize_allocation_co):
-    # GA needs a fixed scheduling order and pre-fixed single-core allocations before searching; CO resolves
-    # allocation (and any inter-core tiling wildcards) itself and builds its own internal sub-pipeline.
-    if allocation_strategy == "ga":
-        allocation_stage_kwargs = {
-            "nb_ga_generations": nb_ga_generations,
-            "nb_ga_individuals": nb_ga_individuals,
-        }
-        allocation_stage_classes = [
-            SetFixedAllocationPerformanceStage,
-            SchedulingOrderGenerationStage,
-            GeneticAlgorithmAllocationStage,
-        ]
-    elif allocation_strategy == "co":
-        allocation_stage_kwargs = {
-            "allocations_path": f"{output_path}/{experiment_id}/waco/",
-            "tiled_workload_post_co_path": f"{output_path}/{experiment_id}/tiled_workload_post_co.pickle",
-            "cost_lut_post_co_path": f"{output_path}/{experiment_id}/cost_lut_post_co.pickle",
-        }
-        allocation_stage_classes = [ConstraintOptimizationAllocationStage]
-    else:
-        raise ValueError(f"Invalid allocation strategy: {allocation_strategy}. Must be 'ga' or 'co'.")
+    # GA needs a fixed scheduling order and pre-fixed single-core allocations before searching (see
+    # optimize_allocation_ga).
+    allocation_stage_kwargs: dict[str, Any] = {
+        "nb_ga_generations": nb_ga_generations,
+        "nb_ga_individuals": nb_ga_individuals,
+    }
+    allocation_stage_classes = [
+        SetFixedAllocationPerformanceStage,
+        SchedulingOrderGenerationStage,
+        GeneticAlgorithmAllocationStage,
+    ]
 
     # Stages up to and including TilingExplorationStage run once in this process; everything after it
     # (TilingGenerationStage onward) runs per-candidate inside worker processes spawned by
@@ -324,10 +343,15 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
         LayerStacksGenerationStage,
         TilingExplorationStage,  # Sweeps candidate intra-/inter-core tiling configurations
     ]
+    # CoreArchitectureExplorationStage replaces the fixed-template accelerator generation: it runs once per
+    # tiling-GA individual (inside TilingExplorationStage's own worker processes) and searches per-layer core
+    # designs with its own nested NSGA2 GA before handing off to ZigZagCoreMappingEstimationStage. See its
+    # docstring for the resulting nested-multiprocessing caveat (core_max_workers defaults to 1 to avoid
+    # oversubscription).
     per_candidate_stage_classes = [
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
-        TiledWorkloadAcceleratorGenerationStage,
+        CoreArchitectureExplorationStage,
         ZigZagCoreMappingEstimationStage,
         *allocation_stage_classes,
     ]
@@ -335,6 +359,29 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
     if profile:
         outer_stage_classes, timings = wrap_stages_with_timing(outer_stage_classes)
     list_of_callables = outer_stage_classes + per_candidate_stage_classes
+
+    core_search_kwargs: dict[str, Any] = {
+        "nb_core_ga_generations": nb_core_ga_generations,  # required by CoreArchitectureExplorationStage
+        "nb_core_ga_individuals": nb_core_ga_individuals,  # required by CoreArchitectureExplorationStage
+        "core_max_workers": core_max_workers,  # required by CoreArchitectureExplorationStage
+        "core_pareto_points": core_pareto_points,  # required by CoreArchitectureExplorationStage
+        "core_max_pareto_schedules": core_max_pareto_schedules,  # required by CoreArchitectureExplorationStage
+        "core_param_ranges": core_param_ranges,  # required by CoreArchitectureExplorationStage
+    }
+
+    # Precompute the entire CACTI memory design space `core_param_ranges` can produce, once, before any GA work
+    # starts (and before TilingExplorationStage's first fork below) -- see cacti_precompute's module docstring
+    # for why this makes every CACTI lookup during the search hit memory instead of a subprocess call or a
+    # CactiBatch pool-file read.
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    logger.info("optimize_tiling: precomputing CACTI design space for core_search...")
+    t_precompute_start = _time.perf_counter()
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+    logger.info(
+        f"optimize_tiling: precomputed {len(design_space)} CACTI config(s) in "
+        f"{_time.perf_counter() - t_precompute_start:.1f}s."
+    )
 
     mainstage = MainStage(
         list_of_callables,
@@ -346,13 +393,16 @@ def optimize_tiling(  # noqa: PLR0912, PLR0913, PLR0915
         layer_stacks=layer_stacks,
         tiling_candidates_dir=tiling_candidates_dir,  # required by TilingExplorationStage
         scme_path=scme_path,  # required by TilingExplorationStage
-        sort_key=sort_key,  # required by TilingExplorationStage
+        sort_key=sort_key,  # required by TilingExplorationStage (and forwarded on to CoreArchitectureExplorationStage)
         max_workers=max_workers,  # required by TilingExplorationStage
         nb_tiling_ga_generations=nb_tiling_ga_generations,  # required by TilingExplorationStage
         nb_tiling_ga_individuals=nb_tiling_ga_individuals,  # required by TilingExplorationStage
+        candidate_results_csv_path=candidate_results_csv_path,  # required by TilingExplorationStage
         temporal_mapping_type=temporal_mapping_type,  # required by ZigZagCoreMappingEstimationStage
         operands_to_prefetch=[],  # required by GeneticAlgorithmAllocationStage/ConstraintOptimizationAllocationStage
+        profile=profile,  # required by TilingExplorationStage, to time its own per-candidate pipeline stages
         **allocation_stage_kwargs,
+        **core_search_kwargs,
     )
     # Launch the MainStage
     t_start = _time.perf_counter()

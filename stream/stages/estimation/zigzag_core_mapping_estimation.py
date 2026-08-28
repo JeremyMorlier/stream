@@ -27,6 +27,44 @@ from stream.workload.onnx_workload import ComputationNodeWorkload
 logger = logging.getLogger(__name__)
 
 
+def evaluate_node_on_core(
+    node: ComputationNode,
+    core: Core,
+    *,
+    loma_lpf_limit: int,
+    temporal_mapping_type: TemporalMappingType,
+    loma_show_progress_bar: bool = False,
+) -> CostModelEvaluation:
+    """Evaluate one tile directly on one freestanding candidate core, without any accelerator/core_id/cost-lut
+    bookkeeping. The same ZigZag sub-flow `ZigZagCoreMappingEstimationStage.instantiate_zigzag_flow` builds,
+    minus offchip-spill modeling (`check_core_capacity_for_node`/`add_offchip_to_core`) and the cycles-per-op
+    post-processing (`increase_cc_per_op`) -- both need a real accelerator/cost-lut context this function
+    doesn't have. Used by `CoreArchitectureExplorationStage` to score a per-tile core design directly, without
+    assembling a whole accelerator or running the full downstream pipeline per candidate."""
+    nb_parallel_nodes: int = (
+        1 if contains_wildcard(node.inter_core_tiling) else prod(size for _, size in node.inter_core_tiling)
+    )  # type: ignore
+    main_stage = MainStage(
+        [
+            MinimalBandwidthLatencyStage,  # type: ignore
+            SpatialMappingGeneratorStage,
+            MinimalBandwidthLatencyStage,
+            TemporalMappingGeneratorStage,
+            CostModelStage,
+        ],
+        layer=node,
+        accelerator=core,  # Accelerator in zigzag corresponds to Core in stream
+        loma_lpf_limit=loma_lpf_limit,
+        loma_show_progress_bar=loma_show_progress_bar,
+        temporal_mapping_type=temporal_mapping_type,
+        nb_parallel_nodes=nb_parallel_nodes,
+        has_dram_level=False,
+    )
+    answers = main_stage.run()
+    assert len(answers) == 1, "evaluate_node_on_core's subflow returned more than one CME"
+    return answers[0][0]  # type: ignore
+
+
 class ZigZagCoreMappingEstimationStage(Stage):
     """
     Class that saves the optimal CME for each valid node-core allocation to the node.

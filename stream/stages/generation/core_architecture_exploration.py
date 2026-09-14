@@ -28,9 +28,14 @@ from stream.hardware.architecture.core_generator import (
 )
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.parser.core_validator import CoreValidator
-from stream.stages.estimation.zigzag_core_mapping_estimation import evaluate_node_on_core
+from stream.stages.estimation.zigzag_core_mapping_estimation import (
+    evaluate_node_on_core,
+    lowest_memory_level_violations,
+)
 from stream.stages.generation.tiled_workload_accelerator_generation import (
+    RolledTopology,
     derive_group_dedicated_topology,
+    derive_rolled_topology,
     get_original_nodes,
     get_tiles_by_original_node,
     load_offchip_core_data,
@@ -231,6 +236,20 @@ class CoreGeneLayout:
         return _validate_core_dict(core_dict)
 
 
+@dataclass
+class ParetoCoreSearchResult:
+    """Everything the per-tile core search produced, in plain data.
+
+    Returned by `search_pareto_fronts` so callers that want the *whole* front per tile -- rather than the
+    single best design `run` picks -- can have it without re-running the GA (see `ScheduleExplorationStage`)."""
+
+    designs_per_tile: list[list[dict[str, Any]]]  # per unique tile: [{"core_dict": ..., "fitness": (l, e, a)}]
+    unique_tiles: list[ComputationNode]
+    tile_to_unique_index: dict[int, int]  # id(tile) -> index into `unique_tiles`
+    original_nodes: list[ComputationNode]
+    tiles_by_original: dict[ComputationNode, list[ComputationNode]]
+
+
 class CustomCoreAcceleratorGenerationStage(Stage):
     """Builds an accelerator with the same group-dedicated topology as `TiledWorkloadAcceleratorGenerationStage`
     (see `derive_group_dedicated_topology`), but instead of copying one fixed core template to every dedicated
@@ -262,33 +281,95 @@ class CustomCoreAcceleratorGenerationStage(Stage):
         sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
         yield from sub_stage.run()
 
-    def build_custom_accelerator(self) -> Accelerator:
-        topology = derive_group_dedicated_topology(self.workload, self.original_workload)
-        offchip_core_id = topology.offchip_core_id
+    def build_custom_accelerator(self, save_yaml: bool = True) -> Accelerator:
+        return assemble_custom_accelerator(
+            self.workload,
+            self.original_workload,
+            self.accelerator,
+            self.node_core_dicts,
+            yaml_path=os.path.join(os.path.dirname(self.tiled_workload_path), "accelerator.yaml")
+            if save_yaml
+            else None,
+        )
 
-        cores: dict[int, dict[str, Any]] = {}
-        for original_node in topology.original_nodes:
-            core_dict = self.node_core_dicts[original_node.id]
-            for core_id in topology.node_core_ids[original_node.id]:
-                cores[core_id] = core_dict
-        cores[offchip_core_id] = load_offchip_core_data()
 
-        accelerator_data = {
-            "name": f"{self.accelerator.name}_custom",
-            "cores": cores,
-            "offchip_core_id": offchip_core_id,
-            "unit_energy_cost": 0,
-            "core_memory_sharing": [],
-            "core_connectivity": [topology.bus_connection, *topology.link_connections],
-        }
-        self._save_accelerator_yaml(accelerator_data)
-        return AcceleratorFactory(accelerator_data).create()
+def assemble_custom_accelerator(
+    workload: ComputationNodeWorkload,
+    original_workload: ONNXWorkload,
+    accelerator: Accelerator,
+    node_core_dicts: dict[int, dict[str, Any]],
+    yaml_path: str | None = None,
+) -> Accelerator:
+    """Assemble the group-dedicated accelerator that gives each original node's cores its own design, optionally
+    dumping the assembled description to `yaml_path`.
 
-    def _save_accelerator_yaml(self, accelerator_data: dict[str, Any]) -> None:
-        accelerator_yaml_path = os.path.join(os.path.dirname(self.tiled_workload_path), "accelerator.yaml")
-        with open(accelerator_yaml_path, "w") as f:
+    A plain function rather than only a stage method because callers that build *many* accelerators without
+    running a sub-pipeline (see `ScheduleExplorationStage`) have no list of callables to hand a stage. Note it
+    pins every tile in `workload` to its core as a side effect of `derive_group_dedicated_topology`."""
+    topology = derive_group_dedicated_topology(workload, original_workload)
+    offchip_core_id = topology.offchip_core_id
+
+    cores: dict[int, dict[str, Any]] = {}
+    for original_node in topology.original_nodes:
+        core_dict = node_core_dicts[original_node.id]
+        for core_id in topology.node_core_ids[original_node.id]:
+            cores[core_id] = core_dict
+    cores[offchip_core_id] = load_offchip_core_data()
+
+    accelerator_data = {
+        "name": f"{accelerator.name}_custom",
+        "cores": cores,
+        "offchip_core_id": offchip_core_id,
+        "unit_energy_cost": 0,
+        "core_memory_sharing": [],
+        "core_connectivity": [topology.bus_connection, *topology.link_connections],
+    }
+    if yaml_path:
+        with open(yaml_path, "w") as f:
             yaml.safe_dump(accelerator_data, f, sort_keys=False)
-        logger.info(f"Saved custom-core accelerator to {accelerator_yaml_path}.")
+        logger.info(f"Saved custom-core accelerator to {yaml_path}.")
+    return AcceleratorFactory(accelerator_data).create()
+
+
+def assemble_rolled_accelerator(
+    workload: ComputationNodeWorkload,
+    original_workload: ONNXWorkload,
+    accelerator: Accelerator,
+    merge_of_core: dict[int, Any],
+    core_dict_of_core: dict[int, dict[str, Any]],
+    yaml_path: str | None = None,
+) -> tuple[Accelerator, "RolledTopology"]:
+    """Assemble a *rolled* accelerator: the group-dedicated topology folded onto fewer physical cores by
+    `derive_rolled_topology`, each rolled core getting the design named in `core_dict_of_core` (keyed by rolled
+    core id, since a rolled core can host several layers and so is no longer identified by a node).
+
+    Returns the topology alongside the accelerator -- the caller needs `members_of_core`/`hosted_node_groups`
+    for its artifacts and topology figures, and re-deriving it would re-pin the workload a second time.
+
+    Note this must be used *instead of* `assemble_custom_accelerator` on the rolled path: that one re-derives
+    the unrolled topology and would silently re-pin every tile back to an unrolled core id.
+    """
+    topology = derive_rolled_topology(workload, original_workload, merge_of_core)
+    offchip_core_id = topology.offchip_core_id
+
+    # Insertion order matters: `AcceleratorFactory.create` walks this dict and `create_core_graph` asserts that
+    # each core's id equals its index, so build it densely in ascending id order with offchip last.
+    cores: dict[int, dict[str, Any]] = {core_id: core_dict_of_core[core_id] for core_id in range(offchip_core_id)}
+    cores[offchip_core_id] = load_offchip_core_data()
+
+    accelerator_data = {
+        "name": f"{accelerator.name}_rolled",
+        "cores": cores,
+        "offchip_core_id": offchip_core_id,
+        "unit_energy_cost": 0,
+        "core_memory_sharing": [],
+        "core_connectivity": [topology.bus_connection, *topology.link_connections],
+    }
+    if yaml_path:
+        with open(yaml_path, "w") as f:
+            yaml.safe_dump(accelerator_data, f, sort_keys=False)
+        logger.info(f"Saved rolled accelerator to {yaml_path}.")
+    return AcceleratorFactory(accelerator_data).create(), topology
 
 
 def _evaluate_design_on_tile(
@@ -311,6 +392,18 @@ def _evaluate_design_on_tile(
     try:
         core_dict = gene_layout.decode_node(values, name=name)
         core = build_core_from_dict(core_dict, core_id=0)
+        # Cores whose innermost memories cannot hold one spatially unrolled operand slice of this tile are
+        # ruled out before ZigZag ever sees them: LOMA would find no valid loop ordering at all, so they are
+        # worthless as designs, and the check is far cheaper than the mapping search that would reject them.
+        # It also keeps them out of the per-tile Pareto fronts, where a design that is fine for its own tile
+        # but not for another one later aborts the schedule search's cost-model warm-up.
+        violations = lowest_memory_level_violations(tile, core)
+        if violations:
+            logger.debug(
+                f"CoreArchitectureExplorationStage: candidate '{name}' cannot map tile {tile} "
+                f"({violations[0]}), penalizing it."
+            )
+            return (float("inf"), float("inf"), float("inf"))
         # Deep-copy before handing the tile to ZigZag: it may set temporary attributes (spatial mapping, chosen
         # core allocation, ...) on the node it's given, and this same tile object is reused across many
         # evaluations (its own GA, plus every other tile's top-K cross-evaluation).
@@ -343,6 +436,31 @@ def _evaluate_cross_job(
         loma_lpf_limit=loma_lpf_limit,
         temporal_mapping_type=temporal_mapping_type,
     )
+
+
+def _record_evaluated_designs(
+    rows: list[tuple[Any, ...]],
+    tile_index: int,
+    generation: int,
+    individuals: list[Any],
+) -> None:
+    """Append one row per individual the GA evaluated.
+
+    Raw gene values are kept, not the decoded core: `CoreGeneLayout.decode_node` can rebuild any of them, so
+    every design the search ever looked at stays re-evaluatable -- including the ones NSGA2 discarded, which
+    nothing else persists (`pareto_fronts.pickle` only ever holds the final front's top `core_pareto_points`)."""
+    for individual in individuals:
+        latency, energy, area = individual.fitness.values
+        rows.append((tile_index, generation, _candidate_key(individual), latency, energy, area, *tuple(individual)))
+
+
+def _write_all_evaluated_cores_csv(csv_path: str, gene_names: list[str], rows: list[tuple[Any, ...]]) -> None:
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["tile_index", "generation", "design_key", "latency", "energy", "area", *gene_names])
+        writer.writerows(rows)
+    logger.info(f"CoreArchitectureExplorationStage: saved {len(rows)} evaluated core design(s) to {csv_path}.")
 
 
 def _write_cross_tile_results_csv(csv_path: str, rows: list[tuple[int, int, int, float, float, float]]) -> None:
@@ -403,6 +521,7 @@ class CoreArchitectureExplorationStage(Stage):
         core_max_pareto_schedules: int = 10_000,
         core_param_ranges: dict[str, Any] | None = None,
         candidate_results_csv_path: str | None = None,
+        all_evaluated_cores_csv_path: str | None = None,
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
@@ -419,6 +538,9 @@ class CoreArchitectureExplorationStage(Stage):
         self.gene_ranges = CoreParamRanges(**(core_param_ranges or {}))
         self.candidate_results_csv_path = candidate_results_csv_path or os.path.join(
             os.path.dirname(tiled_workload_path), "core_search", "candidate_results.csv"
+        )
+        self.all_evaluated_cores_csv_path = all_evaluated_cores_csv_path or os.path.join(
+            os.path.dirname(tiled_workload_path), "core_search", "all_evaluated_cores.csv"
         )
 
     def _unique_tiles(self) -> tuple[list[ComputationNode], dict[int, int]]:
@@ -444,10 +566,12 @@ class CoreArchitectureExplorationStage(Stage):
         mu: int,
         loma_lpf_limit: int,
         temporal_mapping_type: TemporalMappingType,
-    ) -> list[Any]:
-        """Run one tile's independent NSGA2 search and return up to `core_pareto_points` representative
-        individuals from its Pareto front (each with `.fitness.values` already set to `(latency, energy,
-        area)`)."""
+    ) -> tuple[list[Any], list[tuple[Any, ...]]]:
+        """Run one tile's independent NSGA2 search.
+
+        Returns up to `core_pareto_points` representative individuals from its Pareto front (each with
+        `.fitness.values` already set to `(latency, energy, area)`), plus the history of every individual it
+        evaluated, for `all_evaluated_cores.csv`."""
         # Tiles run concurrently (see `run()`), each on its own thread sharing the same underlying
         # ProcessPoolExecutor -- copy the toolbox before registering this tile's "evaluate" so concurrent
         # threads don't race on (and clobber) each other's registration on one shared toolbox instance.
@@ -464,10 +588,12 @@ class CoreArchitectureExplorationStage(Stage):
             ),
         )
 
+        history: list[tuple[Any, ...]] = []
         population = toolbox.population(n=mu)
         fitnesses = toolbox.map(toolbox.evaluate, population)
         for ind, fit in zip(population, fitnesses, strict=True):
             ind.fitness.values = fit
+        _record_evaluated_designs(history, tile_index, 0, population)
         # Canonical DEAP NSGA2 pattern (see deap/examples/ga/nsga2.py): this initial select assigns
         # crowding-distance info onto `population`, which `selTournamentDCD` needs for the mating pool below.
         population = toolbox.select(population, mu)
@@ -490,6 +616,7 @@ class CoreArchitectureExplorationStage(Stage):
             fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
             for ind, fit in zip(invalid_ind, fitnesses, strict=True):
                 ind.fitness.values = fit
+            _record_evaluated_designs(history, tile_index, generation + 1, invalid_ind)
 
             population = toolbox.select(population + offspring, mu)
             pareto_front.update(population)
@@ -500,11 +627,17 @@ class CoreArchitectureExplorationStage(Stage):
                 f"best (latency, energy, area)={tuple(best_per_objective)}."
             )
 
-        logger.info(f"CoreArchitectureExplorationStage: tile {tile_index} search done ({len(pareto_front)} pareto point(s)).")
+        logger.info(
+            f"CoreArchitectureExplorationStage: tile {tile_index} search done ({len(pareto_front)} pareto point(s))."
+        )
         n_points = min(self.core_pareto_points, len(pareto_front))
-        return tools.selNSGA2(list(pareto_front), n_points) if n_points else []
+        return (tools.selNSGA2(list(pareto_front), n_points) if n_points else []), history
 
-    def run(self):  # noqa: PLR0915
+    def search_pareto_fronts(self) -> ParetoCoreSearchResult:  # noqa: PLR0915
+        """Search every unique tile's Pareto front of core designs.
+
+        Split out of `run` so subclasses can take the *whole* front per tile instead of the single best design
+        `run` collapses it to -- `ScheduleExplorationStage` searches combinations across those fronts."""
         loma_lpf_limit = self.kwargs["loma_lpf_limit"]
         temporal_mapping_type = self.kwargs["temporal_mapping_type"]
 
@@ -526,7 +659,9 @@ class CoreArchitectureExplorationStage(Stage):
             creator.create("CoreTileIndividual", array.array, typecode="d", fitness=creator.CoreTileFitness)
 
         def _random_individual():
-            return creator.CoreTileIndividual(random.uniform(lo, hi) for lo, hi in zip(low_bounds, up_bounds, strict=True))
+            return creator.CoreTileIndividual(
+                random.uniform(lo, hi) for lo, hi in zip(low_bounds, up_bounds, strict=True)
+            )
 
         toolbox = base.Toolbox()
         toolbox.register("individual", _random_individual)
@@ -585,11 +720,24 @@ class CoreArchitectureExplorationStage(Stage):
             with ThreadPoolExecutor(max_workers=len(unique_tiles)) as tile_executor:
                 futures = [
                     tile_executor.submit(
-                        self._run_tile_ga, tile_index, tile, gene_layout, toolbox, mu, loma_lpf_limit, temporal_mapping_type
+                        self._run_tile_ga,
+                        tile_index,
+                        tile,
+                        gene_layout,
+                        toolbox,
+                        mu,
+                        loma_lpf_limit,
+                        temporal_mapping_type,
                     )
                     for tile_index, tile in enumerate(unique_tiles)
                 ]
-                top_designs_per_tile = [future.result() for future in futures]
+                tile_results = [future.result() for future in futures]
+            top_designs_per_tile = [top_designs for top_designs, _history in tile_results]
+            _write_all_evaluated_cores_csv(
+                self.all_evaluated_cores_csv_path,
+                gene_layout.names,
+                [row for _top_designs, history in tile_results for row in history],
+            )
 
             for tile_index, top_designs in enumerate(top_designs_per_tile):
                 for rank, design in enumerate(top_designs):
@@ -671,13 +819,79 @@ class CoreArchitectureExplorationStage(Stage):
 
         self._save_pareto_schedules(decoded_designs_per_tile, original_nodes, tiles_by_original, tile_to_unique_index)
 
-        sort_index = {"latency": 0, "energy": 1, "area": 2}[self.sort_key]
-        best_design_per_tile = [
-            min(designs, key=lambda design: design["fitness"][sort_index])["core_dict"]
-            for designs in decoded_designs_per_tile
+        return ParetoCoreSearchResult(
+            designs_per_tile=decoded_designs_per_tile,
+            unique_tiles=unique_tiles,
+            tile_to_unique_index=tile_to_unique_index,
+            original_nodes=original_nodes,
+            tiles_by_original=tiles_by_original,
+        )
+
+    @staticmethod
+    def _extra_shapes_per_unique_tile(search: ParetoCoreSearchResult) -> dict[int, set[int]]:
+        """Which *other* tile shape classes each unique tile's chosen design will also have to run.
+
+        `_build_node_core_dicts` gives every tile of an original node the design its *representative* tile
+        picked, so a node whose tiles are not all the same shape makes one design responsible for several
+        shapes -- and the per-tile GA only ever checked it against its own. Empty for every unique tile whose
+        node is uniformly shaped, which is the usual case."""
+        extra: dict[int, set[int]] = {}
+        for tiles in search.tiles_by_original.values():
+            representative = search.tile_to_unique_index[id(tiles[0])]
+            others = {search.tile_to_unique_index[id(tile)] for tile in tiles} - {representative}
+            if others:
+                extra.setdefault(representative, set()).update(others)
+        return extra
+
+    def _designs_running(
+        self,
+        unique_index: int,
+        designs: list[dict[str, Any]],
+        unique_tiles: list[ComputationNode],
+        extra_shapes: dict[int, set[int]],
+    ) -> list[dict[str, Any]]:
+        """`designs` restricted to the ones that can also map the other shapes they will have to run (see
+        `_extra_shapes_per_unique_tile`). A design that cannot raises `NoValidLoopOrderingFoundException` in the
+        downstream `ZigZagCoreMappingEstimationStage`, which aborts the whole pipeline."""
+        shapes = extra_shapes.get(unique_index)
+        if not shapes:
+            return designs
+        usable = [
+            design
+            for design in designs
+            if not any(
+                lowest_memory_level_violations(
+                    unique_tiles[shape], build_core_from_dict(design["core_dict"], core_id=0)
+                )
+                for shape in sorted(shapes)
+            )
         ]
+        if not usable:
+            raise ValueError(
+                f"CoreArchitectureExplorationStage: no design on tile {unique_index}'s front can map the other "
+                f"tile shapes {sorted(shapes)} of its node. Widen `core_param_ranges` so larger innermost "
+                f"memories are reachable."
+            )
+        if len(usable) < len(designs):
+            logger.info(
+                f"CoreArchitectureExplorationStage: {len(designs) - len(usable)} of tile {unique_index}'s "
+                f"design(s) cannot map the other shapes {sorted(shapes)} its node runs; picking among the rest."
+            )
+        return usable
+
+    def run(self):
+        """Search every unique tile's Pareto front, then collapse each front to its single best design by
+        `sort_key` and hand the resulting accelerator to the rest of the pipeline."""
+        search = self.search_pareto_fronts()
+
+        sort_index = {"latency": 0, "energy": 1, "area": 2}[self.sort_key]
+        extra_shapes = self._extra_shapes_per_unique_tile(search)
+        best_design_per_tile: list[dict[str, Any]] = []
+        for unique_index, designs in enumerate(search.designs_per_tile):
+            usable = self._designs_running(unique_index, designs, search.unique_tiles, extra_shapes)
+            best_design_per_tile.append(min(usable, key=lambda design: design["fitness"][sort_index])["core_dict"])
         node_core_dicts = self._build_node_core_dicts(
-            best_design_per_tile, original_nodes, tiles_by_original, tile_to_unique_index
+            best_design_per_tile, search.original_nodes, search.tiles_by_original, search.tile_to_unique_index
         )
 
         kwargs = self.kwargs.copy()
@@ -719,7 +933,9 @@ class CoreArchitectureExplorationStage(Stage):
         materializing designs, so checking the count first is cheap even when enumeration itself is skipped."""
         front_sizes = [len(designs) for designs in decoded_designs_per_tile]
         nb_schedules = math.prod(front_sizes) if front_sizes else 0
-        schedules_path = os.path.join(os.path.dirname(self.tiled_workload_path), "core_search", "pareto_schedules.pickle")
+        schedules_path = os.path.join(
+            os.path.dirname(self.tiled_workload_path), "core_search", "pareto_schedules.pickle"
+        )
         if not (0 < nb_schedules <= self.max_pareto_schedules):
             logger.warning(
                 f"CoreArchitectureExplorationStage: skipping full schedule enumeration -- {nb_schedules} "

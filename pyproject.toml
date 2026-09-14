@@ -71,6 +71,8 @@ fix = true
 lint.select = ["E", "F", "W", "I", "PL", "N", "UP", "B"]
 lint.ignore = ["D401", "N806"]
 lint.pylint.max-args = 8
+# Expected values written out literally are what an assertion is for.
+lint.per-file-ignores = { "test_*.py" = ["PLR2004"] }
 
 [tool.uv.sources]
 zigzag-dse = { git = "https://github.com/JeremyMorlier/zigzag", branch = "CactiBatch" }

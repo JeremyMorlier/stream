@@ -21,11 +21,11 @@ nb_ga_individuals = 4
 ##############################################################################################
 
 ################################PARSING###############################
-hw_name = accelerator.split("/")[-1].split(".")[0]
+hw_name = accelerator.rsplit("/", maxsplit=1)[-1].split(".", maxsplit=1)[0]
 wl_name = re.split(r"/|\.", workload_path)[-1]
 if wl_name == "onnx":
     wl_name = re.split(r"/|\.", workload_path)[-2]
-experiment_id = f"{hw_name}-{wl_name}-{mode}-genetic_algorithm"
+experiment_id = f"{hw_name}-{wl_name}-{mode}-genetic_algorithm2"
 ######################################################################
 
 ##############PLOTTING###############
@@ -55,6 +55,7 @@ scme = optimize_allocation_ga(
     experiment_id=experiment_id,
     output_path="outputs",
     skip_if_exists=False,
+    profile=True,
 )
 
 # Load in the CostModelEvaluationLUT from the run
@@ -66,3 +67,4 @@ plot_memory_usage(scme, section_start_percent, percent_shown, fig_path=memory_fi
 
 # Save json for perfetto visualization (Visualize at http://ui.perfetto.dev/)
 convert_scme_to_perfetto_json(scme, cost_lut, json_path=json_path)
+print(scme.latency, scme.energy)

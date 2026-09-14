@@ -1,17 +1,20 @@
 import logging
 import os
+from collections import defaultdict
 from math import ceil, prod
 from typing import Any
 
 from zigzag.cost_model.cost_model import CostModelEvaluation
-from zigzag.datatypes import Constants, MemoryOperand
+from zigzag.datatypes import Constants, LayerDim, MemoryOperand, UnrollFactor
 from zigzag.hardware.architecture.memory_level import MemoryLevel
 from zigzag.hardware.architecture.memory_port import DataDirection, PortAllocation
 from zigzag.mapping.temporal_mapping import TemporalMappingType
 from zigzag.stages.evaluation.cost_model_evaluation import CostModelStage
+from zigzag.stages.mapping.spatial_mapping_conversion import SpatialMappingConversionStage
 from zigzag.stages.mapping.spatial_mapping_generation import SpatialMappingGeneratorStage
 from zigzag.stages.mapping.temporal_mapping_generator_stage import TemporalMappingGeneratorStage
 from zigzag.utils import pickle_deepcopy
+from zigzag.workload.layer_attributes import LayerDimSizes
 
 from stream.hardware.architecture.accelerator import Accelerator
 from stream.hardware.architecture.core import Core
@@ -63,6 +66,82 @@ def evaluate_node_on_core(
     answers = main_stage.run()
     assert len(answers) == 1, "evaluate_node_on_core's subflow returned more than one CME"
     return answers[0][0]  # type: ignore
+
+
+class _UnusedLeafStage(Stage):
+    """Placeholder sub-stage for ZigZag stages instantiated only to call one of their methods (see
+    `lowest_memory_level_violations`). `Stage.__init__` rejects an empty `list_of_callables` on a non-leaf
+    stage, and these are never `run()`."""
+
+    def is_leaf(self) -> bool:
+        return True
+
+    def run(self):
+        yield from ()
+
+
+def lowest_memory_level_violations(node: ComputationNode, core: Core) -> list[str]:
+    """Check ZigZag's "a single operand does not fit within the lowest memory level" precondition for `node` on
+    `core`, returning one human-readable message per violating `(spatial mapping, operand)` pair -- empty when
+    the pair is mappable.
+
+    `LomaEngine` only yields a temporal mapping for orderings whose *spatially unrolled* slice of every operand
+    already fits in the innermost memory level serving it: `MemoryAllocator.calc_size_slices` raises
+    `MemoryTooSmallException` on the empty slice otherwise. That slice is the same for every loop ordering, so
+    when it overflows, no ordering survives and LOMA raises `NoValidLoopOrderingFoundException` -- which aborts
+    the entire run rather than just this candidate (`ZigZagCoreMappingEstimationStage.update_cost_lut` has no
+    per-(node, core) recovery). ZigZag's own `SpatialMappingGeneratorStage.limit_unrolling_to_mem_capacity` is
+    meant to shrink the unrolling until it fits, but it cannot always: it only visits `get_inner_memories()`
+    (so an operand whose innermost level is shared with another operand's level above is never limited), and
+    its `factor_map` is keyed by unroll *value*, so two LayerDims unrolled by the same factor collapse onto one
+    another's replacement and the product can stay over capacity.
+
+    Since the slice is ordering-independent it can be checked up front, without running LOMA or the cost model:
+    generate exactly the spatial mappings `SpatialMappingGeneratorStage` would, convert each the way
+    `SpatialMappingConversionStage` does, and compare every operand's level-0 tensor size against the capacity
+    of its innermost memory. `SpatialMappingGeneratorStage.run` feeds *every* mapping it generates to the
+    downstream stages, so a single violating mapping is enough to sink the pair -- hence all of them are
+    checked, not just the first.
+
+    Any exception raised while generating or converting the mappings (e.g. ZigZag's own "No valid
+    SpatialMappings found" assertion) is reported as a violation too: it means the same thing for the caller --
+    this core cannot run this tile.
+    """
+    # The generator mutates the layer it is given (`spatial_mapping`, `spatial_mapping_hint`), and callers
+    # reuse the same tile across many candidate cores.
+    layer = pickle_deepcopy(node)
+    hierarchy = core.memory_hierarchy
+    violations: list[str] = []
+    try:
+        generator = SpatialMappingGeneratorStage([_UnusedLeafStage], accelerator=core, layer=layer)
+        for mapping in generator.generate_spatial_mappings():
+            layer.spatial_mapping = mapping
+            conversion = SpatialMappingConversionStage([_UnusedLeafStage], accelerator=core, layer=layer)
+            spatial_mapping, _ = conversion.convert_user_spatial_mapping(conversion.user_spatial_mapping)
+            for layer_op, mem_op in layer.memory_operand_links.layer_and_mem_ops():
+                levels = hierarchy.get_memory_levels(mem_op)
+                if not levels:
+                    continue
+                capacity = levels[0].memory_instance.size
+                # Same shape as `MemoryAllocator.calc_loops_size`: a defaultdict, so `calc_tensor_size` reads 1
+                # for every dimension the level-0 unrolling does not mention (including a PR dim's related
+                # dims).
+                unrolled_sizes: dict[LayerDim, UnrollFactor] = defaultdict(lambda: 1)
+                for layer_dim, unroll_factor in spatial_mapping.get_unrolling(op=layer_op, level=0):
+                    unrolled_sizes[layer_dim] *= unroll_factor
+                # `operand_precision[layer_op]` is the partial-sum precision for the output operand, i.e. the
+                # larger of the two precisions `MemoryAllocator.get_precision` can pick -- the conservative
+                # choice, and the one ZigZag's own capacity limiting uses.
+                precision = layer.operand_precision[layer_op]
+                needed = layer.calc_tensor_size(layer_op, LayerDimSizes(unrolled_sizes)) * precision
+                if needed > capacity:
+                    violations.append(
+                        f"operand {mem_op} needs {needed:.0f} bit(s) in {levels[0].name} (capacity {capacity}) "
+                        f"for spatial mapping {mapping}"
+                    )
+    except Exception as exc:  # noqa: BLE001 -- any failure here means the same thing: not mappable
+        violations.append(f"no spatial mapping could be derived: {exc!r}")
+    return violations
 
 
 class ZigZagCoreMappingEstimationStage(Stage):

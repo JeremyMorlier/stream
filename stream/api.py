@@ -16,6 +16,8 @@ from stream.stages.allocation.genetic_algorithm_allocation import GeneticAlgorit
 from stream.stages.estimation.zigzag_core_mapping_estimation import ZigZagCoreMappingEstimationStage
 from stream.stages.generation.core_architecture_exploration import CoreArchitectureExplorationStage, CoreParamRanges
 from stream.stages.generation.layer_stacks_generation import LayerStacksGenerationStage
+from stream.stages.generation.rolled_schedule_exploration import RolledScheduleExplorationStage
+from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
 from stream.stages.generation.scheduling_order_generation import SchedulingOrderGenerationStage
 from stream.stages.generation.tiled_workload_generation import TiledWorkloadGenerationStage
 from stream.stages.generation.tiling_exploration import TilingExplorationStage
@@ -433,3 +435,330 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
             logger.info("  %-38s %8.3fs (%5.1f%%)", label, exclusive_time, percent)
 
     return best_scme, answers
+
+
+def optimize_schedules(  # noqa: PLR0913
+    hardware: str,
+    workload: str,
+    mapping: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    skip_if_exists: bool = False,
+    temporal_mapping_type: str = "uneven",
+    sort_key: Literal["latency", "energy"] = "latency",
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+    nb_core_ga_generations: int = 4,
+    nb_core_ga_individuals: int = 8,
+    core_max_workers: int | None = None,
+    core_pareto_points: int = 10,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
+    max_schedule_evaluations: int = 1000,
+    max_search_nodes: int = 1_000_000,
+    prune_schedules: bool = True,
+    reuse_pareto_fronts: bool = True,
+) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
+    """Search the `(latency, energy, area)` Pareto front of whole *schedules* on a fixed workload and tiling,
+    over every combination of the per-tile Pareto core designs -- the multi-objective counterpart of
+    `optimize_allocation_ga`, which evaluates a single fixed accelerator.
+
+    `CoreArchitectureExplorationStage` (used by `optimize_tiling`) searches a Pareto front of core designs per
+    unique tile and then collapses each front to its single best design by `sort_key`, so only one accelerator
+    is ever scheduled. Here `ScheduleExplorationStage` keeps every design instead and searches the product of
+    the fronts, measuring combinations through the real scheduler; the result is the set of schedules that are
+    non-dominated on all three objectives at once -- e.g. the one that gives up 5% latency for half the area.
+
+    The enumeration is a branch and bound, not a sweep: the accelerator topology is derived once (it does not
+    depend on the designs), each distinct `(tile, design)` pair is cost-modelled by ZigZag exactly once, and
+    area/energy/latency lower bounds computed without scheduling prune whole subtrees whose every completion is
+    already dominated by a measured schedule. See `stream.stages.generation.schedule_exploration`'s module
+    docstring for why each bound holds.
+
+    Args:
+        core_pareto_points: designs retained per unique tile -- this is the branching factor of the schedule
+            search, so it drives the combination count directly (`core_pareto_points ** nb_decision_classes`).
+        max_schedule_evaluations: cap on schedules actually measured. The search stays exact up to the cap; past
+            it, the reported front is the front of what was measured.
+        max_search_nodes: branch-and-bound node budget, a guard against fronts where pruning cannot keep up.
+        prune_schedules: False measures every combination (exhaustive, exponentially slower) -- used to verify
+            the pruned search returns the same front.
+        reuse_pareto_fronts: reuse `core_search/pareto_fronts.pickle` from an earlier run of this experiment
+            instead of re-running the per-tile core GA.
+
+    Returns:
+        The best schedule by `sort_key` as a `StreamCostModelEvaluation`, and the full Pareto set as plain
+        records (ranks, latency, energy, area, bounds). The same records, the trade-off figure and the measured
+        schedules' CSV are written under `{output_path}/{experiment_id}/schedule_search/` -- see
+        `ScheduleExplorationStage`'s docstring for the artifact list.
+    """
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+
+    # Output paths
+    tiled_workload_path = f"{output_path}/{experiment_id}/tiled_workload.pickle"
+    cost_lut_path = f"{output_path}/{experiment_id}/cost_lut.pickle"
+    scme_path = f"{output_path}/{experiment_id}/scme.pickle"
+    schedule_search_dir = f"{output_path}/{experiment_id}/schedule_search"
+
+    logger = _logging.getLogger(__name__)
+
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+
+    if os.path.exists(scme_path) and skip_if_exists:
+        scme = pickle_load(scme_path)
+        logger.info(f"Loaded SCME from {scme_path}")
+        return scme, []
+
+    # ScheduleExplorationStage measures each combination by running the stages after it itself, with a cost LUT
+    # it assembles from its own warm-up -- hence no ZigZagCoreMappingEstimationStage in this chain.
+    stage_classes = [
+        AcceleratorParserStage,
+        StreamONNXModelParserStage,
+        LayerStacksGenerationStage,
+        TilingGenerationStage,
+        TiledWorkloadGenerationStage,
+        ScheduleExplorationStage,
+        SetFixedAllocationPerformanceStage,
+        SchedulingOrderGenerationStage,
+        GeneticAlgorithmAllocationStage,
+    ]
+
+    # Same one-off CACTI precompute as optimize_tiling: the core GA and every accelerator the schedule search
+    # assembles hit memory instead of a CACTI subprocess.
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    logger.info("optimize_schedules: precomputing CACTI design space...")
+    t_precompute_start = _time.perf_counter()
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+    logger.info(
+        f"optimize_schedules: precomputed {len(design_space)} CACTI config(s) in "
+        f"{_time.perf_counter() - t_precompute_start:.1f}s."
+    )
+
+    mainstage = MainStage(
+        stage_classes,
+        accelerator=hardware,  # required by AcceleratorParserStage
+        workload_path=workload,  # required by ModelParserStage
+        mapping_path=mapping,  # required by ModelParserStage
+        loma_lpf_limit=6,  # required by LomaEngine
+        mode=mode,
+        layer_stacks=layer_stacks,
+        tiled_workload_path=tiled_workload_path,
+        cost_lut_path=cost_lut_path,
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],  # required by GeneticAlgorithmAllocationStage
+        nb_ga_generations=nb_ga_generations,  # required by GeneticAlgorithmAllocationStage
+        nb_ga_individuals=nb_ga_individuals,  # required by GeneticAlgorithmAllocationStage
+        sort_key=sort_key,  # required by ScheduleExplorationStage (inherited from CoreArchitectureExplorationStage)
+        nb_core_ga_generations=nb_core_ga_generations,  # required by the inherited per-tile core search
+        nb_core_ga_individuals=nb_core_ga_individuals,
+        core_max_workers=core_max_workers,
+        core_pareto_points=core_pareto_points,
+        core_param_ranges=core_param_ranges,
+        schedule_search_dir=schedule_search_dir,  # required by ScheduleExplorationStage
+        max_schedule_evaluations=max_schedule_evaluations,
+        max_search_nodes=max_search_nodes,
+        prune_schedules=prune_schedules,
+        reuse_pareto_fronts=reuse_pareto_fronts,
+    )
+
+    t_start = _time.perf_counter()
+    answers = [answer for answer in mainstage.run() if answer[0] is not None]
+    total_time = _time.perf_counter() - t_start
+    if not answers:
+        raise ValueError("No schedule could be evaluated.")
+
+    best_scme, extra_info = answers[0]
+    pickle_save(best_scme, scme_path)  # type: ignore
+    pareto_schedules: list[dict[str, Any]] = extra_info["pareto_schedules"]
+    stats = extra_info["search_stats"]
+    logger.info(
+        f"optimize_schedules: {len(pareto_schedules)} pareto schedule(s) from {stats['measured']} measured of "
+        f"{stats['combinations']} combination(s) in {total_time:.1f}s; best by {sort_key}: "
+        f"latency={best_scme.latency}, energy={best_scme.energy}."
+    )
+    return best_scme, pareto_schedules
+
+
+def optimize_rolled_schedules(  # noqa: PLR0913
+    hardware: str,
+    workload: str,
+    mapping: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    skip_if_exists: bool = False,
+    temporal_mapping_type: str = "uneven",
+    sort_key: Literal["latency", "energy"] = "latency",
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+    nb_core_ga_generations: int = 4,
+    nb_core_ga_individuals: int = 8,
+    core_max_workers: int | None = None,
+    core_pareto_points: int = 10,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
+    max_schedule_evaluations: int = 1000,
+    max_search_nodes: int = 1_000_000,
+    prune_schedules: bool = True,
+    reuse_pareto_fronts: bool = True,
+    fold_overlap: Literal["hull", "exact"] = "hull",
+    fold_tolerances: tuple[float, ...] = (0.0, 0.05, 0.15, 0.35, 0.6, 1.0),
+    rolled_core_count_targets: tuple[int, ...] | None = None,
+    fold_allow_sibling_merge: bool = False,
+    merged_design_pool: Literal["members", "all"] = "members",
+    merged_design_objectives: tuple[str, ...] = ("latency", "energy", "area"),
+    keep_singleton_designs: bool = True,
+    max_rolled_variants_per_schedule: int = 8,
+    max_rolled_evaluations: int = 200,
+    fold_source: Literal["pareto", "all"] = "pareto",
+    prune_rolled: bool = True,
+    max_cme_matrix_cells: int = 2000,
+) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
+    """Search schedules as `optimize_schedules` does, then *roll* them: reuse cores that are idle later in the
+    schedule so the accelerator needs fewer of them, and return one Pareto front over both families.
+
+    `optimize_schedules` only ever searches which core *design* each layer gets. The topology underneath is
+    fully unrolled -- one dedicated core per `(layer, inter-core group)` -- so the core count grows with the
+    workload and every core idles outside its layer's window. This adds the complementary axis: each measured
+    schedule is folded onto fewer physical cores by merging cores whose busy windows don't collide, the
+    communication graph is re-derived (merged traffic becomes free, and new links appear between merged
+    groups), and the folded accelerator is re-measured with the real scheduler.
+
+    Both families share one `(latency, energy, area)` archive, so the returned front shows the whole trade-off:
+    unrolled designs at the fast end, heavily folded ones at the cheap end. Records are tagged `kind` and
+    carry `nb_cores`; rolled ones also carry their full fold, enough to rebuild the accelerator.
+
+    Args:
+        fold_overlap: "hull" merges only cores whose whole busy spans are disjoint (optimal colouring);
+            "exact" compares the true busy sets and can fold further when layers interleave.
+        fold_tolerances: the aggressiveness ladder -- a pair conflicts when it is busy at once for more than
+            `tolerance * min(load)`. 0.0 merges only genuinely idle cores; 1.0 merges almost anything and pays
+            serialization for area. Under layer fusion the strict setting often admits no fold at all, which is
+            why the sweep matters.
+        merged_design_objectives: one folded variant per objective, each giving merged cores the design that is
+            cheapest for the layers they now host.
+        max_cme_matrix_cells: guard on the full `shape x design` cost-model warm-up that folding needs (a
+            folded core runs layers that were never meant for its design). Above it the run falls back to the
+            unrolled diagonal warm-up.
+        prune_rolled: skip folds whose lower bound is already dominated by a measured schedule.
+
+    Returns:
+        The best schedule by `sort_key`, and the combined Pareto set as plain records. Artifacts are written
+        under `{output_path}/{experiment_id}/rolled_search/` -- see `RolledScheduleExplorationStage`.
+    """
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+
+    tiled_workload_path = f"{output_path}/{experiment_id}/tiled_workload.pickle"
+    cost_lut_path = f"{output_path}/{experiment_id}/cost_lut.pickle"
+    scme_path = f"{output_path}/{experiment_id}/scme.pickle"
+    schedule_search_dir = f"{output_path}/{experiment_id}/schedule_search"
+    rolled_search_dir = f"{output_path}/{experiment_id}/rolled_search"
+
+    logger = _logging.getLogger(__name__)
+
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+
+    if os.path.exists(scme_path) and skip_if_exists:
+        scme = pickle_load(scme_path)
+        logger.info(f"Loaded SCME from {scme_path}")
+        return scme, []
+
+    # As in `optimize_schedules`, the exploration stage supplies its own cost LUT, so no
+    # ZigZagCoreMappingEstimationStage in this chain.
+    stage_classes = [
+        AcceleratorParserStage,
+        StreamONNXModelParserStage,
+        LayerStacksGenerationStage,
+        TilingGenerationStage,
+        TiledWorkloadGenerationStage,
+        RolledScheduleExplorationStage,
+        SetFixedAllocationPerformanceStage,
+        SchedulingOrderGenerationStage,
+        GeneticAlgorithmAllocationStage,
+    ]
+
+    # Must happen before `mainstage.run()` forks anything, so every worker inherits the patch.
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    logger.info("optimize_rolled_schedules: precomputing CACTI design space...")
+    t_precompute_start = _time.perf_counter()
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+    logger.info(
+        f"optimize_rolled_schedules: precomputed {len(design_space)} CACTI config(s) in "
+        f"{_time.perf_counter() - t_precompute_start:.1f}s."
+    )
+
+    mainstage = MainStage(
+        stage_classes,
+        accelerator=hardware,
+        workload_path=workload,
+        mapping_path=mapping,
+        loma_lpf_limit=6,
+        mode=mode,
+        layer_stacks=layer_stacks,
+        tiled_workload_path=tiled_workload_path,
+        cost_lut_path=cost_lut_path,
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],
+        nb_ga_generations=nb_ga_generations,
+        nb_ga_individuals=nb_ga_individuals,
+        sort_key=sort_key,
+        nb_core_ga_generations=nb_core_ga_generations,
+        nb_core_ga_individuals=nb_core_ga_individuals,
+        core_max_workers=core_max_workers,
+        core_pareto_points=core_pareto_points,
+        core_param_ranges=core_param_ranges,
+        schedule_search_dir=schedule_search_dir,
+        max_schedule_evaluations=max_schedule_evaluations,
+        max_search_nodes=max_search_nodes,
+        prune_schedules=prune_schedules,
+        reuse_pareto_fronts=reuse_pareto_fronts,
+        rolled_search_dir=rolled_search_dir,
+        fold_overlap=fold_overlap,
+        fold_tolerances=fold_tolerances,
+        rolled_core_count_targets=rolled_core_count_targets,
+        fold_allow_sibling_merge=fold_allow_sibling_merge,
+        merged_design_pool=merged_design_pool,
+        merged_design_objectives=merged_design_objectives,
+        keep_singleton_designs=keep_singleton_designs,
+        max_rolled_variants_per_schedule=max_rolled_variants_per_schedule,
+        max_rolled_evaluations=max_rolled_evaluations,
+        fold_source=fold_source,
+        prune_rolled=prune_rolled,
+        max_cme_matrix_cells=max_cme_matrix_cells,
+    )
+
+    t_start = _time.perf_counter()
+    answers = [answer for answer in mainstage.run() if answer[0] is not None]
+    total_time = _time.perf_counter() - t_start
+    if not answers:
+        raise ValueError("No schedule could be evaluated.")
+
+    best_scme, extra_info = answers[0]
+    pickle_save(best_scme, scme_path)  # type: ignore
+    pareto_schedules: list[dict[str, Any]] = extra_info["pareto_schedules"]
+    stats = extra_info["search_stats"]
+    rolled = stats.get("rolled", {})
+    nb_rolled = sum(1 for record in pareto_schedules if record.get("kind") == "rolled")
+    logger.info(
+        f"optimize_rolled_schedules: {len(pareto_schedules)} pareto schedule(s) ({nb_rolled} rolled) from "
+        f"{stats['measured']} unrolled + {rolled.get('measured', 0)} rolled measurement(s) in {total_time:.1f}s; "
+        f"best by {sort_key}: latency={best_scme.latency}, energy={best_scme.energy}."
+    )
+    return best_scme, pareto_schedules

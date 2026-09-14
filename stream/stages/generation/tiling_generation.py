@@ -1,10 +1,12 @@
 import logging
+import os
 from collections import defaultdict
 from typing import Any, Literal
 
 import numpy as np
 from onnx import ModelProto, helper, numpy_helper
 from zigzag.datatypes import LayerDim
+from zigzag.utils import pickle_save
 
 from stream.hardware.architecture.accelerator import Accelerator
 from stream.stages.stage import Stage, StageCallable
@@ -62,12 +64,16 @@ class TilingGenerationStage(Stage):
         self.mode = kwargs.get("mode")
 
     def run(self):
+        tiling_history: dict[int, dict[str, Any]] = {}
         for node in self.workload.node_list:
             if not isinstance(node, ComputationNode):
                 continue
             nb_nodes_in_stack = len(next(stack for stack in self.layer_stacks if node.id in stack))
+            record = self._start_tiling_record(node)
             self.set_valid_intra_core_tiling(node, nb_nodes_in_stack)
             self.set_valid_inter_core_tiling(node)
+            tiling_history[node.id] = self._finish_tiling_record(node, record)
+        self._save_tiling_history(tiling_history)
 
         self.kwargs["accelerator"] = self.accelerator
         self.kwargs["workload"] = self.workload
@@ -78,6 +84,61 @@ class TilingGenerationStage(Stage):
             **self.kwargs,
         )
         yield from sub_stage.run()
+
+    @staticmethod
+    def _plain_tiling(tiling: TILING_T | TILING_WILDCARD_T) -> list[tuple[str, int | str]]:
+        """`LayerDim`-keyed tiling as plain `(name, factor)` strings/ints, so the saved history stays readable
+        (and unpicklable-safe) without dragging in zigzag datatypes."""
+        return [(str(layer_dim), factor) for layer_dim, factor in tiling]
+
+    @staticmethod
+    def _plain_layer_dim_sizes(node: ComputationNode) -> dict[str, int]:
+        return {str(layer_dim): size for layer_dim, size in node.layer_dim_sizes.items()}
+
+    def _start_tiling_record(self, node: ComputationNode) -> dict[str, Any]:
+        """Snapshot what this node *asks for* before `set_valid_intra_core_tiling`/`set_valid_inter_core_tiling`
+        rewrite it in place -- they drop dims the node doesn't have, clamp oversized factors, expand `all`, fill
+        in defaults, and can even grow `layer_dim_sizes` to make a requested factor divide the layer."""
+        return {
+            "node_name": node.name,
+            "node_type": node.type,
+            "requested_intra_core_tiling": self._plain_tiling(node.intra_core_tiling),
+            "requested_inter_core_tiling": self._plain_tiling(node.inter_core_tiling),
+            "layer_dim_sizes_before": self._plain_layer_dim_sizes(node),
+        }
+
+    def _finish_tiling_record(self, node: ComputationNode, record: dict[str, Any]) -> dict[str, Any]:
+        record["resolved_intra_core_tiling"] = self._plain_tiling(node.intra_core_tiling)
+        record["resolved_inter_core_tiling"] = self._plain_tiling(node.inter_core_tiling)
+        record["layer_dim_sizes_after"] = self._plain_layer_dim_sizes(node)
+        record["changed"] = (
+            record["resolved_intra_core_tiling"] != record["requested_intra_core_tiling"]
+            or record["resolved_inter_core_tiling"] != record["requested_inter_core_tiling"]
+            or record["layer_dim_sizes_after"] != record["layer_dim_sizes_before"]
+        )
+        return record
+
+    def _save_tiling_history(self, tiling_history: dict[int, dict[str, Any]]) -> None:
+        """Persist the tiling this stage actually resolved, per node, next to the tiled workload it produced.
+
+        Everything upstream only ever records the *requested* tiling (`TilingExplorationStage`'s
+        `extra_info["tiling_config"]` and its CSVs come from the GA individual, before this stage runs), so
+        without this the rewrites above leave no trace except log warnings and the mutated workload buried
+        inside `tiled_workload.pickle`. Plain data only (str/int/list/dict) so it can be loaded in a bare
+        process without stream/zigzag classes."""
+        tiled_workload_path = self.kwargs.get("tiled_workload_path")
+        if not tiled_workload_path:
+            logger.debug("No tiled_workload_path given; not saving the resolved tiling history.")
+            return
+        history_dir = os.path.dirname(tiled_workload_path) or "."
+        os.makedirs(history_dir, exist_ok=True)
+        history_path = os.path.join(history_dir, "resolved_tiling.pickle")
+        pickle_save(tiling_history, history_path)  # type: ignore
+        nb_changed = sum(1 for record in tiling_history.values() if record["changed"])
+        logger.info(
+            f"TilingGenerationStage: saved resolved tiling for {len(tiling_history)} node(s) "
+            f"({nb_changed} differing from the requested tiling) to {history_path}."
+        )
 
     def set_valid_intra_core_tiling(self, node: ComputationNode, stack_size: int):
         self.remove_invalid_entries_from_intra_core_tiling(node)

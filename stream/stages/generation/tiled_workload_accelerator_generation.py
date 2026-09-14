@@ -41,9 +41,7 @@ def get_tiles_by_original_node(
     workload: ComputationNodeWorkload, original_nodes: list[ComputationNode]
 ) -> dict[ComputationNode, list[ComputationNode]]:
     tiles = [node for node in workload.node_list if isinstance(node, ComputationNode)]
-    return {
-        original_node: [tile for tile in tiles if tile.id == original_node.id] for original_node in original_nodes
-    }
+    return {original_node: [tile for tile in tiles if tile.id == original_node.id] for original_node in original_nodes}
 
 
 @dataclass
@@ -125,6 +123,161 @@ def derive_group_dedicated_topology(
         bus_connection=bus_connection,
         link_connections=link_connections,
         original_nodes=original_nodes,
+    )
+
+
+@dataclass
+class RolledTopology:
+    """A `GroupDedicatedTopology` folded onto fewer physical cores: several `(original node, group)` pairs may
+    now share one core, so the core count no longer grows with the workload.
+
+    Carries the same fields the unrolled topology does -- so `AcceleratorFactory` input is built the same way --
+    plus the provenance a caller needs to explain and draw the fold: which unrolled cores went into each rolled
+    core, which `(node, group)` pairs it hosts, and the re-derived core-to-core traffic."""
+
+    node_core_ids: dict[int, list[int]]  # original node id -> rolled core id per group (length unchanged)
+    offchip_core_id: int
+    bus_connection: dict[str, Any]
+    link_connections: list[dict[str, Any]]
+    original_nodes: list[ComputationNode]
+    members_of_core: dict[int, list[int]]
+    hosted_node_groups: dict[int, list[tuple[int, int]]]
+    core_pair_bits: dict[tuple[int, int], int]
+
+    @property
+    def nb_compute_cores(self) -> int:
+        return self.offchip_core_id
+
+
+def renumber_merged_cores(merge_of_core: dict[int, Any]) -> dict[int, int]:
+    """Map each unrolled compute core to its rolled core id.
+
+    Dense from 0 and in first-appearance order over the sorted unrolled ids -- both are required, not
+    cosmetic: `AcceleratorFactory.create_core_graph` asserts every core's id equals its index, and the
+    deterministic order keeps a fold's ids stable across runs."""
+    new_id_of_label: dict[Any, int] = {}
+    for core_id in sorted(merge_of_core):
+        new_id_of_label.setdefault(merge_of_core[core_id], len(new_id_of_label))
+    return {core_id: new_id_of_label[merge_of_core[core_id]] for core_id in sorted(merge_of_core)}
+
+
+def fold_core_pair_bits(
+    unrolled_pair_bits: dict[tuple[int, int], int], rolled_of: dict[int, int]
+) -> dict[tuple[int, int], int]:
+    """Re-derive core-to-core traffic after a fold.
+
+    Traffic whose two ends landed on the same rolled core is now intra-core and needs no link at all. What
+    remains is summed per *unordered* pair, so traffic that used to run over several separate links coalesces
+    onto the one link between the merged groups -- and so that the two directions of a pair cannot end up as
+    two `"link"` entries, where the second would silently replace the first in the core graph."""
+    folded: dict[tuple[int, int], int] = defaultdict(int)
+    for (core_a, core_b), bits in unrolled_pair_bits.items():
+        rolled_a, rolled_b = rolled_of[core_a], rolled_of[core_b]
+        if rolled_a == rolled_b:
+            continue
+        folded[(min(rolled_a, rolled_b), max(rolled_a, rolled_b))] += bits
+    return dict(folded)
+
+
+def derive_rolled_topology(
+    workload: ComputationNodeWorkload,
+    original_workload: ONNXWorkload,
+    merge_of_core: dict[int, Any],
+) -> RolledTopology:
+    """Fold the group-dedicated topology by merging every unrolled compute core that shares a label in
+    `merge_of_core` (a graph colouring of cores whose busy windows don't collide -- see
+    `RolledScheduleExplorationStage`) into one physical core.
+
+    Three things have to be re-derived rather than carried over:
+
+    1. **Core ids.** `AcceleratorFactory.create_core_graph` asserts `core.id == index`, and `create` walks the
+       `cores` dict in insertion order, so the merged cores are renumbered densely from 0 in first-appearance
+       order over the sorted unrolled ids (deterministic), with offchip appended last.
+    2. **Tile pinning.** Every tile is re-pinned to its rolled core, the same side effect
+       `derive_group_dedicated_topology` has, so no downstream stage resolves an allocation against the stale
+       unrolled ids.
+    3. **Links.** Traffic between two cores that ended up merged is now intra-core and free, so those links
+       disappear; conversely a rolled core inherits the union of its members' neighbours, so pairs that were
+       never adjacent become adjacent and their bits *coalesce onto one link*. That is the connection-adding
+       half of rolling, and it matters: a missing point-to-point link does not fail, it silently falls back to
+       the shared offchip bus (`Accelerator.find_earliest_time_for_transfer` takes the first shortest path),
+       which is orders of magnitude narrower.
+
+    Bits are summed per unordered core pair, matching `derive_group_dedicated_topology`'s summing convention.
+    Folding makes the two directions of a pair far more likely to both carry traffic, and one `"link"` entry
+    per direction would have the second silently replace the first in the core `DiGraph` -- `AcceleratorFactory`
+    already builds both directions from a single entry.
+    """
+    unrolled = derive_group_dedicated_topology(workload, original_workload)
+    original_nodes = unrolled.original_nodes
+    tiles_by_original = get_tiles_by_original_node(workload, original_nodes)
+    id_to_original_node = {node.id: node for node in original_nodes}
+
+    compute_core_ids = sorted(merge_of_core)
+    if compute_core_ids != list(range(unrolled.offchip_core_id)):
+        raise ValueError(
+            f"derive_rolled_topology: `merge_of_core` must label every compute core exactly once "
+            f"({list(range(unrolled.offchip_core_id))}), got {compute_core_ids}."
+        )
+
+    rolled_of = renumber_merged_cores(merge_of_core)
+    offchip_core_id = len(set(rolled_of.values()))
+
+    members_of_core: dict[int, list[int]] = {rolled_id: [] for rolled_id in range(offchip_core_id)}
+    for core_id in compute_core_ids:
+        members_of_core[rolled_of[core_id]].append(core_id)
+
+    node_core_ids = {
+        node_id: [rolled_of[core_id] for core_id in core_ids] for node_id, core_ids in unrolled.node_core_ids.items()
+    }
+    hosted_node_groups: dict[int, list[tuple[int, int]]] = {rolled_id: [] for rolled_id in range(offchip_core_id)}
+    for node_id, core_ids in unrolled.node_core_ids.items():
+        for group, unrolled_id in enumerate(core_ids):
+            hosted_node_groups[rolled_of[unrolled_id]].append((node_id, group))
+
+    for original_node, tiles in tiles_by_original.items():
+        core_ids = node_core_ids[original_node.id]
+        for tile in tiles:
+            tile.possible_core_allocation = core_ids
+            tile.set_chosen_core_allocation(core_ids[tile.group])
+
+    unrolled_pair_bits: dict[tuple[int, int], int] = defaultdict(int)
+    for producer_tile, consumer_tile, data in workload.edges(data=True):
+        bits = data.get("bits", 0)
+        if bits == 0:
+            continue
+        producer_node = id_to_original_node[producer_tile.id]
+        consumer_node = id_to_original_node[consumer_tile.id]
+        if producer_node is consumer_node:
+            continue
+        core_a = unrolled.node_core_ids[producer_node.id][producer_tile.group]
+        core_b = unrolled.node_core_ids[consumer_node.id][consumer_tile.group]
+        unrolled_pair_bits[(core_a, core_b)] += bits
+
+    core_pair_bits = fold_core_pair_bits(dict(unrolled_pair_bits), rolled_of)
+    bus_connection = {
+        "type": "bus",
+        "cores": list(range(offchip_core_id + 1)),
+        "bandwidth": OFFCHIP_BUS_BANDWIDTH,
+    }
+    link_connections = [
+        {"type": "link", "cores": [core_a, core_b], "bandwidth": bits}
+        for (core_a, core_b), bits in core_pair_bits.items()
+    ]
+    logger.info(
+        f"Derived rolled topology: {unrolled.offchip_core_id} -> {offchip_core_id} compute core(s), "
+        f"{len(unrolled.link_connections)} -> {len(link_connections)} core-to-core link(s)."
+    )
+
+    return RolledTopology(
+        node_core_ids=node_core_ids,
+        offchip_core_id=offchip_core_id,
+        bus_connection=bus_connection,
+        link_connections=link_connections,
+        original_nodes=original_nodes,
+        members_of_core=members_of_core,
+        hosted_node_groups=hosted_node_groups,
+        core_pair_bits=dict(core_pair_bits),
     )
 
 

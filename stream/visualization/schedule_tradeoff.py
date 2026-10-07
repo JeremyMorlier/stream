@@ -37,7 +37,7 @@ def record_key(record: dict[str, Any]) -> Any:
     return record.get("id", record.get("ranks"))
 
 
-def _pareto_staircase(points: list[tuple[float, float]]) -> tuple[list[float], list[float]]:
+def pareto_staircase(points: list[tuple[float, float]]) -> tuple[list[float], list[float]]:
     """Staircase through the 2D-non-dominated points of a projection. A schedule on the 3D front need not be on
     a 2D projection's front, so the line is drawn through the projected front only -- it marks the achievable
     boundary, while the off-line front points are the ones paying for their third objective."""
@@ -91,7 +91,7 @@ def plot_schedule_tradeoffs(
                 label=f"dominated ({len(dominated)})",
                 zorder=1,
             )
-        xs, ys = _pareto_staircase([(record[x_key], record[y_key]) for record in pareto_results])
+        xs, ys = pareto_staircase([(record[x_key], record[y_key]) for record in pareto_results])
         axis.plot(xs, ys, color="0.4", linewidth=1.2, linestyle="--", zorder=2)
         # One shared colour scale across the families, so the third-objective colour stays comparable.
         colors = [record[color_key] for record in pareto_results]

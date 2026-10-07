@@ -22,6 +22,7 @@ from onnx.shape_inference import infer_shapes_path
 from torch import nn
 
 from stream.api import optimize_rolled_schedules
+from stream.visualization.tikz_export import write_figures
 
 _logging_level = _logging.INFO
 _logging_format = "%(asctime)s - %(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
@@ -142,3 +143,18 @@ for record in sorted(pareto_schedules, key=lambda r: r["latency"]):
     )
 print(f"Best by latency: latency={best_scme.latency}, energy={best_scme.energy}")
 print(f"Artifacts: {output_path}/{experiment_id}/rolled_search/")
+
+# The same front the stage just drew as `topologies.html`, re-emitted as LaTeX. `pareto_topologies_*.tex` is
+# the one figure of the pair: the area-vs-latency front with the accelerators behind four of its points drawn
+# as insets above it, each tied to its point. `figures.tex` next to it is a standalone document -- compile it
+# with pdflatex to check the fragments before they go into a paper.
+figures = write_figures(
+    f"{output_path}/{experiment_id}/rolled_search",
+    x_key="latency",
+    y_key="area",
+    color_key="energy",
+    nb_topologies=4,
+    combined_float_env="figure*",  # the picture is 16 cm wide, so a two-column paper wants the starred float
+)
+print(f"Combined LaTeX figure: {figures['combined']}")
+print(f"Preview document:      {figures['preview']} (pdflatex it in place)")

@@ -174,6 +174,8 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
         - `cost_lut_warmup_<k>.pickle`: the warm-up cost LUTs, one per diagonal accelerator.
     """
 
+    schedule_search_time_fraction: float = 1.0
+
     def __init__(
         self,
         list_of_callables: list[StageCallable],
@@ -184,6 +186,7 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
         max_topology_figures: int = 12,
         prune_schedules: bool = True,
         reuse_pareto_fronts: bool = True,
+        schedule_search_time_fraction: float = 1.0,
         **kwargs: Any,
     ):
         """
@@ -201,6 +204,8 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
                 verify that the pruned search returns the same front.
             reuse_pareto_fronts: reuse `core_search/pareto_fronts.pickle` from an earlier run instead of
                 re-running the per-tile core GA, when it matches this workload's tile count.
+            schedule_search_time_fraction: only with a `search_budget`: stop measuring unrolled schedules once
+                this fraction of the budget has elapsed, leaving the rest to subclasses (the rolled search).
         """
         super().__init__(list_of_callables, **kwargs)
         self.schedule_search_dir = schedule_search_dir or os.path.join(
@@ -211,6 +216,7 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
         self.max_topology_figures = max_topology_figures
         self.prune_schedules = prune_schedules
         self.reuse_pareto_fronts = reuse_pareto_fronts
+        self.schedule_search_time_fraction = schedule_search_time_fraction
         self.latency_attr: str = kwargs.get("latency_attr", "latency_total2")
         # Where the warm-up's cost LUTs go. Its own attribute so the rolled stage can keep its (much larger)
         # full-matrix cache under `rolled_search/` instead of mixing it into `schedule_search/`.
@@ -656,6 +662,7 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
             "visited": 0,
             "hit_evaluation_budget": False,
             "hit_node_budget": False,
+            "hit_time_budget": False,
         }
         self.all_results: list[dict[str, Any]] = []
         measured_ranks: set[tuple[int, ...]] = set()
@@ -666,11 +673,25 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
             if stats["measured"] >= self.max_schedule_evaluations:
                 stats["hit_evaluation_budget"] = True
                 return
+            # Past its time share the unrolled search hands over to subclasses (folding) -- but only once it has
+            # a schedule to hand over.
+            if self.search_budget is not None and (
+                self.search_budget.should_stop()
+                or (
+                    stats["measured"] > 0
+                    and self.search_budget.elapsed()
+                    >= self.schedule_search_time_fraction * self.search_budget.max_time_s
+                )
+            ):
+                stats["hit_time_budget"] = True
+                return
             measured_ranks.add(ranks)
             bounds = self._bounds(ranks)
             scme = self._measure(ranks)
             point = (float(scme.latency), float(scme.energy), bounds[2])
             stats["measured"] += 1
+            if self.search_budget is not None:
+                self.search_budget.record(*point, info=f"unrolled {format_ranks(ranks)}")
             record = {
                 "id": f"u{format_ranks(ranks)}",
                 "kind": "unrolled",
@@ -715,6 +736,8 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
                 return
             if stats["measured"] >= self.max_schedule_evaluations:
                 stats["hit_evaluation_budget"] = True
+                return
+            if stats["hit_time_budget"]:
                 return
             if depth == len(self.decision_classes):
                 measure(tuple(ranks))

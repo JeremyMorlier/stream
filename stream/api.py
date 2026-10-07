@@ -11,16 +11,18 @@ from zigzag.utils import pickle_load, pickle_save
 
 from stream.cost_model.cost_model import StreamCostModelEvaluation
 from stream.hardware.architecture.cacti_precompute import install_cacti_monkeypatch, precompute_cacti_design_space
+from stream.opt.search_budget import SearchBudget
 from stream.stages.allocation.constraint_optimization_allocation import ConstraintOptimizationAllocationStage
 from stream.stages.allocation.genetic_algorithm_allocation import GeneticAlgorithmAllocationStage
 from stream.stages.estimation.zigzag_core_mapping_estimation import ZigZagCoreMappingEstimationStage
 from stream.stages.generation.core_architecture_exploration import CoreArchitectureExplorationStage, CoreParamRanges
+from stream.stages.generation.graph_evolution import GraphEvolutionStage
 from stream.stages.generation.layer_stacks_generation import LayerStacksGenerationStage
 from stream.stages.generation.rolled_schedule_exploration import RolledScheduleExplorationStage
 from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
 from stream.stages.generation.scheduling_order_generation import SchedulingOrderGenerationStage
 from stream.stages.generation.tiled_workload_generation import TiledWorkloadGenerationStage
-from stream.stages.generation.tiling_exploration import TilingExplorationStage
+from stream.stages.generation.tiling_exploration import TilingExplorationStage, scme_objective
 from stream.stages.generation.tiling_generation import TilingGenerationStage
 from stream.stages.parsing.accelerator_parser import AcceleratorParserStage
 from stream.stages.parsing.onnx_model_parser import ONNXModelParserStage as StreamONNXModelParserStage
@@ -235,7 +237,7 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
     nb_ga_individuals: int = 4,
     nb_tiling_ga_generations: int = 4,
     nb_tiling_ga_individuals: int = 8,
-    sort_key: Literal["latency", "energy"] = "latency",
+    sort_key: Literal["latency", "energy", "edp"] = "latency",
     max_workers: int | None = None,
     profile: bool = False,
     nb_core_ga_generations: int = 4,
@@ -245,6 +247,8 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
     core_max_pareto_schedules: int = 10_000,
     core_param_ranges: dict[str, Any] | None = None,
     cacti_precompute_workers: int | None = None,
+    explore_cores: bool = True,
+    search_budget: SearchBudget | None = None,
 ) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
     """Search per-layer, per-dimension intra-/inter-core tiling assignments on a fixed hardware and workload
     using a genetic algorithm, running the full pipeline (tiling -> cost estimation -> allocation) once per
@@ -295,6 +299,11 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
             space `core_param_ranges` can produce, once, before the search starts (see
             `stream.hardware.architecture.cacti_precompute`). Defaults to every available core when None, since
             this precompute runs once, serially before any GA parallelism, unlike `core_max_workers`.
+        explore_cores: False keeps `hardware` fixed: the per-candidate core-architecture search (and its CACTI
+            precompute) is dropped, so only the intra-/inter-core tiling is searched on the given accelerator.
+        search_budget: optional wall-clock budget (see `stream.opt.search_budget`). When given, the tiling GA runs
+            generations until the budget stops it instead of for `nb_tiling_ga_generations`, and records every
+            new candidate on it.
     """
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
 
@@ -353,7 +362,7 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
     per_candidate_stage_classes = [
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
-        CoreArchitectureExplorationStage,
+        *([CoreArchitectureExplorationStage] if explore_cores else []),
         ZigZagCoreMappingEstimationStage,
         *allocation_stage_classes,
     ]
@@ -375,15 +384,16 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
     # starts (and before TilingExplorationStage's first fork below) -- see cacti_precompute's module docstring
     # for why this makes every CACTI lookup during the search hit memory instead of a subprocess call or a
     # CactiBatch pool-file read.
-    ranges = CoreParamRanges(**(core_param_ranges or {}))
-    logger.info("optimize_tiling: precomputing CACTI design space for core_search...")
-    t_precompute_start = _time.perf_counter()
-    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
-    install_cacti_monkeypatch(design_space)
-    logger.info(
-        f"optimize_tiling: precomputed {len(design_space)} CACTI config(s) in "
-        f"{_time.perf_counter() - t_precompute_start:.1f}s."
-    )
+    if explore_cores:
+        ranges = CoreParamRanges(**(core_param_ranges or {}))
+        logger.info("optimize_tiling: precomputing CACTI design space for core_search...")
+        t_precompute_start = _time.perf_counter()
+        design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+        install_cacti_monkeypatch(design_space)
+        logger.info(
+            f"optimize_tiling: precomputed {len(design_space)} CACTI config(s) in "
+            f"{_time.perf_counter() - t_precompute_start:.1f}s."
+        )
 
     mainstage = MainStage(
         list_of_callables,
@@ -403,6 +413,7 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
         temporal_mapping_type=temporal_mapping_type,  # required by ZigZagCoreMappingEstimationStage
         operands_to_prefetch=[],  # required by GeneticAlgorithmAllocationStage/ConstraintOptimizationAllocationStage
         profile=profile,  # required by TilingExplorationStage, to time its own per-candidate pipeline stages
+        search_budget=search_budget,  # optional, read by TilingExplorationStage
         **allocation_stage_kwargs,
         **core_search_kwargs,
     )
@@ -414,11 +425,11 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
     if not answers:
         raise ValueError("No candidate tiling configuration produced a result.")
 
-    best_scme, best_extra_info = min(answers, key=lambda answer: getattr(answer[0], sort_key))
+    best_scme, best_extra_info = min(answers, key=lambda answer: scme_objective(answer[0], sort_key))
     pickle_save(best_scme, scme_path)  # type: ignore
     logger.info(
         f"Best tiling candidate {best_extra_info['candidate_index']} out of {len(answers)}: "
-        f"{best_extra_info['tiling_config']} ({sort_key}={getattr(best_scme, sort_key)})."
+        f"{best_extra_info['tiling_config']} ({sort_key}={scme_objective(best_scme, sort_key)})."
     )
 
     with open(results_csv_path, "w", newline="") as csv_file:
@@ -623,6 +634,9 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     fold_source: Literal["pareto", "all"] = "pareto",
     prune_rolled: bool = True,
     max_cme_matrix_cells: int = 2000,
+    search_budget: SearchBudget | None = None,
+    core_search_time_fraction: float = 0.3,
+    schedule_search_time_fraction: float = 0.6,
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
     """Search schedules as `optimize_schedules` does, then *roll* them: reuse cores that are idle later in the
     schedule so the accelerator needs fewer of them, and return one Pareto front over both families.
@@ -651,6 +665,11 @@ def optimize_rolled_schedules(  # noqa: PLR0913
             folded core runs layers that were never meant for its design). Above it the run falls back to the
             unrolled diagonal warm-up.
         prune_rolled: skip folds whose lower bound is already dominated by a measured schedule.
+        search_budget: optional wall-clock budget (see `stream.opt.search_budget`). When given, the search runs
+            on time instead of iteration counts: the per-tile core GAs share the first
+            `core_search_time_fraction` of the budget (or stop earlier once their fronts stall), unrolled
+            schedules are measured until `schedule_search_time_fraction` of it, and folding uses the rest. Every
+            measured schedule is recorded on the budget. Pass large iteration caps alongside it.
 
     Returns:
         The best schedule by `sort_key`, and the combined Pareto set as plain records. Artifacts are written
@@ -742,6 +761,9 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         fold_source=fold_source,
         prune_rolled=prune_rolled,
         max_cme_matrix_cells=max_cme_matrix_cells,
+        search_budget=search_budget,
+        core_search_time_fraction=core_search_time_fraction,
+        schedule_search_time_fraction=schedule_search_time_fraction if search_budget is not None else 1.0,
     )
 
     t_start = _time.perf_counter()
@@ -762,3 +784,104 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         f"best by {sort_key}: latency={best_scme.latency}, energy={best_scme.energy}."
     )
     return best_scme, pareto_schedules
+
+
+def optimize_graph_evolution(  # noqa: PLR0913
+    hardware: str,
+    workload: str,
+    mapping: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    temporal_mapping_type: str = "uneven",
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+    population_size: int = 16,
+    graph_ga_generations: int = 10,
+    max_workers: int | None = None,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
+    search_budget: SearchBudget | None = None,
+) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
+    """Search the accelerator's core graph and the allocation onto it with one evolving-graph NSGA2 loop (see
+    `GraphEvolutionStage`): which cores exist, their designs, which layer groups share a core and which links
+    connect them, scored on `(latency, energy, area)` by the real scheduler.
+
+    Args:
+        population_size: NSGA2 population (rounded up to a multiple of 4).
+        graph_ga_generations: generations to run when no `search_budget` is given.
+        max_workers: worker processes for the cost-model warm-ups and the schedule measurements.
+        search_budget: optional wall-clock budget (see `stream.opt.search_budget`); when given, the loop runs
+            until it stops and every measured graph is recorded on it.
+
+    Returns:
+        The best graph by EDP as a `StreamCostModelEvaluation`, and the final Pareto front as plain records.
+        Artifacts go to `{output_path}/{experiment_id}/graph_search/`.
+    """
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+    logger = _logging.getLogger(__name__)
+
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+
+    stage_classes = [
+        AcceleratorParserStage,
+        StreamONNXModelParserStage,
+        LayerStacksGenerationStage,
+        TilingGenerationStage,
+        TiledWorkloadGenerationStage,
+        GraphEvolutionStage,
+        SetFixedAllocationPerformanceStage,
+        SchedulingOrderGenerationStage,
+        GeneticAlgorithmAllocationStage,
+    ]
+
+    # Must happen before anything forks, so every worker inherits the patch.
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    t_precompute_start = _time.perf_counter()
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+    logger.info(
+        f"optimize_graph_evolution: precomputed {len(design_space)} CACTI config(s) in "
+        f"{_time.perf_counter() - t_precompute_start:.1f}s."
+    )
+
+    mainstage = MainStage(
+        stage_classes,
+        accelerator=hardware,
+        workload_path=workload,
+        mapping_path=mapping,
+        loma_lpf_limit=6,
+        mode=mode,
+        layer_stacks=layer_stacks,
+        tiled_workload_path=f"{output_path}/{experiment_id}/tiled_workload.pickle",
+        cost_lut_path=f"{output_path}/{experiment_id}/cost_lut.pickle",
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],
+        nb_ga_generations=nb_ga_generations,
+        nb_ga_individuals=nb_ga_individuals,
+        core_param_ranges=core_param_ranges,
+        population_size=population_size,
+        graph_ga_generations=graph_ga_generations,
+        max_workers=max_workers,
+        graph_search_dir=f"{output_path}/{experiment_id}/graph_search",
+        search_budget=search_budget,
+    )
+    t_start = _time.perf_counter()
+    answers = [answer for answer in mainstage.run() if answer[0] is not None]
+    if not answers:
+        raise ValueError("No graph could be evaluated.")
+    best_scme, extra_info = answers[0]
+    pickle_save(best_scme, f"{output_path}/{experiment_id}/scme.pickle")  # type: ignore
+    logger.info(
+        f"optimize_graph_evolution: {extra_info['nb_evaluated']} graph(s) measured in "
+        f"{_time.perf_counter() - t_start:.1f}s; best by EDP: latency={best_scme.latency}, "
+        f"energy={best_scme.energy}."
+    )
+    return best_scme, extra_info["pareto_graphs"]

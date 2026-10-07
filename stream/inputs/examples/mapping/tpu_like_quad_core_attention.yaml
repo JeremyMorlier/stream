@@ -1,0 +1,29 @@
+# Attention block (QKV projections, multi-head attention, output projection, residual) on tpu_like_quad_core:
+# the matmuls on the four compute cores, Softmax and the residual Add on the SIMD core (5).
+- name: default
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, 1
+
+- name: MatMul
+  core_allocation: [0, 1, 2, 3]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - K, 1
+
+- name: Softmax
+  core_allocation: [5]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - H, 1
+
+- name: Add
+  core_allocation: [5]
+  intra_core_tiling:
+    - D, all
+  inter_core_tiling:
+    - H, 1

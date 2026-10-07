@@ -26,6 +26,7 @@ from stream.hardware.architecture.core_generator import (
     build_shared_memory_dict,
     core_dict_from_params,
 )
+from stream.opt.search_budget import SearchBudget, hypervolume_3d
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.parser.core_validator import CoreValidator
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
@@ -505,6 +506,9 @@ class CoreArchitectureExplorationStage(Stage):
     ZigZag call (not a full nested pipeline run), that nesting is much cheaper than it used to be.
     """
 
+    # Class-level defaults so stages built without `__init__` (the synthetic tests) run the unbudgeted search.
+    search_budget: "SearchBudget | None" = None
+
     def __init__(  # noqa: PLR0913
         self,
         list_of_callables: list[StageCallable],
@@ -522,9 +526,17 @@ class CoreArchitectureExplorationStage(Stage):
         core_param_ranges: dict[str, Any] | None = None,
         candidate_results_csv_path: str | None = None,
         all_evaluated_cores_csv_path: str | None = None,
+        core_search_time_fraction: float = 0.3,
+        core_patience: int = 5,
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
+        # Optional `SearchBudget` (see stream.opt.search_budget): when present, each tile's NSGA2 runs until a
+        # shared deadline (`core_search_time_fraction` of the budget) or until its front stops improving for
+        # `core_patience` generations, with `nb_core_ga_generations` kept only as a hard cap.
+        self.search_budget = kwargs.get("search_budget")
+        self.core_search_time_fraction = core_search_time_fraction
+        self.core_patience = core_patience
         self.workload = workload
         self.original_workload = original_workload
         self.accelerator = accelerator
@@ -601,7 +613,33 @@ class CoreArchitectureExplorationStage(Stage):
         pareto_front = tools.ParetoFront()
         pareto_front.update(population)
 
+        budget = self.search_budget
+        if budget is not None:
+            deadline = budget.max_time_s * self.core_search_time_fraction
+            finite = [ind.fitness.values for ind in population if all(math.isfinite(v) for v in ind.fitness.values)]
+            reference = [1.1 * max(values[i] for values in finite) for i in range(3)] if finite else None
+            hv_history: list[float] = []
+
         for generation in range(self.nb_core_ga_generations):
+            if budget is not None:
+                if budget.elapsed() >= deadline:
+                    logger.info(f"CoreArchitectureExplorationStage: tile {tile_index} hit its time share.")
+                    break
+                if reference is not None:
+                    front = [
+                        ind.fitness.values
+                        for ind in population
+                        if all(v < r for v, r in zip(ind.fitness.values, reference, strict=True))
+                    ]
+                    hv_history.append(hypervolume_3d(front, reference))
+                    if len(hv_history) > self.core_patience:
+                        previous = hv_history[-1 - self.core_patience]
+                        if previous > 0 and hv_history[-1] / previous - 1 < budget.rel_tol:
+                            logger.info(
+                                f"CoreArchitectureExplorationStage: tile {tile_index} front converged after "
+                                f"{generation} generation(s)."
+                            )
+                            break
             offspring = tools.selTournamentDCD(population, mu)
             offspring = [toolbox.clone(ind) for ind in offspring]
             for ind1, ind2 in zip(offspring[::2], offspring[1::2], strict=False):

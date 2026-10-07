@@ -34,7 +34,10 @@ Two things are deliberately not assumed:
 
 import csv
 import logging
+import math
+import multiprocessing
 import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Literal
@@ -56,6 +59,18 @@ from stream.visualization.hardware_graph import topology_from_connectivity
 from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
+
+# `(stage, reference workload)` a forked warm-up worker reads; set right before the pool forks.
+_WARM_UP_STAGE: tuple[Any, Any] | None = None
+
+
+def _warm_up_column_worker(item: tuple[str, dict[str, Any]]) -> tuple[dict, dict, dict, dict]:
+    assert _WARM_UP_STAGE is not None
+    stage, workload = _WARM_UP_STAGE
+    stage.cme_cache, stage.runtime_cache, stage.energy_cache, stage.area_cache = {}, {}, {}, {}
+    stage._warm_up_uniform_design(*item, workload)
+    return stage.cme_cache, stage.runtime_cache, stage.energy_cache, stage.area_cache
+
 
 INTERVAL_T = tuple[int, int]
 
@@ -398,22 +413,42 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
             f"RolledScheduleExplorationStage: warming up the full cost matrix, {nb_shapes} shape(s) x "
             f"{len(designs)} design(s) = {cells} cell(s), with {len(designs)} uniform accelerator(s)."
         )
-        for design_key, core_dict in designs.items():
-            node_core_dicts = dict.fromkeys(self.design_class_of_node, core_dict)
-            accelerator = self._build_accelerator(node_core_dicts, workload)
-            estimation = ZigZagCoreMappingEstimationStage(
-                [_UnusedLeafStage],
-                workload=workload,
-                accelerator=accelerator,
-                loma_lpf_limit=self.kwargs["loma_lpf_limit"],
-                cost_lut_path=os.path.join(self.cme_cache_dir, f"cost_lut_design_{design_key}.pickle"),
-                layer_stacks=self.kwargs["layer_stacks"],
-                temporal_mapping_type=self.kwargs["temporal_mapping_type"],
-            )
-            estimation.update_cost_lut()
-            self._harvest_cmes(estimation.cost_lut, workload, accelerator, self._design_key_of_core(node_core_dicts))
+        if (self.max_workers or 1) > 1 and len(designs) > 1:
+            self._warm_up_designs_in_parallel(designs, workload)
+        else:
+            for design_key, core_dict in designs.items():
+                self._warm_up_uniform_design(design_key, core_dict, workload)
         self._full_matrix = True
         self._check_cme_cache_complete()
+
+    def _warm_up_uniform_design(self, design_key: str, core_dict: dict[str, Any], workload: Any) -> None:
+        """One column of the cost matrix: every node on `core_dict`, harvested into the caches."""
+        node_core_dicts = dict.fromkeys(self.design_class_of_node, core_dict)
+        accelerator = self._build_accelerator(node_core_dicts, workload)
+        estimation = ZigZagCoreMappingEstimationStage(
+            [_UnusedLeafStage],
+            workload=workload,
+            accelerator=accelerator,
+            loma_lpf_limit=self.kwargs["loma_lpf_limit"],
+            cost_lut_path=os.path.join(self.cme_cache_dir, f"cost_lut_design_{design_key}.pickle"),
+            layer_stacks=self.kwargs["layer_stacks"],
+            temporal_mapping_type=self.kwargs["temporal_mapping_type"],
+        )
+        estimation.update_cost_lut()
+        self._harvest_cmes(estimation.cost_lut, workload, accelerator, self._design_key_of_core(node_core_dicts))
+
+    def _warm_up_designs_in_parallel(self, designs: dict[str, dict[str, Any]], workload: Any) -> None:
+        """The columns are independent, so fill them on `core_max_workers` forked processes. Each worker starts
+        from empty caches and sends back only what it harvested; the parent merges."""
+        global _WARM_UP_STAGE  # noqa: PLW0603
+        _WARM_UP_STAGE = (self, workload)
+        mp_context = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=mp_context) as executor:
+            for caches in executor.map(_warm_up_column_worker, list(designs.items())):
+                for cache, harvested in zip(
+                    (self.cme_cache, self.runtime_cache, self.energy_cache, self.area_cache), caches, strict=True
+                ):
+                    cache.update(harvested)
 
     def _required_cme_keys(self) -> list[tuple[int, str]]:
         if not self._full_matrix:
@@ -653,6 +688,7 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
             "infeasible": 0,
             "duplicate": 0,
             "hit_evaluation_budget": False,
+            "hit_time_budget": False,
         }
         # Snapshot first: `ParetoArchive.add` rewrites `entries` as rolled points evict unrolled ones.
         if self.fold_source == "pareto":
@@ -701,6 +737,9 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         if fold_stats["measured"] >= self.max_rolled_evaluations:
             fold_stats["hit_evaluation_budget"] = True
             return "budget"
+        if self.search_budget is not None and self.search_budget.should_stop():
+            fold_stats["hit_time_budget"] = True
+            return "budget"
 
         try:
             scme, topology = self._measure_fold(plan)
@@ -712,10 +751,14 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
                 exc_info=True,
             )
             fold_stats["infeasible"] += 1
+            if self.search_budget is not None:
+                self.search_budget.record(math.inf, math.inf, bounds[2], info=f"rolled {plan.id} infeasible")
             return "infeasible"
 
         fold_stats["measured"] += 1
         point = (float(scme.latency), float(scme.energy), bounds[2])
+        if self.search_budget is not None:
+            self.search_budget.record(*point, info=f"rolled {plan.id}")
         record = {
             "id": plan.id,
             "kind": "rolled",

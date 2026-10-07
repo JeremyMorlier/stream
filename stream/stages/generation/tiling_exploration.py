@@ -18,6 +18,7 @@ from zigzag.datatypes import LayerDim
 from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
 
 from stream.hardware.architecture.accelerator import Accelerator
+from stream.opt.search_budget import map_until_deadline
 from stream.stages.stage import MainStage, Stage, StageCallable
 from stream.utils import accumulate_stage_timings, get_exclusive_stage_times, wrap_stages_with_timing_for_workers
 from stream.workload.computation.computation_node import ComputationNode
@@ -292,6 +293,14 @@ def _write_candidate_results_csv(
     logger.info(f"TilingExplorationStage: saved all candidate results to {csv_path}.")
 
 
+def scme_objective(scme: Any, sort_key: str) -> float:
+    """The scalar a candidate is ranked by: a `StreamCostModelEvaluation` attribute (`latency`, `energy`), or
+    `edp`, the latency x energy product."""
+    if sort_key == "edp":
+        return float(scme.latency) * float(scme.energy)
+    return getattr(scme, sort_key)
+
+
 def _evaluate_tiling_individual(  # noqa: PLR0913
     individual: "array.array | list[int]",
     genes: list[TilingGene],
@@ -324,7 +333,7 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
 
     if os.path.exists(result_path):
         cached_scme, _cached_extra_info = pickle_load(result_path)
-        return (getattr(cached_scme, sort_key),)
+        return (scme_objective(cached_scme, sort_key),)
 
     per_node = _decode_individual(individual, genes)
     candidate_workload = pickle_deepcopy(workload)
@@ -351,7 +360,7 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
         logger.exception(f"TilingExplorationStage: candidate {key} failed, penalizing it.")
         return (float("inf"),)
 
-    logger.info(f"TilingExplorationStage: candidate {key} evaluated ({sort_key}={getattr(scme, sort_key):.6g}).")
+    logger.info(f"TilingExplorationStage: candidate {key} evaluated ({sort_key}={scme_objective(scme, sort_key):.6g}).")
 
     if profile:
         # Read back by the parent process (see TilingExplorationStage.run) to aggregate per-candidate stage
@@ -370,10 +379,10 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
 
     with scme_lock:
         current_best = pickle_load(scme_path) if os.path.exists(scme_path) else None
-        if current_best is None or getattr(scme, sort_key) < getattr(current_best, sort_key):
+        if current_best is None or scme_objective(scme, sort_key) < scme_objective(current_best, sort_key):
             pickle_save(scme, scme_path)  # type: ignore
 
-    return (getattr(scme, sort_key),)
+    return (scme_objective(scme, sort_key),)
 
 
 class TilingExplorationStage(Stage):
@@ -420,6 +429,17 @@ class TilingExplorationStage(Stage):
             tiling_candidates_dir, "candidate_results.csv"
         )
         self.profile = profile
+        # Optional `SearchBudget` (see stream.opt.search_budget): when present the GA runs generations until the
+        # budget says stop instead of for `nb_tiling_ga_generations`, and every new candidate is recorded on it.
+        self.search_budget = kwargs.get("search_budget")
+        # The hardware is fixed in this search, so every candidate shares the same area.
+        self.accelerator_area = (
+            sum(core.get_area() for core in accelerator.core_list if core.id != accelerator.offchip_core_id)
+            if self.search_budget is not None
+            else 0.0
+        )
+        # Generations in a row that brought no unseen candidate before the space counts as exhausted.
+        self.max_stale_generations = kwargs.get("max_stale_generations", 20)
         # Populated as candidates are evaluated (see run()): summed [init_time, run_time] per per-candidate
         # stage, across every unique candidate evaluated by this GA run.
         self.candidate_stage_timings: dict[str, list[float]] = {}
@@ -459,7 +479,7 @@ class TilingExplorationStage(Stage):
                 profile=self.profile,
             )
             cached = _load_cached_result(self.tiling_candidates_dir, _candidate_key(empty_individual))
-            fitness = float("inf") if cached is None else getattr(cached[0], self.sort_key)
+            fitness = float("inf") if cached is None else scme_objective(cached[0], self.sort_key)
             candidate_records = {_candidate_key(empty_individual): (tuple(empty_individual), fitness)}
             _write_candidate_results_csv(
                 self.candidate_results_csv_path,
@@ -574,7 +594,20 @@ class TilingExplorationStage(Stage):
                         f"TilingExplorationStage: batch of {len(individuals)} individual(s), "
                         f"{len(unique_individuals)} unique after dedup."
                     )
-                    unique_results = list(executor.map(func, unique_individuals))
+                    if self.search_budget is None:
+                        unique_results = list(executor.map(func, unique_individuals))
+                    else:
+                        # Record each candidate as it completes, and cut the batch at the hard time limit.
+                        unique_results = map_until_deadline(
+                            executor,
+                            func,
+                            unique_individuals,
+                            self.search_budget,
+                            fallback=(float("inf"),),
+                            on_result=lambda index, _result: self._record_on_budget(
+                                _candidate_key(unique_individuals[index]), candidate_records
+                            ),
+                        )
                     for individual, result in zip(unique_individuals, unique_results, strict=True):
                         key = _candidate_key(individual)
                         candidate_records[key] = (tuple(individual), result[0])
@@ -597,16 +630,21 @@ class TilingExplorationStage(Stage):
                 # still invoked every generation regardless, so capturing and logging it ourselves below is
                 # behavior-neutral for the GA and routes per-generation stats through the app's real logger
                 # instead of bypassing it via stdout.
-                population, logbook = algorithms.eaSimple(
-                    population,
-                    toolbox,
-                    cxpb=0.5,
-                    mutpb=0.3,
-                    ngen=self.nb_tiling_ga_generations,
-                    stats=statistics,
-                    halloffame=hall_of_fame,
-                    verbose=False,
-                )
+                if self.search_budget is None:
+                    population, logbook = algorithms.eaSimple(
+                        population,
+                        toolbox,
+                        cxpb=0.5,
+                        mutpb=0.3,
+                        ngen=self.nb_tiling_ga_generations,
+                        stats=statistics,
+                        halloffame=hall_of_fame,
+                        verbose=False,
+                    )
+                else:
+                    population, logbook = self._run_until_budget(
+                        population, toolbox, statistics, hall_of_fame, candidate_records
+                    )
                 for record in logbook:
                     logger.info(
                         f"TilingExplorationStage: generation {record['gen']}: "
@@ -641,11 +679,65 @@ class TilingExplorationStage(Stage):
                     scme, extra_info = cached
                     logger.info(
                         f"TilingExplorationStage: hall-of-fame candidate {key}: "
-                        f"{self.sort_key}={getattr(scme, self.sort_key)}"
+                        f"{self.sort_key}={scme_objective(scme, self.sort_key)}"
                     )
                     yield scme, extra_info
 
                 self._save_search_summary(genes, candidate_records, hall_of_fame_summary, list(logbook))
+
+    def _record_on_budget(self, key: str, candidate_records: dict[str, Any]) -> None:
+        """Log a candidate on the budget the first time it is evaluated (cache hits are free, so not recorded)."""
+        if self.search_budget is None or key in candidate_records:
+            return
+        cached = _load_cached_result(self.tiling_candidates_dir, key)
+        if cached is None:
+            self.search_budget.record(float("inf"), float("inf"), self.accelerator_area, info=f"tiling {key} failed")
+        else:
+            scme = cached[0]
+            self.search_budget.record(scme.latency, scme.energy, self.accelerator_area, info=f"tiling {key}")
+
+    def _run_until_budget(
+        self,
+        population: list[Any],
+        toolbox: base.Toolbox,
+        statistics: tools.Statistics,
+        hall_of_fame: tools.HallOfFame,
+        candidate_records: dict[str, Any],
+    ) -> tuple[list[Any], tools.Logbook]:
+        """`algorithms.eaSimple` with the generation count replaced by `self.search_budget`: same selection,
+        variation (cxpb=0.5, mutpb=0.3) and evaluation, looping until the budget fires or `max_stale_generations`
+        generations in a row bring no unseen candidate (a small space the GA has fully explored)."""
+        budget = self.search_budget
+        logbook = tools.Logbook()
+        logbook.header = ["gen", "nevals", *statistics.fields]
+
+        def _evaluate_invalid(individuals: list[Any]) -> int:
+            invalid = [ind for ind in individuals if not ind.fitness.valid]
+            for ind, fit in zip(invalid, toolbox.map(toolbox.evaluate, invalid), strict=True):
+                ind.fitness.values = fit
+            return len(invalid)
+
+        nevals = _evaluate_invalid(population)
+        hall_of_fame.update(population)
+        logbook.record(gen=0, nevals=nevals, **statistics.compile(population))
+        generation, stale = 0, 0
+        while not budget.should_stop():
+            generation += 1
+            seen_before = len(candidate_records)
+            offspring = algorithms.varAnd(toolbox.select(population, len(population)), toolbox, 0.5, 0.3)
+            nevals = _evaluate_invalid(offspring)
+            hall_of_fame.update(offspring)
+            population[:] = offspring
+            logbook.record(gen=generation, nevals=nevals, **statistics.compile(population))
+            stale = stale + 1 if len(candidate_records) == seen_before else 0
+            if stale >= self.max_stale_generations:
+                logger.info(f"TilingExplorationStage: no new candidate in {stale} generation(s); space exhausted.")
+                budget.stop("exhausted")
+        logger.info(
+            f"TilingExplorationStage: budgeted search stopped after {generation} generation(s) "
+            f"({budget.stop_reason}, {len(candidate_records)} unique candidate(s))."
+        )
+        return population, logbook
 
     def _save_search_summary(
         self,

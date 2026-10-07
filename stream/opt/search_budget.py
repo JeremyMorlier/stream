@@ -139,6 +139,47 @@ class SearchBudget:
         with open(path, "w") as f:
             json.dump({**self.summary(), **extra}, f, indent=2, default=str)
 
+    def sub_budget(self, time_cap_s: float) -> "SubBudget":
+        """A per-candidate view for nested searches (see `SubBudget`), started now."""
+        return SubBudget(self, time_cap_s)
+
+
+class SubBudget:
+    """The slice of a parent `SearchBudget` one candidate of an outer search may spend.
+
+    It has its own clock and stops after `time_cap_s` (or whatever the parent has left, if less), or as soon as
+    the parent stops. It has no convergence rule of its own -- the inner stages stop on their own criteria --
+    and its `stop` never stops the parent. Records go straight to the parent, so the trace, the best EDP and the
+    convergence window stay global. Same interface as `SearchBudget` for everything the stages call."""
+
+    def __init__(self, parent: SearchBudget, time_cap_s: float):
+        self.parent = parent
+        self.t_start = time.perf_counter()
+        self.max_time_s = min(time_cap_s, parent.time_left())
+        self.rel_tol = parent.rel_tol
+        self.stop_reason: str | None = None
+
+    def elapsed(self) -> float:
+        return time.perf_counter() - self.t_start
+
+    def time_left(self) -> float:
+        return max(0.0, self.max_time_s - self.elapsed())
+
+    def record(self, latency: float, energy: float, area: float, info: str = "") -> bool:
+        return self.parent.record(latency, energy, area, info=info)
+
+    def stop(self, reason: str) -> None:
+        if self.stop_reason is None:
+            self.stop_reason = reason
+
+    def should_stop(self) -> bool:
+        if self.stop_reason is None:
+            if self.parent.should_stop():
+                self.stop("parent")
+            elif self.elapsed() >= self.max_time_s:
+                self.stop("time")
+        return self.stop_reason is not None
+
 
 def _hypervolume_2d(points: list[tuple[float, float]], reference: tuple[float, float]) -> float:
     """Area dominated by `points` (minimization) inside the box bounded by `reference`."""

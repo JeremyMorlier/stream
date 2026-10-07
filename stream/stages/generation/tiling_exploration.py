@@ -3,6 +3,7 @@ import csv
 import functools
 import hashlib
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -293,12 +294,58 @@ def _write_candidate_results_csv(
     logger.info(f"TilingExplorationStage: saved all candidate results to {csv_path}.")
 
 
+def build_tiling_genes(workload: ONNXWorkload) -> list[TilingGene]:
+    """Build tiling decision points for every layer: one independent "intra" gene per dimension (every
+    dimension of every layer except batch `B` and group `G` — matching the exclusion convention already
+    used elsewhere, e.g. the fallback dimension pick in `TilingGenerationStage.get_fusion_partition_dim`),
+    plus a single combined per-layer "inter" gene choosing at most one of those dimensions to split
+    inter-core (see `TilingGene`'s docstring for why inter must stay single-dimension). Dimensions of
+    size <= 1 have nothing to tile and are excluded from both."""
+    genes: list[TilingGene] = []
+    for node in workload.node_list:
+        if not isinstance(node, ComputationNode):
+            continue
+        nb_cores = len(node.possible_core_allocation) or 1
+        relevant_dims = [
+            dim
+            for dim in node.layer_dim_sizes
+            if dim not in (LayerDim("B"), LayerDim("G")) and node.layer_dim_sizes[dim] > 1
+        ]
+        if not relevant_dims:
+            continue
+
+        for dim in relevant_dims:
+            size = node.layer_dim_sizes[dim]
+            intra_candidates: list[INTRA_CANDIDATE_T] = [1, *prime_divisors(size)]
+            if len(intra_candidates) > 1:
+                genes.append(TilingGene(node_id=node.id, kind="intra", dim=dim, candidates=intra_candidates))
+
+        inter_candidates: list[INTER_CANDIDATE_T] = [None]
+        for dim in relevant_dims:
+            size = node.layer_dim_sizes[dim]
+            inter_candidates += [(dim, factor) for factor in prime_divisors(size) if factor <= nb_cores]
+        if len(inter_candidates) > 1:
+            genes.append(TilingGene(node_id=node.id, kind="inter", dim=None, candidates=inter_candidates))
+    return genes
+
+
 def scme_objective(scme: Any, sort_key: str) -> float:
     """The scalar a candidate is ranked by: a `StreamCostModelEvaluation` attribute (`latency`, `energy`), or
     `edp`, the latency x energy product."""
     if sort_key == "edp":
         return float(scme.latency) * float(scme.energy)
     return getattr(scme, sort_key)
+
+
+def _candidate_fitness(scme: Any, sub_extra_info: Any, sort_key: str) -> float:
+    """A candidate's fitness: its returned schedule's `sort_key`, or -- when the per-candidate pipeline returns a
+    whole Pareto set (`RolledScheduleExplorationStage`) -- the best `sort_key` over that set."""
+    if isinstance(sub_extra_info, dict) and sub_extra_info.get("pareto_schedules"):
+        records = sub_extra_info["pareto_schedules"]
+        if sort_key == "edp":
+            return min(float(r["latency"]) * float(r["energy"]) for r in records)
+        return min(float(r[sort_key]) for r in records)
+    return scme_objective(scme, sort_key)
 
 
 def _evaluate_tiling_individual(  # noqa: PLR0913
@@ -312,6 +359,7 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     sort_key: str,
     scme_lock: "AcquirerProxy | nullcontext[None]",
     profile: bool = False,
+    candidate_budget: Any = None,
 ) -> tuple[float]:
     """Runs in a worker process: decodes one GA individual into per-layer tiling, evaluates it through the
     full downstream pipeline, and atomically updates the shared best-so-far `scme_path` under `scme_lock` --
@@ -332,8 +380,8 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
         return (float("inf"),)
 
     if os.path.exists(result_path):
-        cached_scme, _cached_extra_info = pickle_load(result_path)
-        return (scme_objective(cached_scme, sort_key),)
+        cached_scme, cached_extra_info = pickle_load(result_path)
+        return (cached_extra_info.get("fitness", scme_objective(cached_scme, sort_key)),)
 
     per_node = _decode_individual(individual, genes)
     candidate_workload = pickle_deepcopy(workload)
@@ -347,6 +395,8 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     os.makedirs(candidate_dir, exist_ok=True)
     kwargs["tiled_workload_path"] = f"{candidate_dir}/tiled_workload.pickle"
     kwargs["cost_lut_path"] = f"{candidate_dir}/cost_lut.pickle"
+    if candidate_budget is not None:
+        kwargs["search_budget"] = candidate_budget
     stage_timings: dict[str, list[float]] = {}
     if profile:
         kwargs["_stage_timings"] = stage_timings
@@ -360,14 +410,17 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
         logger.exception(f"TilingExplorationStage: candidate {key} failed, penalizing it.")
         return (float("inf"),)
 
-    logger.info(f"TilingExplorationStage: candidate {key} evaluated ({sort_key}={scme_objective(scme, sort_key):.6g}).")
+    fitness = _candidate_fitness(scme, sub_extra_info, sort_key)
+    logger.info(f"TilingExplorationStage: candidate {key} evaluated ({sort_key}={fitness:.6g}).")
 
     if profile:
         # Read back by the parent process (see TilingExplorationStage.run) to aggregate per-candidate stage
         # timings across every worker process, the same way `result.pickle` is used for the SCME itself.
         pickle_save(stage_timings, f"{candidate_dir}/stage_timings.pickle")  # type: ignore
 
-    extra_info = {"tiling_config": per_node, "candidate_index": key}
+    extra_info = {"tiling_config": per_node, "candidate_index": key, "fitness": fitness}
+    if isinstance(sub_extra_info, dict) and "pareto_schedules" in sub_extra_info:
+        extra_info["pareto_schedules"] = sub_extra_info["pareto_schedules"]
     # CoreArchitectureExplorationStage (if present in the per-candidate chain) yields its own extra_info with
     # the winning core design's identifying keys -- surface it here so it isn't silently dropped.
     if isinstance(sub_extra_info, dict) and "core_node_ids" in sub_extra_info:
@@ -382,7 +435,7 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
         if current_best is None or scme_objective(scme, sort_key) < scme_objective(current_best, sort_key):
             pickle_save(scme, scme_path)  # type: ignore
 
-    return (scme_objective(scme, sort_key),)
+    return (fitness,)
 
 
 class TilingExplorationStage(Stage):
@@ -440,6 +493,11 @@ class TilingExplorationStage(Stage):
         )
         # Generations in a row that brought no unseen candidate before the space counts as exhausted.
         self.max_stale_generations = kwargs.get("max_stale_generations", 20)
+        # In-process mode: candidates run one at a time in this process, so their own (parallel) stages get the
+        # machine, and each gets a `search_budget.sub_budget(candidate_time_cap_s)` -- the per-candidate stages
+        # then record their measurements on the shared budget themselves (see `optimize_rolled_tiling`).
+        self.evaluate_in_process: bool = kwargs.get("evaluate_in_process", False)
+        self.candidate_time_cap_s: float = kwargs.get("candidate_time_cap_s", math.inf)
         # Populated as candidates are evaluated (see run()): summed [init_time, run_time] per per-candidate
         # stage, across every unique candidate evaluated by this GA run.
         self.candidate_stage_timings: dict[str, list[float]] = {}
@@ -594,7 +652,9 @@ class TilingExplorationStage(Stage):
                         f"TilingExplorationStage: batch of {len(individuals)} individual(s), "
                         f"{len(unique_individuals)} unique after dedup."
                     )
-                    if self.search_budget is None:
+                    if self.evaluate_in_process:
+                        unique_results = [self._evaluate_with_sub_budget(func, ind) for ind in unique_individuals]
+                    elif self.search_budget is None:
                         unique_results = list(executor.map(func, unique_individuals))
                     else:
                         # Record each candidate as it completes, and cut the batch at the hard time limit.
@@ -684,6 +744,14 @@ class TilingExplorationStage(Stage):
                     yield scme, extra_info
 
                 self._save_search_summary(genes, candidate_records, hall_of_fame_summary, list(logbook))
+
+    def _evaluate_with_sub_budget(self, func, individual) -> tuple[float]:
+        """In-process evaluation of one candidate under its own slice of the budget."""
+        if self.search_budget is None:
+            return func(individual)
+        if self.search_budget.should_stop():
+            return (float("inf"),)
+        return func(individual, candidate_budget=self.search_budget.sub_budget(self.candidate_time_cap_s))
 
     def _record_on_budget(self, key: str, candidate_records: dict[str, Any]) -> None:
         """Log a candidate on the budget the first time it is evaluated (cache hits are free, so not recorded)."""
@@ -782,35 +850,4 @@ class TilingExplorationStage(Stage):
             logger.info("  %-38s %8.3fs (%5.1f%%)", label, exclusive_time, percent)
 
     def _build_genes(self) -> list[TilingGene]:
-        """Build tiling decision points for every layer: one independent "intra" gene per dimension (every
-        dimension of every layer except batch `B` and group `G` — matching the exclusion convention already
-        used elsewhere, e.g. the fallback dimension pick in `TilingGenerationStage.get_fusion_partition_dim`),
-        plus a single combined per-layer "inter" gene choosing at most one of those dimensions to split
-        inter-core (see `TilingGene`'s docstring for why inter must stay single-dimension). Dimensions of
-        size <= 1 have nothing to tile and are excluded from both."""
-        genes: list[TilingGene] = []
-        for node in self.workload.node_list:
-            if not isinstance(node, ComputationNode):
-                continue
-            nb_cores = len(node.possible_core_allocation) or 1
-            relevant_dims = [
-                dim
-                for dim in node.layer_dim_sizes
-                if dim not in (LayerDim("B"), LayerDim("G")) and node.layer_dim_sizes[dim] > 1
-            ]
-            if not relevant_dims:
-                continue
-
-            for dim in relevant_dims:
-                size = node.layer_dim_sizes[dim]
-                intra_candidates: list[INTRA_CANDIDATE_T] = [1, *prime_divisors(size)]
-                if len(intra_candidates) > 1:
-                    genes.append(TilingGene(node_id=node.id, kind="intra", dim=dim, candidates=intra_candidates))
-
-            inter_candidates: list[INTER_CANDIDATE_T] = [None]
-            for dim in relevant_dims:
-                size = node.layer_dim_sizes[dim]
-                inter_candidates += [(dim, factor) for factor in prime_divisors(size) if factor <= nb_cores]
-            if len(inter_candidates) > 1:
-                genes.append(TilingGene(node_id=node.id, kind="inter", dim=None, candidates=inter_candidates))
-        return genes
+        return build_tiling_genes(self.workload)

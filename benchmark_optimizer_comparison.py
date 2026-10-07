@@ -1,12 +1,18 @@
 """Compare design-space optimizers on a common wall-clock budget instead of iteration counts.
 
 Methods:
-- `rolled`: the rolled schedule exploration of `example_rolled_schedule_exploration.py` (per-tile core NSGA2 ->
-  unrolled schedule branch-and-bound -> folding onto fewer cores), on the tpu_like_quad_core seed.
-- `graph_ga`: the evolving-graph GA (`GraphEvolutionStage`): NSGA2 over a variable-size core graph (core
-  designs, which layer groups share a core, which links exist).
+- `rolled`: the rolled methodology (`optimize_rolled_tiling`): a GA over intra-/inter-core tilings; each tiling
+  candidate gets its hardware graph from a per-tile core NSGA2 (stopping on front hypervolume convergence), an
+  unrolled schedule branch-and-bound over those cores, then rolling onto fewer cores. Each candidate runs under
+  `--candidate-time-cap`.
+- `graph_ga`: the two-step evolving-graph GA (`GraphEvolutionStage`): step 1 evolves an independent hardware graph
+  (core designs, explicit links) with the allocation onto it; step 2 freezes the best graphs and evolves the
+  mapping (tiling and allocation) on them.
 - `grid_2x2` / `grid_4x4`: the intra-/inter-core tiling GA (`TilingExplorationStage`) on a fixed homogeneous
   grid of tpu_like cores, ranked by EDP.
+
+`rolled` and `graph_ga` start from tpu_like_quad_core and its mapping only as a seed: the mapping's tiling is
+where their tiling search starts, and the hardware is replaced by the generated graphs.
 
 Workloads: `resnet` (ResNet-50 first bottleneck) and `attention` (QKV, multi-head attention, output projection
 and residual of an LLM layer).
@@ -54,9 +60,9 @@ def _export_workload(workload: str, path: str) -> str:
 
 
 def _run_rolled(workload_path, mapping, layer_stacks, out_root, experiment_id, budget, args):
-    from stream.api import optimize_rolled_schedules
+    from stream.api import optimize_rolled_tiling
 
-    return optimize_rolled_schedules(
+    return optimize_rolled_tiling(
         hardware=QUAD_CORE,
         workload=workload_path,
         mapping=mapping,
@@ -64,18 +70,16 @@ def _run_rolled(workload_path, mapping, layer_stacks, out_root, experiment_id, b
         layer_stacks=layer_stacks,
         experiment_id=experiment_id,
         output_path=out_root,
-        sort_key="latency",
+        search_budget=budget,
+        candidate_time_cap_s=args.candidate_time_cap or args.max_time / 6,
+        nb_tiling_ga_individuals=args.rolled_population,
         nb_core_ga_generations=NO_CAP,
         nb_core_ga_individuals=16,
-        core_pareto_points=10,
+        core_convergence_patience=args.core_patience,
+        core_rel_tol=args.rel_tol,
         core_max_workers=args.workers,
+        core_pareto_points=10,
         cacti_precompute_workers=args.workers,
-        max_schedule_evaluations=NO_CAP,
-        reuse_pareto_fronts=False,
-        fold_tolerances=(0.0, 0.25, 1.0),
-        fold_overlap="exact",
-        max_rolled_evaluations=NO_CAP,
-        search_budget=budget,
     )
 
 
@@ -94,6 +98,9 @@ def _run_graph_ga(workload_path, mapping, layer_stacks, out_root, experiment_id,
         max_workers=args.workers,
         cacti_precompute_workers=args.workers,
         search_budget=budget,
+        graph_step_fraction=args.graph_step_fraction,
+        step1_patience=args.step1_patience,
+        nb_frozen_graphs=args.frozen_graphs,
     )
 
 
@@ -190,6 +197,17 @@ def _launch(workload: str, method: str, args: argparse.Namespace) -> int:
         str(args.population),
         "--seed",
         str(args.seed),
+        "--rolled-population",
+        str(args.rolled_population),
+        "--core-patience",
+        str(args.core_patience),
+        "--graph-step-fraction",
+        str(args.graph_step_fraction),
+        "--step1-patience",
+        str(args.step1_patience),
+        "--frozen-graphs",
+        str(args.frozen_graphs),
+        *(["--candidate-time-cap", str(args.candidate_time_cap)] if args.candidate_time_cap else []),
         "--output-dir",
         args.output_dir,
     ]
@@ -209,6 +227,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rel-tol", type=float, default=0.005, help="Converged below this EDP gain per window.")
     parser.add_argument("--workers", type=int, default=8, help="Worker processes, the same for every method.")
     parser.add_argument("--population", type=int, default=16, help="GA population (graph_ga and grid tiling).")
+    parser.add_argument(
+        "--candidate-time-cap", type=float, default=None, help="rolled: seconds per tiling candidate (max-time/6)."
+    )
+    parser.add_argument("--rolled-population", type=int, default=4, help="rolled: tiling GA population.")
+    parser.add_argument("--core-patience", type=int, default=5, help="rolled: core GA hypervolume patience.")
+    parser.add_argument("--graph-step-fraction", type=float, default=0.5, help="graph_ga: max budget for step 1.")
+    parser.add_argument("--step1-patience", type=int, default=5, help="graph_ga: step 1 convergence patience.")
+    parser.add_argument("--frozen-graphs", type=int, default=4, help="graph_ga: graphs frozen for step 2.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--parallel-runs", type=int, default=1, help="Runs executed side by side.")
     parser.add_argument("--output-dir", default="outputs/optimizer_comparison")

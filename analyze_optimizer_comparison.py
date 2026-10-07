@@ -34,9 +34,20 @@ def read_trace(path: str) -> list[dict[str, float]]:
     with open(path) as f:
         rows = list(csv.DictReader(f))
     return [
-        {key: float(row[key]) for key in ("t", "n_eval", "latency", "energy", "area", "edp", "best_edp", "feasible")}
+        {
+            **{
+                key: float(row[key])
+                for key in ("t", "n_eval", "latency", "energy", "area", "edp", "best_edp", "feasible")
+            },
+            "info": row.get("info", ""),
+        }
         for row in rows
     ]
+
+
+def step2_start(trace: list[dict]) -> float | None:
+    """When a two-step graph_ga run moved from the hardware graph (step 1) to the mapping (step 2)."""
+    return next((row["t"] for row in trace if str(row["info"]).startswith("step2")), None)
 
 
 def pareto_points(trace: list[dict[str, float]]) -> list[tuple[float, float, float]]:
@@ -96,6 +107,12 @@ def plot_convergence(workload: str, methods: dict[str, dict], path: str) -> None
         color = COLORS.get(method)
         ax.step(times, values, where="post", label=method, color=color, linewidth=1.8)
         ax.plot(times[-1], values[-1], marker="o", color=color)
+        switch = step2_start(run["trace"])
+        if switch is not None:
+            ax.axvline(switch, color=color, linestyle=":", linewidth=1)
+            ax.annotate(
+                "step 2", (switch, values[0]), fontsize=7, color=color, xytext=(3, -10), textcoords="offset points"
+            )
         ax.annotate(
             run["summary"]["stop_reason"],
             (times[-1], values[-1]),
@@ -169,6 +186,7 @@ def main() -> None:
                     "best_energy": best.get("energy"),
                     "best_area": best.get("area"),
                     "pareto_points": len(run["front"]),
+                    "step2_start_s": step2_start(run["trace"]),
                     "hypervolume": round(hypervolumes[method], 4),
                     "error": summary.get("error"),
                 }

@@ -1,30 +1,37 @@
-"""Evolving-graph genetic search over the accelerator's core graph and the workload's allocation onto it.
+"""Evolving-graph genetic search: an independent hardware graph that evolves alongside the workload mapping, in
+two steps.
 
-The rolled schedule exploration builds an accelerator in fixed phases: one core design per tile (NSGA2), one
-schedule per design combination (branch and bound), then folding onto fewer cores. This stage searches the same
-space -- which cores exist, what each one is, which layer groups share a core, which links connect them -- in a
-single NSGA2 loop over *variable-size graphs*:
+A genome is a hardware graph plus a mapping onto it:
 
-- **nodes** are physical cores, each a real-valued `CoreGeneLayout` design;
-- **assignment** maps every core of the group-dedicated (fully unrolled) topology -- one per `(layer, inter-core
-  group)` -- onto a node. That is exactly the `merge_of_core` labelling `derive_rolled_topology` folds, so a
-  genome *is* a rolled accelerator: nodes sharing groups host them, traffic between them becomes free, and the
-  links between nodes are re-derived from the traffic;
-- **dropped links**: node pairs whose derived point-to-point link is removed (the transfer falls back to the
-  shared bus), so the search can trade link cost against bandwidth.
+- **nodes**: physical cores, each a real-valued `CoreGeneLayout` design;
+- **links**: an explicit set of point-to-point links between nodes. It is part of the genome, not derived from
+  the traffic, so the search decides the topology. A shared bus to the DRAM controller always exists, so a
+  missing link slows a transfer down rather than making it impossible;
+- **tiling**: the intra-/inter-core tiling genes of `TilingExplorationStage` (`build_tiling_genes`). The
+  all-zero vector keeps the mapping file's tiling, which is the seed;
+- **alloc**: for every layer, the node each of its inter-core groups runs on. Its length follows the layer's
+  inter-core factor, so it is resized whenever the tiling changes.
 
-Mutations change the graph's structure (move a group, split a node, merge two nodes, share a design) as well as
-its contents (perturb a design, toggle a link); crossover grafts the assignment of a random subset of layers
-from one parent onto the other. Fitness is `(latency, energy, area)`, measured with the real scheduler.
+The search runs in two steps:
 
-Every node design must map every tile shape of the workload (checked with the cheap
-`lowest_memory_level_violations` pre-check before any ZigZag run), so any design can host any group and the
-cost of a design is learned once: a new design is cost-modelled on all shapes with a uniform accelerator, the
-same way `RolledScheduleExplorationStage` fills its cost matrix.
+1. **Hardware graph.** The tiling stays at the seed; NSGA2 evolves the graph (add/remove/perturb/share a node
+   design, add/remove a link) together with the allocation onto it. Unused nodes are pruned. The step ends when
+   the best EDP gains less than `rel_tol` over `step1_patience` generations, or after `graph_step_fraction` of
+   the budget.
+2. **Mapping.** The `nb_frozen_graphs` best distinct graphs of the step-1 front are frozen (every node keeps
+   counting toward area); NSGA2 evolves the tiling and the allocation on them -- and which frozen graph a
+   mapping runs on -- until the budget stops.
+
+Fitness is `(latency, energy, area)`, measured with the real scheduler. Each tiling is generated once
+(`TilingGenerationStage` + `TiledWorkloadGenerationStage`) and cached; a design's cost on a tiling's shapes is
+learned once with a uniform accelerator, as `RolledScheduleExplorationStage` fills its cost matrix, and shared
+across tilings through global tile-shape ids. A design must map every shape of the genome's tiling (the cheap
+`lowest_memory_level_violations` pre-check), so any node can host any group.
 """
 
 import copy
 import csv
+import json
 import logging
 import math
 import multiprocessing
@@ -54,22 +61,37 @@ from stream.stages.generation.schedule_exploration import (
 )
 from stream.stages.generation.tiled_workload_accelerator_generation import (
     derive_group_dedicated_topology,
-    derive_rolled_topology,
     load_offchip_core_data,
 )
-from stream.stages.stage import StageCallable
+from stream.stages.generation.tiled_workload_generation import TiledWorkloadGenerationStage
+from stream.stages.generation.tiling_exploration import (
+    TilingGene,
+    _candidate_key,
+    _decode_individual,
+    _repair_tiling_constraints,
+    _respects_tiling_constraints,
+    build_tiling_genes,
+)
+from stream.stages.generation.tiling_generation import TilingGenerationStage
+from stream.stages.stage import MainStage, Stage, StageCallable
 from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
 
 INF3 = (math.inf, math.inf, math.inf)
+LINK_BANDWIDTH = 32  # as tpu_like_quad_core's point-to-point links
+BUS_BANDWIDTH = 128  # as tpu_like_quad_core's shared bus
 # Chance that a reassigned group opens a node of its own instead of joining an existing one.
 NEW_NODE_PROBABILITY = 0.2
+# Step-2 mutation: chance to move the mapping onto another frozen graph, and to mutate the tiling (else the
+# allocation).
+SWITCH_GRAPH_PROBABILITY = 0.1
+TILING_MUTATION_PROBABILITY = 0.5
 # Merge, share-design and link mutations act on a pair of nodes.
 PAIR = 2
 
 # The stage a forked worker process evaluates against. Set right before each pool is forked, so workers inherit
-# the current cost-model cache without pickling the stage (and its workload) per task.
+# the current caches and tiling contexts without pickling the stage per task.
 _WORKER_STAGE: "GraphEvolutionStage | None" = None
 
 
@@ -79,32 +101,59 @@ if not hasattr(creator, "GraphFitness"):
 
 @dataclass
 class GraphGenome:
-    designs: dict[int, list[float]]  # node label -> design gene vector
-    assign: dict[int, int]  # unrolled core id -> node label
-    dropped_links: set[frozenset[int]] = field(default_factory=set)  # node label pairs without a direct link
+    nodes: dict[int, list[float]]  # node label -> design gene vector
+    links: set[frozenset[int]]  # node label pairs joined by a point-to-point link
+    tiling: tuple[int, ...]  # tiling-gene indices (all zero = the mapping file's tiling)
+    alloc: dict[int, list[int]]  # layer id -> node label of each inter-core group
+    graph_id: int | None = None  # step 2: which frozen graph `nodes`/`links` are
     fitness: Any = field(default_factory=creator.GraphFitness)
 
     def prune(self) -> "GraphGenome":
-        """Drop nodes no group is assigned to, and link drops that no longer name two live nodes."""
-        used = set(self.assign.values())
-        self.designs = {label: values for label, values in self.designs.items() if label in used}
-        self.dropped_links = {pair for pair in self.dropped_links if pair <= used}
+        """Step 1 only: drop nodes no group runs on, and links to them."""
+        used = {label for labels in self.alloc.values() for label in labels}
+        self.nodes = {label: values for label, values in self.nodes.items() if label in used}
+        self.links = {pair for pair in self.links if pair <= used}
         return self
 
     def new_label(self) -> int:
-        return max(self.designs, default=-1) + 1
+        return max(self.nodes, default=-1) + 1
 
     @property
     def nb_cores(self) -> int:
-        return len(set(self.assign.values()))
+        return len(self.nodes)
 
 
-def _warm_up_worker(core_dict: dict[str, Any]) -> tuple[str, dict[tuple[int, str], Any] | None, float]:
+@dataclass
+class TilingContext:
+    """Everything that depends on the tiling only: the tiled workload, the matching ONNX workload, the
+    group-dedicated core ids (used only by the cost-model warm-up), every tile's global shape id and the number of
+    inter-core groups per layer."""
+
+    key: str
+    workload: Any
+    original_workload: Any
+    core_ids_of_node: dict[int, list[int]]
+    shape_class_of_tile: dict[tuple[int, int], int]
+    groups_per_layer: dict[int, int]
+    shapes: set[int]
+
+
+class _CaptureStage(Stage):
+    """Leaf that hands the tiled workload back instead of scheduling it."""
+
+    def is_leaf(self) -> bool:
+        return True
+
+    def run(self):
+        yield self.kwargs["workload"], self.kwargs["original_workload"]
+
+
+def _warm_up_worker(job: tuple[str, list[float]]) -> tuple[dict[tuple[int, str], Any] | None, float]:
     assert _WORKER_STAGE is not None
-    return _WORKER_STAGE._warm_up_design(core_dict)
+    return _WORKER_STAGE._warm_up_design(*job)
 
 
-def _measure_worker(genome: GraphGenome) -> tuple[float, float]:
+def _measure_worker(genome: "GraphGenome") -> tuple[float, float]:
     assert _WORKER_STAGE is not None
     try:
         scme = _WORKER_STAGE._measure_genome(genome)
@@ -115,8 +164,8 @@ def _measure_worker(genome: GraphGenome) -> tuple[float, float]:
 
 
 class GraphEvolutionStage(ScheduleExplorationStage):
-    """NSGA2 over variable-size core graphs; see the module docstring. Reuses `ScheduleExplorationStage` for
-    the cost-model cache, the cost-LUT assembly and the downstream measurement, but runs no per-tile core GA."""
+    """Two-step evolving-graph NSGA2; see the module docstring. Reuses `ScheduleExplorationStage` for the cost-model
+    harvest, the cost-LUT assembly and the downstream measurement, but runs no per-tile core GA."""
 
     def __init__(  # noqa: PLR0913
         self,
@@ -128,6 +177,9 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         graph_search_dir: str | None = None,
         crossover_probability: float = 0.7,
         design_sampling_attempts: int = 2000,
+        graph_step_fraction: float = 0.5,
+        step1_patience: int = 5,
+        nb_frozen_graphs: int = 4,
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
@@ -140,35 +192,102 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         )
         self.crossover_probability = crossover_probability
         self.design_sampling_attempts = design_sampling_attempts
+        self.graph_step_fraction = graph_step_fraction
+        self.step1_patience = step1_patience
+        self.nb_frozen_graphs = nb_frozen_graphs
         self.search_budget: SearchBudget | None = kwargs.get("search_budget")
 
     # ------------------------------------------------------------------------------------------ set-up -------
 
     def _prepare(self) -> None:
         os.makedirs(self.graph_search_dir, exist_ok=True)
-        self.unique_tiles, _ = self._unique_tiles()
-        reference = pickle_deepcopy(self.workload)
-        topology = derive_group_dedicated_topology(reference, self.original_workload)
-        self.core_ids_of_node: dict[int, list[int]] = topology.node_core_ids
-        self.unrolled_core_ids: list[int] = list(range(topology.offchip_core_id))
-        self.shape_class_of_tile = {
-            tile_key(tile): self._shape_class_of(tile)
-            for tile in reference.node_list
-            if isinstance(tile, ComputationNode)
-        }
+        # The untiled workload every tiling is re-derived from, and the tiling genes over it.
+        self.base_workload = pickle_deepcopy(self.original_workload)
+        self.tiling_genes: list[TilingGene] = build_tiling_genes(self.base_workload)
+        self.layers: list[int] = [node.id for node in self.base_workload.node_list if isinstance(node, ComputationNode)]
+        self.seed_tiling: tuple[int, ...] = (0,) * len(self.tiling_genes)
+
+        self.unique_tiles: list[ComputationNode] = []  # global shape registry, across every tiling
+        self.contexts: dict[str, TilingContext | None] = {}
         self.cme_cache: dict[tuple[int, str], Any] = {}
         self.runtime_cache: dict[tuple[int, str], float] = {}
         self.energy_cache: dict[tuple[int, str], float] = {}
         self.area_cache: dict[str, float] = {}
-        self.infeasible_designs: set[str] = set()
+        self.failed_cells: set[tuple[str, str]] = set()  # (tiling key, design key) whose warm-up failed
+        self.mappable: dict[tuple[str, str], bool] = {}
+        self.key_memo: dict[tuple[float, ...], str] = {}
         self.gene_layout = CoreGeneLayout(self.gene_ranges)
         self.fitness_of_key: dict[tuple, tuple[float, float, float]] = {}
-        self.key_memo: dict[tuple[float, ...], str] = {}
         self.evaluated: list[dict[str, Any]] = []
+        self.frozen_graphs: list[GraphGenome] = []
+        self.step = "step1"
+
+        seed = self._context(self.seed_tiling)
+        if seed is None:
+            raise ValueError("GraphEvolutionStage: the mapping file's tiling could not be generated.")
         logger.info(
-            f"GraphEvolutionStage: {len(self.unrolled_core_ids)} unrolled core(s) over {len(self.core_ids_of_node)} "
-            f"layer(s), {len(self.unique_tiles)} tile shape(s)."
+            f"GraphEvolutionStage: {len(self.layers)} layer(s), {len(self.tiling_genes)} tiling gene(s), seed "
+            f"tiling has {sum(seed.groups_per_layer.values())} group(s) over {len(seed.shapes)} tile shape(s)."
         )
+
+    def _global_shape_id(self, tile: ComputationNode) -> int:
+        for index, unique in enumerate(self.unique_tiles):
+            if tile.has_same_performance(unique):
+                return index
+        self.unique_tiles.append(tile)
+        return len(self.unique_tiles) - 1
+
+    def _context(self, tiling: tuple[int, ...]) -> TilingContext | None:
+        """The tiled workload of a tiling, generated once and cached (None if the tiling cannot be generated)."""
+        key = _candidate_key(tiling)
+        if key in self.contexts:
+            return self.contexts[key]
+        workload = pickle_deepcopy(self.base_workload)
+        per_node = _decode_individual(tiling, self.tiling_genes)
+        for node in workload.node_list:
+            if isinstance(node, ComputationNode) and node.id in per_node:
+                node.intra_core_tiling = per_node[node.id]["intra_core_tiling"]
+                node.inter_core_tiling = per_node[node.id]["inter_core_tiling"]
+        kwargs = self.kwargs.copy()
+        kwargs.update(
+            workload=workload,
+            accelerator=self.accelerator,
+            tiled_workload_path=os.path.join(self.graph_search_dir, "tilings", key, "tiled_workload.pickle"),
+        )
+        os.makedirs(os.path.dirname(kwargs["tiled_workload_path"]), exist_ok=True)
+        try:
+            tiled, original = MainStage(
+                [TilingGenerationStage, TiledWorkloadGenerationStage, _CaptureStage], **kwargs
+            ).run()[0]
+            reference = pickle_deepcopy(tiled)
+            topology = derive_group_dedicated_topology(reference, original)
+        except Exception:
+            logger.warning(f"GraphEvolutionStage: tiling {key} could not be generated.", exc_info=True)
+            self.contexts[key] = None
+            return None
+        shape_class_of_tile = {
+            tile_key(tile): self._global_shape_id(tile)
+            for tile in reference.node_list
+            if isinstance(tile, ComputationNode)
+        }
+        context = TilingContext(
+            key=key,
+            workload=tiled,
+            original_workload=original,
+            core_ids_of_node=topology.node_core_ids,
+            shape_class_of_tile=shape_class_of_tile,
+            groups_per_layer={layer: len(cores) for layer, cores in topology.node_core_ids.items()},
+            shapes=set(shape_class_of_tile.values()),
+        )
+        self.contexts[key] = context
+        return context
+
+    def _use(self, context: TilingContext) -> None:
+        """Point the inherited helpers (`_build_accelerator`, `_harvest_cmes`, `_assemble_cost_lut`) at a tiling."""
+        self.workload = context.workload
+        self.original_workload = context.original_workload
+        self.core_ids_of_node = context.core_ids_of_node
+        self.shape_class_of_tile = context.shape_class_of_tile
 
     # ------------------------------------------------------------------------------------- designs -------------
 
@@ -178,40 +297,6 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         except ValueError:
             return None
 
-    def _maps_every_shape(self, values: list[float]) -> bool:
-        """Cheap pre-check that a design can host any group: its innermost memories fit every tile shape."""
-        core_dict = self._decode(values)
-        if core_dict is None:
-            return False
-        try:
-            core = build_core_from_dict(core_dict, core_id=0)
-        except Exception:
-            return False
-        return not any(lowest_memory_level_violations(tile, core) for tile in self.unique_tiles)
-
-    def _random_design(self) -> list[float]:
-        for _ in range(self.design_sampling_attempts):
-            values = [
-                random.uniform(lo, hi) for lo, hi in zip(self.gene_layout.low, self.gene_layout.high, strict=True)
-            ]
-            if self._maps_every_shape(values):
-                return values
-        raise ValueError(
-            f"GraphEvolutionStage: no design in {self.design_sampling_attempts} random sample(s) maps every tile "
-            "shape; widen `core_param_ranges`."
-        )
-
-    def _perturbed(self, values: list[float], attempts: int = 5) -> list[float]:
-        """Polynomial-bounded mutation, retried until the design still maps every shape (else unchanged)."""
-        n_genes = len(values)
-        for _ in range(attempts):
-            (candidate,) = tools.mutPolynomialBounded(
-                list(values), eta=20.0, low=self.gene_layout.low, up=self.gene_layout.high, indpb=max(1 / n_genes, 0.1)
-            )
-            if self._maps_every_shape(candidate):
-                return list(candidate)
-        return list(values)
-
     def _key_of(self, values: list[float]) -> str:
         """Content key of the core a gene vector decodes to (memoized: canonical keys ask for it constantly)."""
         memo_key = tuple(values)
@@ -220,13 +305,58 @@ class GraphEvolutionStage(ScheduleExplorationStage):
             self.key_memo[memo_key] = "invalid" if core_dict is None else core_dict_key(core_dict)
         return self.key_memo[memo_key]
 
-    def _warm_up_design(self, core_dict: dict[str, Any]) -> tuple[str, dict[tuple[int, str], Any] | None, float]:
-        """Cost-model every tile shape on one design, with a uniform accelerator (every layer on that design):
-        ZigZag then runs once per shape. Returns `(design key, {(shape, key): cme}, area)`, with `None` cells
-        when the design fails to map some shape after all."""
+    def _maps(self, values: list[float], context: TilingContext) -> bool:
+        """Cheap pre-check that a design can host any group of a tiling: its innermost memories fit every shape."""
+        cache_key = (context.key, self._key_of(values))
+        if cache_key not in self.mappable:
+            core_dict = self._decode(values)
+            ok = core_dict is not None
+            if ok:
+                try:
+                    core = build_core_from_dict(core_dict, core_id=0)
+                    ok = not any(
+                        lowest_memory_level_violations(self.unique_tiles[shape], core) for shape in context.shapes
+                    )
+                except Exception:
+                    ok = False
+            self.mappable[cache_key] = ok
+        return self.mappable[cache_key]
+
+    def _random_design(self, context: TilingContext) -> list[float]:
+        for _ in range(self.design_sampling_attempts):
+            values = [
+                random.uniform(lo, hi) for lo, hi in zip(self.gene_layout.low, self.gene_layout.high, strict=True)
+            ]
+            if self._maps(values, context):
+                return values
+        raise ValueError(
+            f"GraphEvolutionStage: no design in {self.design_sampling_attempts} random sample(s) maps every tile "
+            "shape; widen `core_param_ranges`."
+        )
+
+    def _perturbed(self, values: list[float], attempts: int = 5) -> list[float]:
+        """Polynomial-bounded mutation, retried until the design still maps the seed tiling (else unchanged)."""
+        context = self.contexts[_candidate_key(self.seed_tiling)]
+        assert context is not None
+        n_genes = len(values)
+        for _ in range(attempts):
+            (candidate,) = tools.mutPolynomialBounded(
+                list(values), eta=20.0, low=self.gene_layout.low, up=self.gene_layout.high, indpb=max(1 / n_genes, 0.1)
+            )
+            if self._maps(candidate, context):
+                return list(candidate)
+        return list(values)
+
+    def _warm_up_design(self, context_key: str, design_values: list[float]):
+        """Cost-model every tile shape of one tiling on one design, with a uniform accelerator (every layer on that
+        design): ZigZag then runs once per shape. Returns `({(shape, design key): cme}, area)`, or `(None, inf)`."""
+        context = self.contexts[context_key]
+        assert context is not None
+        self._use(context)
+        core_dict = self._decode(design_values)
         design_key = core_dict_key(core_dict)
-        workload = pickle_deepcopy(self.workload)
-        node_core_dicts = dict.fromkeys(self.core_ids_of_node, core_dict)
+        workload = pickle_deepcopy(context.workload)
+        node_core_dicts = dict.fromkeys(context.core_ids_of_node, core_dict)
         lut_path = os.path.join(self.graph_search_dir, f"cost_lut_{design_key}_{os.getpid()}.pickle")
         try:
             accelerator = self._build_accelerator(node_core_dicts, workload)
@@ -242,101 +372,136 @@ class GraphEvolutionStage(ScheduleExplorationStage):
             estimation.update_cost_lut()
             self.cme_cache, self.runtime_cache, self.energy_cache, self.area_cache = {}, {}, {}, {}
             self._harvest_cmes(estimation.cost_lut, workload, accelerator, self._design_key_of_core(node_core_dicts))
-            return design_key, dict(self.cme_cache), self.area_cache.get(design_key, math.inf)
+            return dict(self.cme_cache), self.area_cache.get(design_key, math.inf)
         except Exception:
             logger.warning(f"GraphEvolutionStage: design {design_key} failed its cost-model warm-up.", exc_info=True)
-            return design_key, None, math.inf
+            return None, math.inf
         finally:
             if os.path.exists(lut_path):
                 os.remove(lut_path)
 
-    def _warm_up_designs(self, genomes: list[GraphGenome]) -> None:
-        """Cost-model, in parallel, every design these genomes use that the cache has not seen yet."""
-        pending: dict[str, dict[str, Any]] = {}
+    def _missing_cells(self, context: TilingContext, design_key: str) -> bool:
+        return any((shape, design_key) not in self.cme_cache for shape in context.shapes)
+
+    def _warm_up(self, genomes: list[GraphGenome]) -> None:
+        """Cost-model, in parallel, every (tiling, design) pair these genomes need that the cache cannot cover."""
+        jobs: dict[tuple[str, str], tuple[str, list[float]]] = {}
         for genome in genomes:
-            for values in genome.designs.values():
-                core_dict = self._decode(values)
-                if core_dict is None:
-                    continue
-                key = core_dict_key(core_dict)
-                if key not in self.area_cache and key not in self.infeasible_designs:
-                    pending[key] = core_dict
-        if not pending:
-            return
-        logger.info(f"GraphEvolutionStage: cost-modelling {len(pending)} new design(s).")
-        results = self._parallel(_warm_up_worker, list(pending.values()), fallback=(None, None, math.inf))
-        for (key, cells, area), expected_key in zip(results, pending, strict=True):
-            if cells is None or key is None:
-                self.infeasible_designs.add(expected_key)
+            context = self._context(genome.tiling)
+            if context is None:
                 continue
-            shapes = {shape for shape in self.shape_class_of_tile.values()}
-            if {shape for shape, _ in cells} != shapes:
-                self.infeasible_designs.add(key)
+            for values in genome.nodes.values():
+                design_key = self._key_of(values)
+                pair = (context.key, design_key)
+                if (
+                    pair not in jobs
+                    and pair not in self.failed_cells
+                    and self._maps(values, context)
+                    and self._missing_cells(context, design_key)
+                ):
+                    jobs[pair] = (context.key, values)
+        if not jobs:
+            return
+        logger.info(f"GraphEvolutionStage: cost-modelling {len(jobs)} new (tiling, design) pair(s).")
+        results = self._parallel(_warm_up_worker, list(jobs.values()), fallback=(None, math.inf))
+        for pair, (cells, area) in zip(jobs, results, strict=True):
+            if cells is None:
+                self.failed_cells.add(pair)
                 continue
             for cell_key, cme in cells.items():
                 self.cme_cache[cell_key] = cme
                 self.runtime_cache[cell_key] = float(getattr(cme, self.latency_attr))
                 self.energy_cache[cell_key] = float(cme.energy_total)
-            self.area_cache[key] = area
+            self.area_cache[pair[1]] = area
 
     # ------------------------------------------------------------------------------------ measuring ----------
 
     def _assemble(self, genome: GraphGenome, workload: Any, yaml_path: str | None = None):
-        """Fold the unrolled topology by the genome's assignment, give each node its design, drop its links."""
-        topology = derive_rolled_topology(workload, self.original_workload, genome.assign)
-        label_of_core = {
-            rolled_id: genome.assign[members[0]] for rolled_id, members in topology.members_of_core.items()
+        """Build the genome's accelerator (nodes renumbered densely, offchip last, its own links plus the bus) and
+        pin every tile of `workload` to the node its group is allocated to."""
+        core_of_label = {label: index for index, label in enumerate(sorted(genome.nodes))}
+        offchip = len(core_of_label)
+        cores: dict[int, Any] = {
+            core_of_label[label]: self._decode(values, name=f"graph_core_{label}")
+            for label, values in sorted(genome.nodes.items())
         }
-        core_dicts = {
-            rolled_id: self._decode(genome.designs[label], name=f"graph_core_{label}")
-            for rolled_id, label in label_of_core.items()
-        }
-        cores: dict[int, Any] = {rolled_id: core_dicts[rolled_id] for rolled_id in range(topology.offchip_core_id)}
-        cores[topology.offchip_core_id] = load_offchip_core_data()
+        cores[offchip] = load_offchip_core_data()
         links = [
-            link
-            for link in topology.link_connections
-            if frozenset(label_of_core[core] for core in link["cores"]) not in genome.dropped_links
+            {"type": "link", "cores": sorted(core_of_label[label] for label in pair), "bandwidth": LINK_BANDWIDTH}
+            for pair in sorted(genome.links, key=sorted)
         ]
         accelerator_data = {
             "name": f"{self.accelerator.name}_graph",
             "cores": cores,
-            "offchip_core_id": topology.offchip_core_id,
+            "offchip_core_id": offchip,
             "unit_energy_cost": 0,
             "core_memory_sharing": [],
-            "core_connectivity": [topology.bus_connection, *links],
+            "core_connectivity": [
+                {"type": "bus", "cores": list(range(offchip + 1)), "bandwidth": BUS_BANDWIDTH},
+                *links,
+            ],
         }
         if yaml_path:
             with open(yaml_path, "w") as f:
                 yaml.safe_dump(accelerator_data, f, sort_keys=False)
-        design_key_of_core = {rolled_id: core_dict_key(core_dict) for rolled_id, core_dict in core_dicts.items()}
+        for tile in workload.node_list:
+            if isinstance(tile, ComputationNode):
+                core_ids = [core_of_label[label] for label in genome.alloc[tile.id]]
+                tile.possible_core_allocation = core_ids
+                tile.set_chosen_core_allocation(core_ids[tile.group])
+        design_key_of_core = {core: core_dict_key(core_dict) for core, core_dict in cores.items() if core != offchip}
         return AcceleratorFactory(accelerator_data).create(), design_key_of_core
 
     def _measure_genome(self, genome: GraphGenome, save_yaml: bool = False):
-        workload = pickle_deepcopy(self.workload)
+        context = self._context(genome.tiling)
+        assert context is not None
+        self._use(context)
+        workload = pickle_deepcopy(context.workload)
         yaml_path = os.path.join(self.graph_search_dir, "accelerator.yaml") if save_yaml else None
         accelerator, design_key_of_core = self._assemble(genome, workload, yaml_path)
         cost_lut = self._assemble_cost_lut(workload, accelerator, design_key_of_core)
         return self._measure_accelerator(workload, accelerator, cost_lut)
 
     def _area(self, genome: GraphGenome) -> float:
-        return sum(self.area_cache[self._key_of(values)] for values in genome.designs.values())
+        return sum(self.area_cache[self._key_of(values)] for values in genome.nodes.values())
 
     def _is_feasible(self, genome: GraphGenome) -> bool:
+        context = self._context(genome.tiling)
+        if context is None:
+            return False
+        if genome.tiling != self.seed_tiling and not _respects_tiling_constraints(
+            list(genome.tiling), self.tiling_genes
+        ):
+            return False
+        if any(len(genome.alloc.get(layer, [])) != groups for layer, groups in context.groups_per_layer.items()):
+            return False
         return all(
-            (key := self._key_of(values)) in self.area_cache and key not in self.infeasible_designs
-            for values in genome.designs.values()
+            self._maps(values, context) and not self._missing_cells(context, self._key_of(values))
+            for values in genome.nodes.values()
         )
 
     def _canonical_key(self, genome: GraphGenome) -> tuple:
-        """Identity of the accelerator a genome describes, independent of how its labels are numbered."""
+        """Identity of the accelerator and mapping a genome describes, independent of its label numbering."""
         relabel: dict[int, int] = {}
-        for core in self.unrolled_core_ids:
-            relabel.setdefault(genome.assign[core], len(relabel))
+        for layer in self.layers:
+            for label in genome.alloc.get(layer, []):
+                relabel.setdefault(label, len(relabel))
+        for label in sorted(genome.nodes, key=lambda label: self._key_of(genome.nodes[label])):
+            relabel.setdefault(label, len(relabel))
         return (
-            tuple(relabel[genome.assign[core]] for core in self.unrolled_core_ids),
-            tuple(self._key_of(genome.designs[label]) for label in sorted(relabel, key=relabel.get)),
-            tuple(sorted(tuple(sorted(relabel[label] for label in pair)) for pair in genome.dropped_links)),
+            genome.tiling,
+            tuple(tuple(relabel[label] for label in genome.alloc.get(layer, [])) for layer in self.layers),
+            tuple(self._key_of(genome.nodes[label]) for label in sorted(relabel, key=relabel.get)),
+            tuple(sorted(tuple(sorted(relabel[label] for label in pair)) for pair in genome.links)),
+        )
+
+    def _graph_key(self, genome: GraphGenome) -> tuple:
+        """Identity of the hardware alone (nodes and links), for picking distinct graphs to freeze."""
+        order = sorted(genome.nodes, key=lambda label: self._key_of(genome.nodes[label]))
+        index = {label: position for position, label in enumerate(order)}
+        return (
+            tuple(self._key_of(genome.nodes[label]) for label in order),
+            tuple(sorted(tuple(sorted(index[label] for label in pair)) for pair in genome.links)),
         )
 
     def _parallel(self, func, items: list[Any], fallback: Any, on_result=None) -> list[Any]:
@@ -347,8 +512,9 @@ class GraphEvolutionStage(ScheduleExplorationStage):
             return map_until_deadline(executor, func, items, self.search_budget, fallback, on_result=on_result)
 
     def _evaluate(self, genomes: list[GraphGenome]) -> None:
-        """Set every genome's fitness: warm up new designs, then schedule each new graph once (cached by key)."""
-        self._warm_up_designs(genomes)
+        """Set every genome's fitness: generate new tilings, warm up new (tiling, design) pairs, then schedule each
+        new genome once (cached by canonical key)."""
+        self._warm_up(genomes)
         to_measure: dict[tuple, GraphGenome] = {}
         for genome in genomes:
             key = self._canonical_key(genome)
@@ -365,11 +531,20 @@ class GraphEvolutionStage(ScheduleExplorationStage):
             genome = to_measure[keys[index]]
             area = self._area(genome)
             latency, energy = result
-            fitness = (latency, energy, area) if math.isfinite(latency) else INF3
-            self.fitness_of_key[keys[index]] = fitness
-            self.evaluated.append({"nb_cores": genome.nb_cores, "latency": latency, "energy": energy, "area": area})
+            self.fitness_of_key[keys[index]] = (latency, energy, area) if math.isfinite(latency) else INF3
+            self.evaluated.append(
+                {
+                    "step": self.step,
+                    "nb_cores": genome.nb_cores,
+                    "nb_links": len(genome.links),
+                    "tiling": _candidate_key(genome.tiling),
+                    "latency": latency,
+                    "energy": energy,
+                    "area": area,
+                }
+            )
             if budget is not None:
-                budget.record(latency, energy, area, info=f"graph cores={genome.nb_cores}")
+                budget.record(latency, energy, area, info=f"{self.step} cores={genome.nb_cores}")
 
         if keys:
             self._parallel(
@@ -378,27 +553,38 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         for genome in genomes:
             genome.fitness.values = self.fitness_of_key.get(self._canonical_key(genome), INF3)
 
-    # ------------------------------------------------------------------------------------ operators ----------
+    # ------------------------------------------------------------------------------ step 1: graph -------------
 
-    def _random_genome(self, design_pool: list[list[float]]) -> GraphGenome:
-        """Spread the initial population over core counts: fully unrolled, a single shared core, and random
-        partitions in between."""
-        n_unrolled = len(self.unrolled_core_ids)
-        nb_nodes = random.choice([n_unrolled, 1, random.randint(1, n_unrolled)])
-        assign = {
-            core: (core if nb_nodes == n_unrolled else random.randrange(nb_nodes)) for core in self.unrolled_core_ids
+    def _random_graph(self, design_pool: list[list[float]], context: TilingContext) -> GraphGenome:
+        """Spread the initial population over node counts (one per group, a single node, and in between) and over
+        topologies (no links, a ring, random links)."""
+        nb_groups = sum(context.groups_per_layer.values())
+        nb_nodes = random.choice([nb_groups, 1, random.randint(1, nb_groups)])
+        alloc = {
+            layer: [random.randrange(nb_nodes) for _ in range(groups)]
+            for layer, groups in context.groups_per_layer.items()
         }
-        designs = {label: list(random.choice(design_pool)) for label in set(assign.values())}
-        return GraphGenome(designs=designs, assign=assign).prune()
+        nodes = {label: list(random.choice(design_pool)) for label in range(nb_nodes)}
+        topology = random.choice(("none", "ring", "random"))
+        links: set[frozenset[int]] = set()
+        if nb_nodes >= PAIR and topology == "ring":
+            links = {frozenset((label, (label + 1) % nb_nodes)) for label in range(nb_nodes)}
+        elif nb_nodes >= PAIR and topology == "random":
+            links = {frozenset(random.sample(range(nb_nodes), PAIR)) for _ in range(nb_nodes)}
+        return GraphGenome(nodes=nodes, links=links, tiling=self.seed_tiling, alloc=alloc).prune()
 
-    def _mutate(self, genome: GraphGenome) -> GraphGenome:
+    def _groups(self, genome: GraphGenome) -> list[tuple[int, int]]:
+        return [(layer, group) for layer, labels in genome.alloc.items() for group in range(len(labels))]
+
+    def _mutate_graph(self, genome: GraphGenome) -> GraphGenome:
         operators = [
             self._mut_reassign,
             self._mut_split,
             self._mut_merge,
             self._mut_design,
             self._mut_share_design,
-            self._mut_toggle_link,
+            self._mut_add_link,
+            self._mut_remove_link,
         ]
         for _ in range(random.choice((1, 1, 2))):
             random.choice(operators)(genome)
@@ -406,138 +592,291 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         return genome
 
     def _mut_reassign(self, genome: GraphGenome) -> None:
-        core = random.choice(self.unrolled_core_ids)
+        layer, group = random.choice(self._groups(genome))
         if random.random() < NEW_NODE_PROBABILITY:
             label = genome.new_label()
-            genome.designs[label] = self._perturbed(genome.designs[genome.assign[core]])
+            genome.nodes[label] = self._perturbed(genome.nodes[genome.alloc[layer][group]])
         else:
-            label = random.choice(list(genome.designs))
-        genome.assign[core] = label
+            label = random.choice(list(genome.nodes))
+        genome.alloc[layer][group] = label
 
     def _mut_split(self, genome: GraphGenome) -> None:
-        members: dict[int, list[int]] = {}
-        for core, label in genome.assign.items():
-            members.setdefault(label, []).append(core)
-        splittable = [label for label, cores in members.items() if len(cores) > 1]
+        """Add a node: move some of a busy node's groups onto a perturbed copy of it."""
+        members: dict[int, list[tuple[int, int]]] = {}
+        for layer, group in self._groups(genome):
+            members.setdefault(genome.alloc[layer][group], []).append((layer, group))
+        splittable = [label for label, groups in members.items() if len(groups) > 1]
         if not splittable:
             return
         label = random.choice(splittable)
-        moved = random.sample(members[label], k=random.randint(1, len(members[label]) - 1))
         new = genome.new_label()
-        genome.designs[new] = self._perturbed(genome.designs[label])
-        for core in moved:
-            genome.assign[core] = new
+        genome.nodes[new] = self._perturbed(genome.nodes[label])
+        for layer, group in random.sample(members[label], k=random.randint(1, len(members[label]) - 1)):
+            genome.alloc[layer][group] = new
 
     def _mut_merge(self, genome: GraphGenome) -> None:
-        if len(genome.designs) < PAIR:
+        """Remove a node: its groups move onto another one."""
+        if len(genome.nodes) < PAIR:
             return
-        keep, drop = random.sample(list(genome.designs), PAIR)
-        for core, label in genome.assign.items():
-            if label == drop:
-                genome.assign[core] = keep
+        keep, drop = random.sample(list(genome.nodes), PAIR)
+        for labels in genome.alloc.values():
+            labels[:] = [keep if label == drop else label for label in labels]
 
     def _mut_design(self, genome: GraphGenome) -> None:
-        label = random.choice(list(genome.designs))
-        genome.designs[label] = self._perturbed(genome.designs[label])
+        label = random.choice(list(genome.nodes))
+        genome.nodes[label] = self._perturbed(genome.nodes[label])
 
     def _mut_share_design(self, genome: GraphGenome) -> None:
-        if len(genome.designs) < PAIR:
+        if len(genome.nodes) < PAIR:
             return
-        source, target = random.sample(list(genome.designs), PAIR)
-        genome.designs[target] = list(genome.designs[source])
+        source, target = random.sample(list(genome.nodes), PAIR)
+        genome.nodes[target] = list(genome.nodes[source])
 
-    def _mut_toggle_link(self, genome: GraphGenome) -> None:
-        if len(genome.designs) < PAIR:
+    def _mut_add_link(self, genome: GraphGenome) -> None:
+        if len(genome.nodes) < PAIR:
             return
-        pair = frozenset(random.sample(list(genome.designs), PAIR))
-        genome.dropped_links ^= {pair}
+        genome.links.add(frozenset(random.sample(list(genome.nodes), PAIR)))
 
-    def _crossover(self, first: GraphGenome, second: GraphGenome) -> tuple[GraphGenome, GraphGenome]:
-        """Graft the assignment of a random subset of layers (with the nodes and designs hosting them) from one
-        parent onto the other, in both directions."""
-        layers = list(self.core_ids_of_node)
-        graft = set(random.sample(layers, k=random.randint(1, max(1, len(layers) // 2))))
-        return self._graft(first, second, graft), self._graft(second, first, graft)
+    def _mut_remove_link(self, genome: GraphGenome) -> None:
+        if genome.links:
+            genome.links.discard(random.choice(sorted(genome.links, key=sorted)))
+
+    def _crossover_graph(self, first: GraphGenome, second: GraphGenome) -> tuple[GraphGenome, GraphGenome]:
+        """Graft the allocation of a random half of the layers -- with the nodes hosting them and the links among
+        those nodes -- from one parent onto the other, in both directions."""
+        layers = set(random.sample(self.layers, k=max(1, len(self.layers) // 2)))
+        return self._graft(first, second, layers), self._graft(second, first, layers)
 
     def _graft(self, receiver: GraphGenome, donor: GraphGenome, layers: set[int]) -> GraphGenome:
         child = GraphGenome(
-            designs={label: list(values) for label, values in receiver.designs.items()},
-            assign=dict(receiver.assign),
-            dropped_links=set(receiver.dropped_links),
+            nodes={label: list(values) for label, values in receiver.nodes.items()},
+            links=set(receiver.links),
+            tiling=receiver.tiling,
+            alloc={layer: list(labels) for layer, labels in receiver.alloc.items()},
         )
         offset = child.new_label()
+        grafted: set[int] = set()
         for layer in layers:
-            for core in self.core_ids_of_node[layer]:
-                donor_label = donor.assign[core]
-                child.assign[core] = offset + donor_label
-                child.designs[offset + donor_label] = list(donor.designs[donor_label])
+            child.alloc[layer] = [offset + label for label in donor.alloc[layer]]
+            grafted.update(donor.alloc[layer])
+        for label in grafted:
+            child.nodes[offset + label] = list(donor.nodes[label])
+        child.links |= {frozenset(offset + label for label in pair) for pair in donor.links if pair <= grafted}
         return child.prune()
+
+    # ---------------------------------------------------------------------------- step 2: mapping -------------
+
+    def _on_graph(self, graph_id: int, tiling: tuple[int, ...], alloc: dict[int, list[int]]) -> GraphGenome:
+        graph = self.frozen_graphs[graph_id]
+        genome = GraphGenome(nodes=graph.nodes, links=graph.links, tiling=tiling, alloc=alloc, graph_id=graph_id)
+        self._fit_alloc(genome)
+        return genome
+
+    def _fit_alloc(self, genome: GraphGenome) -> None:
+        """Resize every layer's allocation to its group count under the genome's tiling, and keep its labels on the
+        genome's graph."""
+        context = self._context(genome.tiling)
+        if context is None:
+            return
+        labels = sorted(genome.nodes)
+        for layer, groups in context.groups_per_layer.items():
+            current = [
+                label if label in genome.nodes else labels[label % len(labels)] for label in genome.alloc.get(layer, [])
+            ]
+            genome.alloc[layer] = (current + [random.choice(labels) for _ in range(groups)])[:groups]
+
+    def _mutate_mapping(self, genome: GraphGenome) -> GraphGenome:
+        if len(self.frozen_graphs) > 1 and random.random() < SWITCH_GRAPH_PROBABILITY:
+            graph_id = random.choice([g for g in range(len(self.frozen_graphs)) if g != genome.graph_id])
+            genome = self._on_graph(graph_id, genome.tiling, genome.alloc)
+        if self.tiling_genes and random.random() < TILING_MUTATION_PROBABILITY:
+            tiling = list(genome.tiling)
+            for index, gene in enumerate(self.tiling_genes):
+                if random.random() < 1 / len(tiling):
+                    replacements = [v for v in range(len(gene.candidates)) if v != tiling[index]]
+                    if replacements:
+                        tiling[index] = random.choice(replacements)
+            genome.tiling = tuple(_repair_tiling_constraints(tiling, self.tiling_genes))
+        else:
+            layer, group = random.choice(self._groups(genome))
+            genome.alloc[layer][group] = random.choice(sorted(genome.nodes))
+        self._fit_alloc(genome)
+        return genome
+
+    def _crossover_mapping(self, first: GraphGenome, second: GraphGenome) -> tuple[GraphGenome, GraphGenome]:
+        """Two-point crossover on the tiling plus a per-layer allocation swap, between mappings on one graph."""
+        if first.graph_id != second.graph_id:
+            return first, second
+        tiling_1, tiling_2 = list(first.tiling), list(second.tiling)
+        if len(tiling_1) >= PAIR:
+            tools.cxTwoPoint(tiling_1, tiling_2)
+        first.tiling = tuple(_repair_tiling_constraints(tiling_1, self.tiling_genes))
+        second.tiling = tuple(_repair_tiling_constraints(tiling_2, self.tiling_genes))
+        for layer in random.sample(self.layers, k=max(1, len(self.layers) // 2)):
+            first.alloc[layer], second.alloc[layer] = second.alloc.get(layer, []), first.alloc.get(layer, [])
+        self._fit_alloc(first)
+        self._fit_alloc(second)
+        return first, second
+
+    def _freeze(self, front: list[GraphGenome]) -> None:
+        """Keep the best distinct graphs of the step-1 front: lowest EDP first."""
+        self.frozen_graphs = []
+        seen: set[tuple] = set()
+        for genome in sorted(front, key=lambda g: g.fitness.values[0] * g.fitness.values[1]):
+            key = self._graph_key(genome)
+            if key in seen:
+                continue
+            seen.add(key)
+            self.frozen_graphs.append(copy.deepcopy(genome))
+            if len(self.frozen_graphs) == self.nb_frozen_graphs:
+                break
+        with open(os.path.join(self.graph_search_dir, "frozen_graphs.json"), "w") as f:
+            json.dump(
+                [
+                    {
+                        "graph_id": index,
+                        "nb_cores": graph.nb_cores,
+                        "links": sorted(sorted(pair) for pair in graph.links),
+                        "design_keys": {label: self._key_of(values) for label, values in graph.nodes.items()},
+                        "step1_fitness": list(graph.fitness.values),
+                    }
+                    for index, graph in enumerate(self.frozen_graphs)
+                ],
+                f,
+                indent=2,
+            )
+        logger.info(
+            f"GraphEvolutionStage: froze {len(self.frozen_graphs)} graph(s) with "
+            f"{[graph.nb_cores for graph in self.frozen_graphs]} core(s)."
+        )
 
     # ------------------------------------------------------------------------------------------ loop ---------
 
-    def _should_stop(self, generation: int) -> bool:
+    def _clone(self, genome: GraphGenome) -> GraphGenome:
+        """Copy the mapping; step-2 genomes keep sharing their frozen graph's nodes and links."""
+        frozen = genome.graph_id is not None
+        return GraphGenome(
+            nodes=genome.nodes if frozen else copy.deepcopy(genome.nodes),
+            links=genome.links if frozen else set(genome.links),
+            tiling=genome.tiling,
+            alloc={layer: list(labels) for layer, labels in genome.alloc.items()},
+            graph_id=genome.graph_id,
+        )
+
+    def _generation(self, population, mutate, crossover) -> tuple[list[GraphGenome], list[GraphGenome]]:
+        mu = self.population_size
+        offspring = [self._clone(genome) for genome in tools.selTournamentDCD(population, mu)]
+        children: list[GraphGenome] = []
+        for parent_1, parent_2 in zip(offspring[::2], offspring[1::2], strict=True):
+            pair = (
+                crossover(parent_1, parent_2) if random.random() < self.crossover_probability else (parent_1, parent_2)
+            )
+            children += [mutate(child) for child in pair]
+        self._evaluate(children)
+        return tools.selNSGA2(population + children, mu), children
+
+    def _budget_stops(self, generation: int) -> bool:
         if self.search_budget is not None:
             return self.search_budget.should_stop()
         return generation >= self.graph_ga_generations
 
-    def _clone(self, genome: GraphGenome) -> GraphGenome:
-        clone = copy.deepcopy(genome)
-        del clone.fitness.values
-        return clone
+    def _step1_done(self, generation: int, best_edps: list[float]) -> bool:
+        if self._budget_stops(generation):
+            return True
+        budget = self.search_budget
+        if budget is not None and budget.elapsed() >= self.graph_step_fraction * budget.max_time_s:
+            logger.info("GraphEvolutionStage: step 1 used its share of the budget.")
+            return True
+        if budget is None and generation >= self.graph_ga_generations // 2:
+            return True
+        rel_tol = budget.rel_tol if budget is not None else 0.005
+        if len(best_edps) > self.step1_patience:
+            previous = best_edps[-1 - self.step1_patience]
+            if math.isfinite(best_edps[-1]) and previous / best_edps[-1] - 1 < rel_tol:
+                logger.info(f"GraphEvolutionStage: step 1 converged after {generation} generation(s).")
+                return True
+        return False
 
-    def _evolve(self) -> tuple[list[GraphGenome], tools.ParetoFront]:
+    @staticmethod
+    def _best_edp(front) -> float:
+        return min((g.fitness.values[0] * g.fitness.values[1] for g in front), default=math.inf)
+
+    def _evolve(self) -> tools.ParetoFront:
         mu = self.population_size
-        design_pool = [self._random_design() for _ in range(mu)]
-        population = [self._random_genome(design_pool) for _ in range(mu)]
+        front = tools.ParetoFront(similar=lambda a, b: self._canonical_key(a) == self._canonical_key(b))
+
+        # Step 1: the hardware graph, on the seed tiling.
+        seed = self.contexts[_candidate_key(self.seed_tiling)]
+        assert seed is not None
+        design_pool = [self._random_design(seed) for _ in range(mu)]
+        population = [self._random_graph(design_pool, seed) for _ in range(mu)]
         self._evaluate(population)
         population = tools.selNSGA2(population, mu)
-        front = tools.ParetoFront(similar=lambda a, b: self._canonical_key(a) == self._canonical_key(b))
-        front.update([genome for genome in population if math.isfinite(genome.fitness.values[0])])
-
+        front.update([g for g in population if math.isfinite(g.fitness.values[0])])
+        best_edps = [self._best_edp(front)]
         generation = 0
-        while not self._should_stop(generation):
+        while not self._step1_done(generation, best_edps):
             generation += 1
-            offspring = [self._clone(genome) for genome in tools.selTournamentDCD(population, mu)]
-            children: list[GraphGenome] = []
-            for parent_1, parent_2 in zip(offspring[::2], offspring[1::2], strict=True):
-                pair = (
-                    self._crossover(parent_1, parent_2)
-                    if random.random() < self.crossover_probability
-                    else (parent_1, parent_2)
-                )
-                children += [self._mutate(child) for child in pair]
-            self._evaluate(children)
-            population = tools.selNSGA2(population + children, mu)
-            front.update([genome for genome in children if math.isfinite(genome.fitness.values[0])])
-            best_edp = min((g.fitness.values[0] * g.fitness.values[1] for g in front), default=math.inf)
-            logger.info(
-                f"GraphEvolutionStage: generation {generation}: {len(self.fitness_of_key)} distinct graph(s), "
-                f"{len(self.area_cache)} design(s) cost-modelled, front={len(front)}, best EDP={best_edp:.4g}, "
-                f"core counts on front={sorted({g.nb_cores for g in front})}."
-            )
-        return population, front
+            population, children = self._generation(population, self._mutate_graph, self._crossover_graph)
+            front.update([g for g in children if math.isfinite(g.fitness.values[0])])
+            best_edps.append(self._best_edp(front))
+            self._log_generation(generation, front)
+        if not len(front) or self._budget_stops(generation):
+            return front
 
-    def _save(self, front: tools.ParetoFront) -> None:
+        # Step 2: the mapping, on the frozen graphs. Each graph first carries its own step-1 mapping.
+        self.step = "step2"
+        self._freeze(list(front))
+        population = []
+        for index in range(mu):
+            graph_id = index % len(self.frozen_graphs)
+            graph = self.frozen_graphs[graph_id]
+            genome = self._on_graph(graph_id, graph.tiling, {k: list(v) for k, v in graph.alloc.items()})
+            population.append(genome if index < len(self.frozen_graphs) else self._mutate_mapping(genome))
+        self._evaluate(population)
+        population = tools.selNSGA2(population, mu)
+        front.update([g for g in population if math.isfinite(g.fitness.values[0])])
+        while not self._budget_stops(generation):
+            generation += 1
+            population, children = self._generation(population, self._mutate_mapping, self._crossover_mapping)
+            front.update([g for g in children if math.isfinite(g.fitness.values[0])])
+            self._log_generation(generation, front)
+        return front
+
+    def _log_generation(self, generation: int, front) -> None:
+        logger.info(
+            f"GraphEvolutionStage: {self.step} generation {generation}: {len(self.fitness_of_key)} distinct "
+            f"genome(s), {len(self.contexts)} tiling(s), {len(self.area_cache)} design(s) cost-modelled, "
+            f"front={len(front)}, best EDP={self._best_edp(front):.4g}, "
+            f"core counts on front={sorted({g.nb_cores for g in front})}."
+        )
+
+    def _save(self, front) -> None:
         with open(os.path.join(self.graph_search_dir, "evaluated.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["nb_cores", "latency", "energy", "area"])
+            writer = csv.DictWriter(
+                f, fieldnames=["step", "nb_cores", "nb_links", "tiling", "latency", "energy", "area"]
+            )
             writer.writeheader()
             writer.writerows(self.evaluated)
         with open(os.path.join(self.graph_search_dir, "pareto.csv"), "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["nb_cores", "latency", "energy", "area"])
+            writer.writerow(["graph_id", "nb_cores", "nb_links", "tiling", "latency", "energy", "area"])
             for genome in front:
-                writer.writerow([genome.nb_cores, *genome.fitness.values])
+                writer.writerow(
+                    [genome.graph_id, genome.nb_cores, len(genome.links), _candidate_key(genome.tiling)]
+                    + list(genome.fitness.values)
+                )
 
     def run(self):
         self._prepare()
-        _population, front = self._evolve()
+        front = self._evolve()
         self._save(front)
         if not len(front):
             raise ValueError("GraphEvolutionStage: no graph could be scheduled.")
         best = min(front, key=lambda genome: genome.fitness.values[0] * genome.fitness.values[1])
         logger.info(
-            f"GraphEvolutionStage: best graph by EDP has {best.nb_cores} core(s): (latency, energy, area)="
-            f"{best.fitness.values}; {len(front)} graph(s) on the front."
+            f"GraphEvolutionStage: best genome by EDP has {best.nb_cores} core(s), {len(best.links)} link(s): "
+            f"(latency, energy, area)={best.fitness.values}; {len(front)} genome(s) on the front."
         )
         best_scme = self._measure_genome(best, save_yaml=True)
         yield (
@@ -545,7 +884,9 @@ class GraphEvolutionStage(ScheduleExplorationStage):
             {
                 "pareto_graphs": [
                     {
+                        "step": "step1" if genome.graph_id is None else "step2",
                         "nb_cores": genome.nb_cores,
+                        "nb_links": len(genome.links),
                         "latency": genome.fitness.values[0],
                         "energy": genome.fitness.values[1],
                         "area": genome.fitness.values[2],

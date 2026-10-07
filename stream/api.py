@@ -1,4 +1,5 @@
 import csv
+import math
 import logging as _logging
 import os
 import time as _time
@@ -635,7 +636,8 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     prune_rolled: bool = True,
     max_cme_matrix_cells: int = 2000,
     search_budget: SearchBudget | None = None,
-    core_search_time_fraction: float = 0.3,
+    core_convergence_patience: int | None = None,
+    core_rel_tol: float = 0.005,
     schedule_search_time_fraction: float = 0.6,
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
     """Search schedules as `optimize_schedules` does, then *roll* them: reuse cores that are idle later in the
@@ -665,11 +667,11 @@ def optimize_rolled_schedules(  # noqa: PLR0913
             folded core runs layers that were never meant for its design). Above it the run falls back to the
             unrolled diagonal warm-up.
         prune_rolled: skip folds whose lower bound is already dominated by a measured schedule.
-        search_budget: optional wall-clock budget (see `stream.opt.search_budget`). When given, the search runs
-            on time instead of iteration counts: the per-tile core GAs share the first
-            `core_search_time_fraction` of the budget (or stop earlier once their fronts stall), unrolled
-            schedules are measured until `schedule_search_time_fraction` of it, and folding uses the rest. Every
-            measured schedule is recorded on the budget. Pass large iteration caps alongside it.
+        core_convergence_patience: when set, each tile's core GA stops once its front hypervolume grew by less
+            than `core_rel_tol` over that many generations (`nb_core_ga_generations` stays a hard cap).
+        search_budget: optional wall-clock budget (see `stream.opt.search_budget`). When given, unrolled
+            schedules are measured until `schedule_search_time_fraction` of it and folding uses the rest; every
+            measured schedule is recorded on it. Pass large iteration caps alongside it.
 
     Returns:
         The best schedule by `sort_key`, and the combined Pareto set as plain records. Artifacts are written
@@ -762,7 +764,8 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         prune_rolled=prune_rolled,
         max_cme_matrix_cells=max_cme_matrix_cells,
         search_budget=search_budget,
-        core_search_time_fraction=core_search_time_fraction,
+        core_convergence_patience=core_convergence_patience,
+        core_rel_tol=core_rel_tol,
         schedule_search_time_fraction=schedule_search_time_fraction if search_budget is not None else 1.0,
     )
 
@@ -803,20 +806,31 @@ def optimize_graph_evolution(  # noqa: PLR0913
     core_param_ranges: dict[str, Any] | None = None,
     cacti_precompute_workers: int | None = None,
     search_budget: SearchBudget | None = None,
+    graph_step_fraction: float = 0.5,
+    step1_patience: int = 5,
+    nb_frozen_graphs: int = 4,
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
-    """Search the accelerator's core graph and the allocation onto it with one evolving-graph NSGA2 loop (see
-    `GraphEvolutionStage`): which cores exist, their designs, which layer groups share a core and which links
-    connect them, scored on `(latency, energy, area)` by the real scheduler.
+    """Evolve an independent hardware graph alongside the workload mapping, in two steps (see
+    `GraphEvolutionStage`): first the graph -- core designs and explicit links -- with the allocation onto it, on
+    the mapping file's tiling; then, on the best graphs frozen, the mapping -- tiling and allocation. Scored on
+    `(latency, energy, area)` by the real scheduler.
+
+    `hardware` and `mapping` only seed the search: the mapping's tiling is step 1's tiling and the step-2 starting
+    point; the hardware itself is replaced by the evolved graphs.
 
     Args:
         population_size: NSGA2 population (rounded up to a multiple of 4).
-        graph_ga_generations: generations to run when no `search_budget` is given.
+        graph_ga_generations: generations to run when no `search_budget` is given (half per step).
         max_workers: worker processes for the cost-model warm-ups and the schedule measurements.
-        search_budget: optional wall-clock budget (see `stream.opt.search_budget`); when given, the loop runs
-            until it stops and every measured graph is recorded on it.
+        search_budget: optional wall-clock budget (see `stream.opt.search_budget`); when given, the search runs
+            until it stops and every measured genome is recorded on it.
+        graph_step_fraction: step 1 ends after this fraction of the budget at the latest.
+        step1_patience: step 1 ends earlier once the best EDP gained less than the budget's `rel_tol` over this
+            many generations.
+        nb_frozen_graphs: how many of step 1's best distinct graphs step 2 maps onto.
 
     Returns:
-        The best graph by EDP as a `StreamCostModelEvaluation`, and the final Pareto front as plain records.
+        The best genome by EDP as a `StreamCostModelEvaluation`, and the final Pareto front as plain records.
         Artifacts go to `{output_path}/{experiment_id}/graph_search/`.
     """
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
@@ -872,6 +886,9 @@ def optimize_graph_evolution(  # noqa: PLR0913
         max_workers=max_workers,
         graph_search_dir=f"{output_path}/{experiment_id}/graph_search",
         search_budget=search_budget,
+        graph_step_fraction=graph_step_fraction,
+        step1_patience=step1_patience,
+        nb_frozen_graphs=nb_frozen_graphs,
     )
     t_start = _time.perf_counter()
     answers = [answer for answer in mainstage.run() if answer[0] is not None]
@@ -885,3 +902,132 @@ def optimize_graph_evolution(  # noqa: PLR0913
         f"energy={best_scme.energy}."
     )
     return best_scme, extra_info["pareto_graphs"]
+
+
+def optimize_rolled_tiling(  # noqa: PLR0913
+    hardware: str,
+    workload: str,
+    mapping: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    search_budget: SearchBudget,
+    candidate_time_cap_s: float,
+    temporal_mapping_type: str = "uneven",
+    nb_tiling_ga_individuals: int = 4,
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+    nb_core_ga_generations: int = 1000,
+    nb_core_ga_individuals: int = 16,
+    core_convergence_patience: int = 5,
+    core_rel_tol: float = 0.005,
+    core_time_fraction: float = 0.4,
+    core_max_workers: int | None = None,
+    core_pareto_points: int = 10,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
+    schedule_search_time_fraction: float = 0.6,
+    fold_overlap: Literal["hull", "exact"] = "exact",
+    fold_tolerances: tuple[float, ...] = (0.0, 0.25, 1.0),
+) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
+    """The full rolled methodology: a GA over intra-/inter-core tilings, where every tiling candidate generates
+    its own hardware graph through `RolledScheduleExplorationStage` -- a per-tile core NSGA2 (stopping on front
+    hypervolume convergence), the unrolled schedule search over the per-tile fronts, then rolling onto fewer
+    cores -- and is scored by the best EDP on its (latency, energy, area) front.
+
+    Candidates run one at a time in this process (their inner searches use `core_max_workers`), each under
+    `search_budget.sub_budget(candidate_time_cap_s)`: unrolled schedules are measured until
+    `schedule_search_time_fraction` of that cap, folding uses the rest. The outer GA keeps generating
+    candidates until `search_budget` stops. Every schedule measured anywhere is recorded on `search_budget`.
+    The core GAs stop on convergence, or after `core_time_fraction` of the candidate's cap as a safety net, and
+    each candidate measures at least one schedule even if it overruns its cap.
+
+    Returns:
+        The best candidate's schedule and every candidate's `(scme, extra_info)`, as `optimize_tiling` does; the
+        extra info of each candidate carries its Pareto set (`pareto_schedules`). Artifacts go to
+        `{output_path}/{experiment_id}/tiling_search/candidate_<key>/`.
+    """
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+    logger = _logging.getLogger(__name__)
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+
+    outer_stage_classes = [
+        AcceleratorParserStage,
+        StreamONNXModelParserStage,
+        LayerStacksGenerationStage,
+        TilingExplorationStage,
+    ]
+    per_candidate_stage_classes = [
+        TilingGenerationStage,
+        TiledWorkloadGenerationStage,
+        RolledScheduleExplorationStage,
+        SetFixedAllocationPerformanceStage,
+        SchedulingOrderGenerationStage,
+        GeneticAlgorithmAllocationStage,
+    ]
+
+    # Must happen before anything forks, so every worker inherits the patch.
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    t_precompute_start = _time.perf_counter()
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+    logger.info(
+        f"optimize_rolled_tiling: precomputed {len(design_space)} CACTI config(s) in "
+        f"{_time.perf_counter() - t_precompute_start:.1f}s."
+    )
+
+    tiling_candidates_dir = f"{output_path}/{experiment_id}/tiling_search"
+    mainstage = MainStage(
+        outer_stage_classes + per_candidate_stage_classes,
+        accelerator=hardware,
+        workload_path=workload,
+        mapping_path=mapping,
+        loma_lpf_limit=6,
+        mode=mode,
+        layer_stacks=layer_stacks,
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],
+        # Outer tiling GA.
+        tiling_candidates_dir=tiling_candidates_dir,
+        scme_path=f"{output_path}/{experiment_id}/scme.pickle",
+        sort_key="edp",
+        nb_tiling_ga_generations=10**9,  # the budget stops it
+        nb_tiling_ga_individuals=nb_tiling_ga_individuals,
+        candidate_results_csv_path=f"{output_path}/{experiment_id}/tiling_search_all_candidates.csv",
+        evaluate_in_process=True,
+        candidate_time_cap_s=candidate_time_cap_s,
+        search_budget=search_budget,
+        # Per-candidate rolled search.
+        nb_ga_generations=nb_ga_generations,
+        nb_ga_individuals=nb_ga_individuals,
+        nb_core_ga_generations=nb_core_ga_generations,
+        nb_core_ga_individuals=nb_core_ga_individuals,
+        core_convergence_patience=core_convergence_patience,
+        core_rel_tol=core_rel_tol,
+        core_time_fraction=core_time_fraction,
+        core_max_workers=core_max_workers,
+        core_pareto_points=core_pareto_points,
+        core_param_ranges=core_param_ranges,
+        max_schedule_evaluations=10**9,
+        reuse_pareto_fronts=False,
+        schedule_search_time_fraction=schedule_search_time_fraction,
+        fold_overlap=fold_overlap,
+        fold_tolerances=fold_tolerances,
+        max_rolled_evaluations=10**9,
+    )
+    answers = mainstage.run()
+    if not answers:
+        raise ValueError("No tiling candidate produced a rolled schedule.")
+    best_scme, best_extra_info = min(answers, key=lambda answer: answer[1].get("fitness", math.inf))
+    logger.info(
+        f"optimize_rolled_tiling: best tiling candidate {best_extra_info['candidate_index']} of {len(answers)} "
+        f"(best EDP on its front={best_extra_info.get('fitness')})."
+    )
+    return best_scme, answers

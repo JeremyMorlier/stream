@@ -26,7 +26,7 @@ from stream.hardware.architecture.core_generator import (
     build_shared_memory_dict,
     core_dict_from_params,
 )
-from stream.opt.search_budget import SearchBudget, hypervolume_3d
+from stream.opt.search_budget import SearchBudget, SubBudget, hypervolume_3d
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.parser.core_validator import CoreValidator
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
@@ -507,7 +507,9 @@ class CoreArchitectureExplorationStage(Stage):
     """
 
     # Class-level defaults so stages built without `__init__` (the synthetic tests) run the unbudgeted search.
-    search_budget: "SearchBudget | None" = None
+    search_budget: "SearchBudget | SubBudget | None" = None
+    core_convergence_patience: int | None = None
+    core_time_fraction: float = 1.0
 
     def __init__(  # noqa: PLR0913
         self,
@@ -526,17 +528,20 @@ class CoreArchitectureExplorationStage(Stage):
         core_param_ranges: dict[str, Any] | None = None,
         candidate_results_csv_path: str | None = None,
         all_evaluated_cores_csv_path: str | None = None,
-        core_search_time_fraction: float = 0.3,
-        core_patience: int = 5,
+        core_convergence_patience: int | None = None,
+        core_rel_tol: float = 0.005,
+        core_time_fraction: float = 1.0,
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
-        # Optional `SearchBudget` (see stream.opt.search_budget): when present, each tile's NSGA2 runs until a
-        # shared deadline (`core_search_time_fraction` of the budget) or until its front stops improving for
-        # `core_patience` generations, with `nb_core_ga_generations` kept only as a hard cap.
+        # Each tile's NSGA2 stops on convergence (front hypervolume gaining < `core_rel_tol` over
+        # `core_convergence_patience` generations) when a patience is given, or when the optional `SearchBudget`
+        # (see stream.opt.search_budget) stops or `core_time_fraction` of it is spent -- a safety net so the stages
+        # after the core search keep some time; `nb_core_ga_generations` stays a hard cap either way.
         self.search_budget = kwargs.get("search_budget")
-        self.core_search_time_fraction = core_search_time_fraction
-        self.core_patience = core_patience
+        self.core_time_fraction = core_time_fraction
+        self.core_convergence_patience = core_convergence_patience
+        self.core_rel_tol = core_rel_tol
         self.workload = workload
         self.original_workload = original_workload
         self.accelerator = accelerator
@@ -554,6 +559,12 @@ class CoreArchitectureExplorationStage(Stage):
         self.all_evaluated_cores_csv_path = all_evaluated_cores_csv_path or os.path.join(
             os.path.dirname(tiled_workload_path), "core_search", "all_evaluated_cores.csv"
         )
+
+    def _search_stopped(self) -> bool:
+        """Whether the *whole* search has stopped -- for a nested search, the parent of this candidate's
+        `SubBudget` -- so work that only feeds later measurements is pointless."""
+        budget = self.search_budget
+        return budget is not None and getattr(budget, "parent", budget).should_stop()
 
     def _unique_tiles(self) -> tuple[list[ComputationNode], dict[int, int]]:
         """Same shape-dedup as `stream.utils.get_unique_nodes`, done in one pass so we also get a mapping from
@@ -613,33 +624,30 @@ class CoreArchitectureExplorationStage(Stage):
         pareto_front = tools.ParetoFront()
         pareto_front.update(population)
 
-        budget = self.search_budget
-        if budget is not None:
-            deadline = budget.max_time_s * self.core_search_time_fraction
-            finite = [ind.fitness.values for ind in population if all(math.isfinite(v) for v in ind.fitness.values)]
-            reference = [1.1 * max(values[i] for values in finite) for i in range(3)] if finite else None
-            hv_history: list[float] = []
+        # Convergence (when `core_convergence_patience` is set): stop once the front's (latency, energy, area)
+        # hypervolume has grown by less than `core_rel_tol` over the last `core_convergence_patience` generations.
+        # The reference point is fixed from the initial population so successive volumes are comparable.
+        finite = [ind.fitness.values for ind in population if all(math.isfinite(v) for v in ind.fitness.values)]
+        reference = [1.1 * max(values[i] for values in finite) for i in range(3)] if finite else None
+        hv_history: list[float] = []
 
         for generation in range(self.nb_core_ga_generations):
-            if budget is not None:
-                if budget.elapsed() >= deadline:
-                    logger.info(f"CoreArchitectureExplorationStage: tile {tile_index} hit its time share.")
-                    break
-                if reference is not None:
-                    front = [
-                        ind.fitness.values
-                        for ind in population
-                        if all(v < r for v, r in zip(ind.fitness.values, reference, strict=True))
-                    ]
-                    hv_history.append(hypervolume_3d(front, reference))
-                    if len(hv_history) > self.core_patience:
-                        previous = hv_history[-1 - self.core_patience]
-                        if previous > 0 and hv_history[-1] / previous - 1 < budget.rel_tol:
-                            logger.info(
-                                f"CoreArchitectureExplorationStage: tile {tile_index} front converged after "
-                                f"{generation} generation(s)."
-                            )
-                            break
+            budget = self.search_budget
+            if budget is not None and (
+                budget.should_stop() or budget.elapsed() >= self.core_time_fraction * budget.max_time_s
+            ):
+                logger.info(f"CoreArchitectureExplorationStage: tile {tile_index} stopped by the search budget.")
+                break
+            if self.core_convergence_patience is not None and reference is not None:
+                hv_history.append(hypervolume_3d([ind.fitness.values for ind in pareto_front], reference))
+                if len(hv_history) > self.core_convergence_patience:
+                    previous = hv_history[-1 - self.core_convergence_patience]
+                    if previous > 0 and hv_history[-1] / previous - 1 < self.core_rel_tol:
+                        logger.info(
+                            f"CoreArchitectureExplorationStage: tile {tile_index} front converged after "
+                            f"{generation} generation(s) (hypervolume {hv_history[-1]:.4g})."
+                        )
+                        break
             offspring = tools.selTournamentDCD(population, mu)
             offspring = [toolbox.clone(ind) for ind in offspring]
             for ind1, ind2 in zip(offspring[::2], offspring[1::2], strict=False):
@@ -790,6 +798,9 @@ class CoreArchitectureExplorationStage(Stage):
                 for target_index in range(len(unique_tiles))
                 if target_index != origin_index
             ]
+            if self._search_stopped():
+                logger.info("CoreArchitectureExplorationStage: the search budget has stopped; skipping cross-tile.")
+                cross_jobs = []
             if cross_jobs:
                 # Dedup identical (design values, target tile) pairs -- distinct origin tiles can independently
                 # land on the same design, especially once sizes/bandwidths snap to their discrete choices.

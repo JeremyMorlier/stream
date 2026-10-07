@@ -150,6 +150,9 @@ class ParetoArchive:
         return True
 
     def sorted_by(self, objective: str) -> list[tuple[tuple[float, float, float], dict[str, Any]]]:
+        """Entries ordered by one objective, or by `edp` (latency x energy)."""
+        if objective == "edp":
+            return sorted(self.entries, key=lambda entry: entry[0][0] * entry[0][1])
         index = OBJECTIVES.index(objective)
         return sorted(self.entries, key=lambda entry: entry[0][index])
 
@@ -674,13 +677,17 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
                 stats["hit_evaluation_budget"] = True
                 return
             # Past its time share the unrolled search hands over to subclasses (folding) -- but only once it has
-            # a schedule to hand over.
-            if self.search_budget is not None and (
-                self.search_budget.should_stop()
+            # a schedule to hand over: the first measurement is only refused once the whole search (not just
+            # this candidate's slice of it, see `SubBudget`) has stopped.
+            budget = self.search_budget
+            if budget is not None and (
+                getattr(budget, "parent", budget).should_stop()
                 or (
                     stats["measured"] > 0
-                    and self.search_budget.elapsed()
-                    >= self.schedule_search_time_fraction * self.search_budget.max_time_s
+                    and (
+                        budget.should_stop()
+                        or budget.elapsed() >= self.schedule_search_time_fraction * budget.max_time_s
+                    )
                 )
             ):
                 stats["hit_time_budget"] = True
@@ -769,6 +776,8 @@ class ScheduleExplorationStage(CoreArchitectureExplorationStage):
         self.unique_tiles = search.unique_tiles
         self._build_plan(search, reference_workload)
         self._drop_infeasible_designs()
+        if self._search_stopped():
+            raise RuntimeError(f"{type(self).__name__}: the search budget stopped before the cost-model warm-up.")
         self._warm_up_cme_cache(reference_workload)
         self._index_costs()
         self._build_rank_order()

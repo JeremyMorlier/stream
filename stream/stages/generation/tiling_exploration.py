@@ -3,7 +3,6 @@ import csv
 import functools
 import hashlib
 import logging
-import math
 import multiprocessing
 import os
 import random
@@ -19,7 +18,7 @@ from zigzag.datatypes import LayerDim
 from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
 
 from stream.hardware.architecture.accelerator import Accelerator
-from stream.opt.search_budget import map_until_deadline
+from stream.opt.search_budget import map_recording
 from stream.stages.stage import MainStage, Stage, StageCallable
 from stream.utils import accumulate_stage_timings, get_exclusive_stage_times, wrap_stages_with_timing_for_workers
 from stream.workload.computation.computation_node import ComputationNode
@@ -359,7 +358,6 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     sort_key: str,
     scme_lock: "AcquirerProxy | nullcontext[None]",
     profile: bool = False,
-    candidate_budget: Any = None,
 ) -> tuple[float]:
     """Runs in a worker process: decodes one GA individual into per-layer tiling, evaluates it through the
     full downstream pipeline, and atomically updates the shared best-so-far `scme_path` under `scme_lock` --
@@ -395,8 +393,6 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     os.makedirs(candidate_dir, exist_ok=True)
     kwargs["tiled_workload_path"] = f"{candidate_dir}/tiled_workload.pickle"
     kwargs["cost_lut_path"] = f"{candidate_dir}/cost_lut.pickle"
-    if candidate_budget is not None:
-        kwargs["search_budget"] = candidate_budget
     stage_timings: dict[str, list[float]] = {}
     if profile:
         kwargs["_stage_timings"] = stage_timings
@@ -494,10 +490,9 @@ class TilingExplorationStage(Stage):
         # Generations in a row that brought no unseen candidate before the space counts as exhausted.
         self.max_stale_generations = kwargs.get("max_stale_generations", 20)
         # In-process mode: candidates run one at a time in this process, so their own (parallel) stages get the
-        # machine, and each gets a `search_budget.sub_budget(candidate_time_cap_s)` -- the per-candidate stages
-        # then record their measurements on the shared budget themselves (see `optimize_rolled_tiling`).
+        # machine and the live `search_budget` (forwarded through the kwargs), on which they record their
+        # measurements themselves (see `optimize_rolled_tiling`).
         self.evaluate_in_process: bool = kwargs.get("evaluate_in_process", False)
-        self.candidate_time_cap_s: float = kwargs.get("candidate_time_cap_s", math.inf)
         # Populated as candidates are evaluated (see run()): summed [init_time, run_time] per per-candidate
         # stage, across every unique candidate evaluated by this GA run.
         self.candidate_stage_timings: dict[str, list[float]] = {}
@@ -652,17 +647,18 @@ class TilingExplorationStage(Stage):
                         f"TilingExplorationStage: batch of {len(individuals)} individual(s), "
                         f"{len(unique_individuals)} unique after dedup."
                     )
+                    # Every candidate of a generation is evaluated to completion; the budget is only checked
+                    # before the next generation (see `_run_until_budget`).
                     if self.evaluate_in_process:
-                        unique_results = [self._evaluate_with_sub_budget(func, ind) for ind in unique_individuals]
+                        unique_results = [func(ind) for ind in unique_individuals]
                     elif self.search_budget is None:
                         unique_results = list(executor.map(func, unique_individuals))
                     else:
-                        # Record each candidate as it completes, and cut the batch at the hard time limit.
-                        unique_results = map_until_deadline(
+                        # Record each candidate as it completes.
+                        unique_results = map_recording(
                             executor,
                             func,
                             unique_individuals,
-                            self.search_budget,
                             fallback=(float("inf"),),
                             on_result=lambda index, _result: self._record_on_budget(
                                 _candidate_key(unique_individuals[index]), candidate_records
@@ -744,14 +740,6 @@ class TilingExplorationStage(Stage):
                     yield scme, extra_info
 
                 self._save_search_summary(genes, candidate_records, hall_of_fame_summary, list(logbook))
-
-    def _evaluate_with_sub_budget(self, func, individual) -> tuple[float]:
-        """In-process evaluation of one candidate under its own slice of the budget."""
-        if self.search_budget is None:
-            return func(individual)
-        if self.search_budget.should_stop():
-            return (float("inf"),)
-        return func(individual, candidate_budget=self.search_budget.sub_budget(self.candidate_time_cap_s))
 
     def _record_on_budget(self, key: str, candidate_records: dict[str, Any]) -> None:
         """Log a candidate on the budget the first time it is evaluated (cache hits are free, so not recorded)."""

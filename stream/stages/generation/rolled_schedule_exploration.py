@@ -692,7 +692,6 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
             "infeasible": 0,
             "duplicate": 0,
             "hit_evaluation_budget": False,
-            "hit_time_budget": False,
         }
         # Snapshot first: `ParetoArchive.add` rewrites `entries` as rolled points evict unrolled ones.
         if self.fold_source == "pareto":
@@ -740,14 +739,6 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
             return "pruned"
         if fold_stats["measured"] >= self.max_rolled_evaluations:
             fold_stats["hit_evaluation_budget"] = True
-            return "budget"
-        # As for unrolled schedules, the first fold is only refused once the whole search has stopped, so every
-        # candidate of a nested search (see `SubBudget`) gets rolled at least once.
-        budget = self.search_budget
-        if budget is not None and (
-            getattr(budget, "parent", budget).should_stop() or (fold_stats["measured"] > 0 and budget.should_stop())
-        ):
-            fold_stats["hit_time_budget"] = True
             return "budget"
 
         try:

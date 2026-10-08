@@ -3,8 +3,7 @@
 Methods:
 - `rolled`: the rolled methodology (`optimize_rolled_tiling`): a GA over intra-/inter-core tilings; each tiling
   candidate gets its hardware graph from a per-tile core NSGA2 (stopping on front hypervolume convergence), an
-  unrolled schedule branch-and-bound over those cores, then rolling onto fewer cores. Each candidate runs under
-  `--candidate-time-cap`.
+  unrolled schedule branch-and-bound over those cores, then rolling onto fewer cores.
 - `graph_ga`: the two-step evolving-graph GA (`GraphEvolutionStage`): step 1 evolves an independent hardware graph
   (core designs, explicit links) with the allocation onto it; step 2 freezes the best graphs and evolves the
   mapping (tiling and allocation) on them.
@@ -18,10 +17,12 @@ Workloads: `resnet` (ResNet-50 first bottleneck) and `attention` (QKV, multi-hea
 and residual of an LLM layer).
 
 Every run gets the same `SearchBudget`: it stops at `--max-time` or once the best EDP improved by less than
-`--rel-tol` over the last `--window` seconds. Each (workload, method) pair runs in its own subprocess (the CACTI
-monkeypatch and DEAP's `creator` are process-global) and writes `trace.csv` (every measured design) and
-`summary.json` to `<output-dir>/<workload>/<method>/`. `analyze_optimizer_comparison.py` turns those into
-convergence plots, Pareto fronts and a comparison table.
+`--rel-tol` over the last `--window` seconds. The budget is only checked before a new generation starts -- the
+generation under way, and any search without generations, always finishes -- so runs can end past `--max-time`
+(`total_wall_time` in `summary.json` is the real duration). Each (workload, method) pair runs in its own
+subprocess (the CACTI monkeypatch and DEAP's `creator` are process-global) and writes `trace.csv` (every
+measured design) and `summary.json` to `<output-dir>/<workload>/<method>/`. `analyze_optimizer_comparison.py`
+turns those into convergence plots, Pareto fronts and a comparison table.
 
 Run: python benchmark_optimizer_comparison.py --max-time 10800 --window 1800 --rel-tol 0.005 --workers 8
 """
@@ -71,7 +72,6 @@ def _run_rolled(workload_path, mapping, layer_stacks, out_root, experiment_id, b
         experiment_id=experiment_id,
         output_path=out_root,
         search_budget=budget,
-        candidate_time_cap_s=args.candidate_time_cap or args.max_time / 6,
         nb_tiling_ga_individuals=args.rolled_population,
         nb_core_ga_generations=NO_CAP,
         nb_core_ga_individuals=16,
@@ -117,8 +117,8 @@ def _run_grid(size, workload_path, layer_stacks, out_root, experiment_id, budget
         layer_stacks=layer_stacks,
         experiment_id=experiment_id,
         output_path=out_root,
-        nb_ga_generations=4,
-        nb_ga_individuals=4,
+        nb_ga_generations=40,
+        nb_ga_individuals=10,
         nb_tiling_ga_generations=NO_CAP,
         nb_tiling_ga_individuals=args.population,
         sort_key="edp",
@@ -207,7 +207,6 @@ def _launch(workload: str, method: str, args: argparse.Namespace) -> int:
         str(args.step1_patience),
         "--frozen-graphs",
         str(args.frozen_graphs),
-        *(["--candidate-time-cap", str(args.candidate_time_cap)] if args.candidate_time_cap else []),
         "--output-dir",
         args.output_dir,
     ]
@@ -227,9 +226,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rel-tol", type=float, default=0.005, help="Converged below this EDP gain per window.")
     parser.add_argument("--workers", type=int, default=8, help="Worker processes, the same for every method.")
     parser.add_argument("--population", type=int, default=16, help="GA population (graph_ga and grid tiling).")
-    parser.add_argument(
-        "--candidate-time-cap", type=float, default=None, help="rolled: seconds per tiling candidate (max-time/6)."
-    )
     parser.add_argument("--rolled-population", type=int, default=4, help="rolled: tiling GA population.")
     parser.add_argument("--core-patience", type=int, default=5, help="rolled: core GA hypervolume patience.")
     parser.add_argument("--graph-step-fraction", type=float, default=0.5, help="graph_ga: max budget for step 1.")

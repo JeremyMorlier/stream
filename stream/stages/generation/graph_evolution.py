@@ -46,7 +46,7 @@ from deap import base, creator, tools
 from zigzag.utils import pickle_deepcopy
 
 from stream.hardware.architecture.core_generator import build_core_from_dict
-from stream.opt.search_budget import SearchBudget, map_until_deadline
+from stream.opt.search_budget import SearchBudget, map_recording
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
     ZigZagCoreMappingEstimationStage,
@@ -509,7 +509,7 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         _WORKER_STAGE = self
         mp_context = multiprocessing.get_context("fork")
         with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=mp_context) as executor:
-            return map_until_deadline(executor, func, items, self.search_budget, fallback, on_result=on_result)
+            return map_recording(executor, func, items, fallback, on_result=on_result)
 
     def _evaluate(self, genomes: list[GraphGenome]) -> None:
         """Set every genome's fitness: generate new tilings, warm up new (tiling, design) pairs, then schedule each

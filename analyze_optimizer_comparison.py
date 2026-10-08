@@ -4,7 +4,8 @@ Reads `<results-dir>/<workload>/<method>/{trace.csv, summary.json}` and writes i
 - `convergence_<workload>.png`: best-so-far EDP against wall time (log-log), one line per method, with a marker
   where each run stopped;
 - `pareto_<workload>.png`: every method's non-dominated (latency, energy) points, area as marker size;
-- `comparison.csv`: per run -- stop reason, time to stop, time to reach within 1% of its own final best, best
+- `comparison.csv`: per run -- stop reason, time the stop was declared and real end time (the generation under
+  way when the budget stops always finishes), time to reach within 1% of its own final best, best
   EDP (and its gap to the best method on that workload), the best point, evaluation count and the normalized
   (latency, energy, area) hypervolume.
 
@@ -101,7 +102,8 @@ def plot_convergence(workload: str, methods: dict[str, dict], path: str) -> None
         points = [(r["t"], r["best_edp"]) for r in run["trace"] if math.isfinite(r["best_edp"])]
         if not points:
             continue
-        stop = run["summary"]["time_to_stop"]
+        # Runs finish the generation under way after the stop is declared, so they end at `total_wall_time`.
+        stop = max(run["summary"]["time_to_stop"], run["summary"].get("total_wall_time") or 0)
         times, values = zip(*points, strict=True)
         times, values = [*times, max(stop, times[-1])], [*values, values[-1]]
         color = COLORS.get(method)
@@ -175,6 +177,7 @@ def main() -> None:
                     "method": method,
                     "stop_reason": summary["stop_reason"],
                     "time_to_stop_s": round(summary["time_to_stop"], 1),
+                    "total_wall_time_s": round(summary.get("total_wall_time") or summary["time_to_stop"], 1),
                     "time_to_within_1pct_s": summary["time_to_within_1pct"]
                     and round(summary["time_to_within_1pct"], 1),
                     "n_eval": summary["n_eval"],

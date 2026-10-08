@@ -1,5 +1,5 @@
-"""Smoke tests for the optimizer-comparison plumbing: the search budget's stop rules (and its per-candidate
-sub-budgets), the hypervolume helper, the generated tpu_like grids and the evolving-graph genome operators.
+"""Smoke tests for the optimizer-comparison plumbing: the search budget's stop rules, the hypervolume
+helper, the generated tpu_like grids and the evolving-graph genome operators.
 
 Run: python test_optimizer_comparison.py
 """
@@ -46,24 +46,6 @@ def test_budget_times_out() -> None:
     assert budget.should_stop() and budget.stop_reason == "time"
     budget.stop("exhausted")
     assert budget.stop_reason == "time", "the first reason wins"
-
-
-def test_sub_budget() -> None:
-    parent = SearchBudget(max_time_s=100, window_s=1000, rel_tol=0.01)
-    clock = FakeClock(parent)
-    sub = parent.sub_budget(30)
-    sub_clock = FakeClock(sub)  # type: ignore[arg-type]
-    sub.record(2, 3, 1)
-    assert parent.n_eval == 1 and parent.best_edp == 6, "records go to the parent"
-    sub_clock.now = 30
-    assert sub.should_stop() and sub.stop_reason == "time"
-    assert not parent.should_stop(), "a candidate running out of time does not stop the search"
-    other = parent.sub_budget(30)
-    clock.now = 100
-    assert other.should_stop() and other.stop_reason == "parent"
-    capped = SearchBudget(max_time_s=100, window_s=1000, rel_tol=0.01)
-    FakeClock(capped).now = 90
-    assert capped.sub_budget(30).max_time_s == 10, "a candidate never outlives the search"
 
 
 def _stage_with_groups(groups_per_layer: dict[int, int]) -> GraphEvolutionStage:
@@ -115,7 +97,6 @@ def test_grid() -> None:
 if __name__ == "__main__":
     test_budget_converges()
     test_budget_times_out()
-    test_sub_budget()
     test_graph_genome()
     test_hypervolume()
     test_grid()

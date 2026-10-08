@@ -26,7 +26,7 @@ from stream.hardware.architecture.core_generator import (
     build_shared_memory_dict,
     core_dict_from_params,
 )
-from stream.opt.search_budget import SearchBudget, SubBudget, hypervolume_3d
+from stream.opt.search_budget import SearchBudget, hypervolume_3d
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.parser.core_validator import CoreValidator
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
@@ -507,9 +507,8 @@ class CoreArchitectureExplorationStage(Stage):
     """
 
     # Class-level defaults so stages built without `__init__` (the synthetic tests) run the unbudgeted search.
-    search_budget: "SearchBudget | SubBudget | None" = None
+    search_budget: "SearchBudget | None" = None
     core_convergence_patience: int | None = None
-    core_time_fraction: float = 1.0
     # Evaluate every tile's kept designs on every other tile shape (results go to `candidate_results.csv`).
     # Subclasses that cost-model the full shape x design matrix themselves turn it off.
     cross_tile_evaluation: bool = True
@@ -533,16 +532,14 @@ class CoreArchitectureExplorationStage(Stage):
         all_evaluated_cores_csv_path: str | None = None,
         core_convergence_patience: int | None = None,
         core_rel_tol: float = 0.005,
-        core_time_fraction: float = 1.0,
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
         # Each tile's NSGA2 stops on convergence (front hypervolume gaining < `core_rel_tol` over
-        # `core_convergence_patience` generations) when a patience is given, or when the optional `SearchBudget`
-        # (see stream.opt.search_budget) stops or `core_time_fraction` of it is spent -- a safety net so the stages
-        # after the core search keep some time; `nb_core_ga_generations` stays a hard cap either way.
+        # `core_convergence_patience` generations) when a patience is given, or before a new generation once the
+        # optional `SearchBudget` (see stream.opt.search_budget) has stopped; `nb_core_ga_generations` stays a hard
+        # cap either way.
         self.search_budget = kwargs.get("search_budget")
-        self.core_time_fraction = core_time_fraction
         self.core_convergence_patience = core_convergence_patience
         self.core_rel_tol = core_rel_tol
         self.workload = workload
@@ -562,12 +559,6 @@ class CoreArchitectureExplorationStage(Stage):
         self.all_evaluated_cores_csv_path = all_evaluated_cores_csv_path or os.path.join(
             os.path.dirname(tiled_workload_path), "core_search", "all_evaluated_cores.csv"
         )
-
-    def _search_stopped(self) -> bool:
-        """Whether the *whole* search has stopped -- for a nested search, the parent of this candidate's
-        `SubBudget` -- so work that only feeds later measurements is pointless."""
-        budget = self.search_budget
-        return budget is not None and getattr(budget, "parent", budget).should_stop()
 
     def _unique_tiles(self) -> tuple[list[ComputationNode], dict[int, int]]:
         """Same shape-dedup as `stream.utils.get_unique_nodes`, done in one pass so we also get a mapping from
@@ -635,10 +626,8 @@ class CoreArchitectureExplorationStage(Stage):
         hv_history: list[float] = []
 
         for generation in range(self.nb_core_ga_generations):
-            budget = self.search_budget
-            if budget is not None and (
-                budget.should_stop() or budget.elapsed() >= self.core_time_fraction * budget.max_time_s
-            ):
+            # The budget only keeps a new generation from starting; the one under way always completes.
+            if self.search_budget is not None and self.search_budget.should_stop():
                 logger.info(f"CoreArchitectureExplorationStage: tile {tile_index} stopped by the search budget.")
                 break
             if self.core_convergence_patience is not None and reference is not None:
@@ -802,9 +791,6 @@ class CoreArchitectureExplorationStage(Stage):
                 if target_index != origin_index
             ]
             if not self.cross_tile_evaluation:
-                cross_jobs = []
-            elif self._search_stopped():
-                logger.info("CoreArchitectureExplorationStage: the search budget has stopped; skipping cross-tile.")
                 cross_jobs = []
             if cross_jobs:
                 # Dedup identical (design values, target tile) pairs -- distinct origin tiles can independently

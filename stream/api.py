@@ -638,7 +638,6 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     search_budget: SearchBudget | None = None,
     core_convergence_patience: int | None = None,
     core_rel_tol: float = 0.005,
-    schedule_search_time_fraction: float = 0.6,
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
     """Search schedules as `optimize_schedules` does, then *roll* them: reuse cores that are idle later in the
     schedule so the accelerator needs fewer of them, and return one Pareto front over both families.
@@ -669,9 +668,9 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         prune_rolled: skip folds whose lower bound is already dominated by a measured schedule.
         core_convergence_patience: when set, each tile's core GA stops once its front hypervolume grew by less
             than `core_rel_tol` over that many generations (`nb_core_ga_generations` stays a hard cap).
-        search_budget: optional wall-clock budget (see `stream.opt.search_budget`). When given, unrolled
-            schedules are measured until `schedule_search_time_fraction` of it and folding uses the rest; every
-            measured schedule is recorded on it. Pass large iteration caps alongside it.
+        search_budget: optional wall-clock budget (see `stream.opt.search_budget`). Every measured schedule is
+            recorded on it; once it stops, the core GAs start no new generation, but the schedule search and the
+            rolling still run to their own end.
 
     Returns:
         The best schedule by `sort_key`, and the combined Pareto set as plain records. Artifacts are written
@@ -766,7 +765,6 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         search_budget=search_budget,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
-        schedule_search_time_fraction=schedule_search_time_fraction if search_budget is not None else 1.0,
     )
 
     t_start = _time.perf_counter()
@@ -913,7 +911,6 @@ def optimize_rolled_tiling(  # noqa: PLR0913
     experiment_id: str,
     output_path: str,
     search_budget: SearchBudget,
-    candidate_time_cap_s: float,
     temporal_mapping_type: str = "uneven",
     nb_tiling_ga_individuals: int = 4,
     nb_ga_generations: int = 4,
@@ -922,12 +919,12 @@ def optimize_rolled_tiling(  # noqa: PLR0913
     nb_core_ga_individuals: int = 16,
     core_convergence_patience: int = 5,
     core_rel_tol: float = 0.005,
-    core_time_fraction: float = 0.4,
     core_max_workers: int | None = None,
     core_pareto_points: int = 10,
     core_param_ranges: dict[str, Any] | None = None,
     cacti_precompute_workers: int | None = None,
-    schedule_search_time_fraction: float = 0.6,
+    max_schedule_evaluations: int = 60,
+    max_rolled_evaluations: int = 200,
     fold_overlap: Literal["hull", "exact"] = "exact",
     fold_tolerances: tuple[float, ...] = (0.0, 0.25, 1.0),
 ) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
@@ -936,12 +933,14 @@ def optimize_rolled_tiling(  # noqa: PLR0913
     hypervolume convergence), the unrolled schedule search over the per-tile fronts, then rolling onto fewer
     cores -- and is scored by the best EDP on its (latency, energy, area) front.
 
-    Candidates run one at a time in this process (their inner searches use `core_max_workers`), each under
-    `search_budget.sub_budget(candidate_time_cap_s)`: unrolled schedules are measured until
-    `schedule_search_time_fraction` of that cap, folding uses the rest. The outer GA keeps generating
-    candidates until `search_budget` stops. Every schedule measured anywhere is recorded on `search_budget`.
-    The core GAs stop on convergence, or after `core_time_fraction` of the candidate's cap as a safety net, and
-    each candidate measures at least one schedule even if it overruns its cap.
+    Candidates run one at a time in this process (their inner searches use `core_max_workers`), and every
+    schedule measured anywhere is recorded on `search_budget`. The budget never cuts work that has started: a
+    tiling generation always evaluates all its candidates, and each candidate's search runs to its own end -- the
+    core GAs until their fronts converge, the schedule search until it is exhausted or has measured
+    `max_schedule_evaluations` schedules, the rolling until every fold plan is tried or `max_rolled_evaluations`
+    folds are measured (the defaults are those of `example_rolled_schedule_exploration.py`). Once the budget
+    stops, no new generation starts, at either the tiling or the core-GA level, so a run can end past its
+    time limit.
 
     Returns:
         The best candidate's schedule and every candidate's `(scme, extra_info)`, as `optimize_tiling` does; the
@@ -1002,7 +1001,6 @@ def optimize_rolled_tiling(  # noqa: PLR0913
         nb_tiling_ga_individuals=nb_tiling_ga_individuals,
         candidate_results_csv_path=f"{output_path}/{experiment_id}/tiling_search_all_candidates.csv",
         evaluate_in_process=True,
-        candidate_time_cap_s=candidate_time_cap_s,
         search_budget=search_budget,
         # Per-candidate rolled search.
         nb_ga_generations=nb_ga_generations,
@@ -1011,16 +1009,14 @@ def optimize_rolled_tiling(  # noqa: PLR0913
         nb_core_ga_individuals=nb_core_ga_individuals,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
-        core_time_fraction=core_time_fraction,
         core_max_workers=core_max_workers,
         core_pareto_points=core_pareto_points,
         core_param_ranges=core_param_ranges,
-        max_schedule_evaluations=10**9,
+        max_schedule_evaluations=max_schedule_evaluations,
         reuse_pareto_fronts=False,
-        schedule_search_time_fraction=schedule_search_time_fraction,
         fold_overlap=fold_overlap,
         fold_tolerances=fold_tolerances,
-        max_rolled_evaluations=10**9,
+        max_rolled_evaluations=max_rolled_evaluations,
     )
     answers = mainstage.run()
     if not answers:

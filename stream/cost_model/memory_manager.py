@@ -195,9 +195,6 @@ class MemoryManager:
         timestep: int,
         exceptions: list[Tensor],
     ) -> list[Tensor]:
-        # Get all tensors that were being stored at the given timestep
-        stored_tensors = self.get_tensors_stored_at_timestep(top_instance, timestep)
-
         # Get the total capacity of this top instance
         capacity = self.top_instance_capacities[top_instance]
         # Sanity check on the tensor we want to add and the memory's capacity
@@ -207,15 +204,22 @@ class MemoryManager:
                 f"{top_instance} {capacity}."
             )
 
-        relevant_exceptions = [tensor for tensor in exceptions if tensor in stored_tensors]
         # For the total stored tensors size we also need to take into account all tensors,
         # including ones that are not yet present at this timestep.
         # Otherwise adding that tensor in the future could cause an overflow.
         stored_tensors_size = self.get_stored_cumsum_at_timestep(top_instance, timestep)
         min_size_to_evict = tensor_to_add.size - (capacity - stored_tensors_size)
+        # Checked before anything else: most calls need no eviction, and the work below is what made scheduling a
+        # rolled accelerator (many layers' tensors on one core) slow.
         if min_size_to_evict <= 0:  # no need to evict any tensor, the memory's space is enough
             return []
-        evictable_tensors = [tensor for tensor in stored_tensors if tensor not in relevant_exceptions]
+
+        # Get all tensors that were being stored at the given timestep, minus the exceptions. `Tensor` has no
+        # `__eq__`, so list membership compared identities -- an identity set gives the same result without the
+        # quadratic scan.
+        stored_tensors = self.get_tensors_stored_at_timestep(top_instance, timestep)
+        exception_ids = {id(tensor) for tensor in exceptions}
+        evictable_tensors = [tensor for tensor in stored_tensors if id(tensor) not in exception_ids]
         evictable_tensors_priority_size: list[int] = []
         for tensor in evictable_tensors:
             instance_priority = tensor.get_instance_priority(top_instance, self)
@@ -226,21 +230,18 @@ class MemoryManager:
         )
         evictable_tensors_priority_size = list(evictable_tensors_priority_size_tuple)
         evictable_tensors = list(evictable_tensors_tuple)
-        evictable_tensors_size = [tensor.size for tensor in evictable_tensors]
-        evictable_tensors_size_sums = [
-            sum(evictable_tensors_size[:i]) for i in range(0, len(evictable_tensors_size) + 1)
-        ]
-        try:
-            idx_satisfying_min_size_to_evict = next(
-                (i for i, size_sum in enumerate(evictable_tensors_size_sums) if size_sum >= min_size_to_evict)
-            )
-        except StopIteration as exc:
-            raise ValueError(
-                f"The evictable tensors {evictable_tensors} and their sizes {evictable_tensors_size} are too small to "
-                f"evict a size of {min_size_to_evict} {tensor_to_add} {tensor_to_add.size} {capacity}."
-            ) from exc
-        tensors_to_evict = evictable_tensors[:idx_satisfying_min_size_to_evict]
-        return tensors_to_evict
+        # Evict the shortest prefix of the sorted tensors whose sizes add up to `min_size_to_evict`. A running sum
+        # that stops there, rather than every prefix sum recomputed from scratch -- that was quadratic in the number
+        # of stored tensors, and dominated scheduling once a core hosts many layers (a rolled accelerator).
+        evicted_size = 0
+        for count, tensor in enumerate(evictable_tensors, start=1):
+            evicted_size += tensor.size
+            if evicted_size >= min_size_to_evict:
+                return evictable_tensors[:count]
+        raise ValueError(
+            f"The evictable tensors {evictable_tensors} and their sizes {[t.size for t in evictable_tensors]} are too "
+            f"small to evict a size of {min_size_to_evict} {tensor_to_add} {tensor_to_add.size} {capacity}."
+        )
 
     def remove_tensor_from_top_instance(
         self,

@@ -59,6 +59,17 @@ class Accelerator:
         return top_instances
 
     def get_top_instance_of_core(self, core: Core | int, mem_op: MemoryOperand) -> MemoryInstance:
+        # Memoized: the scheduler asks this hundreds of thousands of times per schedule, and each uncached lookup
+        # hashes `MemoryInstance`s (a frozenset of all their attributes, rebuilt per call). The memory topology is
+        # fixed once the accelerator is built, so the answer never changes.
+        core_id = core if isinstance(core, int) else core.id
+        cache = self.__dict__.setdefault("_top_instance_cache", {})
+        key = (core_id, mem_op)
+        if key not in cache:
+            cache[key] = self._find_top_instance_of_core(core, mem_op)
+        return cache[key]
+
+    def _find_top_instance_of_core(self, core: Core | int, mem_op: MemoryOperand) -> MemoryInstance:
         if isinstance(core, int):
             core = self.get_core(core)
         top_instances = self.memory_manager.top_instances_per_core[core]

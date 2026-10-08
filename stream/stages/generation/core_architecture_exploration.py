@@ -510,6 +510,9 @@ class CoreArchitectureExplorationStage(Stage):
     search_budget: "SearchBudget | SubBudget | None" = None
     core_convergence_patience: int | None = None
     core_time_fraction: float = 1.0
+    # Evaluate every tile's kept designs on every other tile shape (results go to `candidate_results.csv`).
+    # Subclasses that cost-model the full shape x design matrix themselves turn it off.
+    cross_tile_evaluation: bool = True
 
     def __init__(  # noqa: PLR0913
         self,
@@ -798,7 +801,9 @@ class CoreArchitectureExplorationStage(Stage):
                 for target_index in range(len(unique_tiles))
                 if target_index != origin_index
             ]
-            if self._search_stopped():
+            if not self.cross_tile_evaluation:
+                cross_jobs = []
+            elif self._search_stopped():
                 logger.info("CoreArchitectureExplorationStage: the search budget has stopped; skipping cross-tile.")
                 cross_jobs = []
             if cross_jobs:

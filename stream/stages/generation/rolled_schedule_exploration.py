@@ -265,6 +265,10 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         - `cost_lut_design_<design_key>.pickle`: the full-matrix warm-up, content-addressed so it is reusable.
     """
 
+    # The full-matrix warm-up (`_warm_up_cme_cache`) runs every design on every tile shape with the complete
+    # ZigZag stage, so the core search's lighter cross-tile pass would only recompute the same pairs.
+    cross_tile_evaluation = False
+
     def __init__(  # noqa: PLR0913
         self,
         list_of_callables: list[StageCallable],

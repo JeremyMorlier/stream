@@ -24,7 +24,7 @@ The search runs in two steps:
 
 Fitness is `(latency, energy, area)`, measured with the real scheduler. Each tiling is generated once
 (`TilingGenerationStage` + `TiledWorkloadGenerationStage`) and cached; a design's cost on a tiling's shapes is
-learned once with a uniform accelerator, as `RolledScheduleExplorationStage` fills its cost matrix, and shared
+learned once with a uniform accelerator, as the rolled schedule search fills its cost matrix, and shared
 across tilings through global tile-shape ids. A design must map every shape of the genome's tiling (the cheap
 `lowest_memory_level_violations` pre-check), so any node can host any group.
 """
@@ -52,9 +52,14 @@ from stream.stages.estimation.zigzag_core_mapping_estimation import (
     ZigZagCoreMappingEstimationStage,
     lowest_memory_level_violations,
 )
-from stream.stages.generation.core_architecture_exploration import CoreGeneLayout
-from stream.stages.generation.schedule_exploration import (
-    ScheduleExplorationStage,
+from stream.stages.generation.core_architecture_exploration import (
+    CoreGeneLayout,
+    CoreParamRanges,
+    assemble_custom_accelerator,
+)
+from stream.stages.generation.schedule_evaluation import (
+    CostCaches,
+    MeasurementPipeline,
     _UnusedLeafStage,
     core_dict_key,
     tile_key,
@@ -163,14 +168,22 @@ def _measure_worker(genome: "GraphGenome") -> tuple[float, float]:
         return math.inf, math.inf
 
 
-class GraphEvolutionStage(ScheduleExplorationStage):
-    """Two-step evolving-graph NSGA2; see the module docstring. Reuses `ScheduleExplorationStage` for the cost-model
-    harvest, the cost-LUT assembly and the downstream measurement, but runs no per-tile core GA."""
+class GraphEvolutionStage(Stage):
+    """Two-step evolving-graph NSGA2; see the module docstring. Shares the cost-model cache (`CostCaches`) and the
+    downstream measurement (`MeasurementPipeline`) with the schedule searches, but runs no per-tile core GA.
+
+    The stages after this one are the measurement pipeline: every genome is scheduled by running them on the
+    genome's accelerator, and the best genome by EDP is yielded."""
 
     def __init__(  # noqa: PLR0913
         self,
         list_of_callables: list[StageCallable],
         *,
+        workload: Any,
+        original_workload: Any,
+        accelerator: Any,
+        tiled_workload_path: str,
+        core_param_ranges: dict[str, Any] | None = None,
         population_size: int = 16,
         graph_ga_generations: int = 10,
         max_workers: int | None = None,
@@ -183,6 +196,13 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         **kwargs: Any,
     ):
         super().__init__(list_of_callables, **kwargs)
+        self.workload = workload
+        self.original_workload = original_workload
+        self.accelerator = accelerator
+        self.tiled_workload_path = tiled_workload_path
+        self.gene_ranges = CoreParamRanges(**(core_param_ranges or {}))
+        self.latency_attr: str = kwargs.get("latency_attr", "latency_total2")
+        self.pipeline = MeasurementPipeline(list_of_callables, self.kwargs)
         # NSGA2's crowded tournament needs a multiple of 4.
         self.population_size = max(4, -(-population_size // 4) * 4)
         self.graph_ga_generations = graph_ga_generations
@@ -209,10 +229,7 @@ class GraphEvolutionStage(ScheduleExplorationStage):
 
         self.unique_tiles: list[ComputationNode] = []  # global shape registry, across every tiling
         self.contexts: dict[str, TilingContext | None] = {}
-        self.cme_cache: dict[tuple[int, str], Any] = {}
-        self.runtime_cache: dict[tuple[int, str], float] = {}
-        self.energy_cache: dict[tuple[int, str], float] = {}
-        self.area_cache: dict[str, float] = {}
+        self.costs = CostCaches(latency_attr=self.latency_attr)
         self.failed_cells: set[tuple[str, str]] = set()  # (tiling key, design key) whose warm-up failed
         self.mappable: dict[tuple[str, str], bool] = {}
         self.key_memo: dict[tuple[float, ...], str] = {}
@@ -282,16 +299,10 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         self.contexts[key] = context
         return context
 
-    def _use(self, context: TilingContext) -> None:
-        """Point the inherited helpers (`_build_accelerator`, `_harvest_cmes`, `_assemble_cost_lut`) at a tiling."""
-        self.workload = context.workload
-        self.original_workload = context.original_workload
-        self.core_ids_of_node = context.core_ids_of_node
-        self.shape_class_of_tile = context.shape_class_of_tile
-
     # ------------------------------------------------------------------------------------- designs -------------
 
     def _decode(self, values: list[float], name: str = "graph_core") -> dict[str, Any] | None:
+        """The core dict a gene vector decodes to, or None if it is not a valid core."""
         try:
             return self.gene_layout.decode_node(values, name=name)
         except ValueError:
@@ -352,14 +363,15 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         design): ZigZag then runs once per shape. Returns `({(shape, design key): cme}, area)`, or `(None, inf)`."""
         context = self.contexts[context_key]
         assert context is not None
-        self._use(context)
         core_dict = self._decode(design_values)
         design_key = core_dict_key(core_dict)
         workload = pickle_deepcopy(context.workload)
         node_core_dicts = dict.fromkeys(context.core_ids_of_node, core_dict)
         lut_path = os.path.join(self.graph_search_dir, f"cost_lut_{design_key}_{os.getpid()}.pickle")
         try:
-            accelerator = self._build_accelerator(node_core_dicts, workload)
+            accelerator = assemble_custom_accelerator(
+                workload, context.original_workload, self.accelerator, node_core_dicts
+            )
             estimation = ZigZagCoreMappingEstimationStage(
                 [_UnusedLeafStage],
                 workload=workload,
@@ -370,9 +382,12 @@ class GraphEvolutionStage(ScheduleExplorationStage):
                 temporal_mapping_type=self.kwargs["temporal_mapping_type"],
             )
             estimation.update_cost_lut()
-            self.cme_cache, self.runtime_cache, self.energy_cache, self.area_cache = {}, {}, {}, {}
-            self._harvest_cmes(estimation.cost_lut, workload, accelerator, self._design_key_of_core(node_core_dicts))
-            return dict(self.cme_cache), self.area_cache.get(design_key, math.inf)
+            costs = CostCaches(latency_attr=self.latency_attr)
+            design_key_of_core = {
+                core_id: design_key for cores in context.core_ids_of_node.values() for core_id in cores
+            }
+            costs.harvest(estimation.cost_lut, workload, accelerator, design_key_of_core, context.shape_class_of_tile)
+            return costs.cme, costs.area.get(design_key, math.inf)
         except Exception:
             logger.warning(f"GraphEvolutionStage: design {design_key} failed its cost-model warm-up.", exc_info=True)
             return None, math.inf
@@ -381,7 +396,7 @@ class GraphEvolutionStage(ScheduleExplorationStage):
                 os.remove(lut_path)
 
     def _missing_cells(self, context: TilingContext, design_key: str) -> bool:
-        return any((shape, design_key) not in self.cme_cache for shape in context.shapes)
+        return any((shape, design_key) not in self.costs.cme for shape in context.shapes)
 
     def _warm_up(self, genomes: list[GraphGenome]) -> None:
         """Cost-model, in parallel, every (tiling, design) pair these genomes need that the cache cannot cover."""
@@ -409,10 +424,8 @@ class GraphEvolutionStage(ScheduleExplorationStage):
                 self.failed_cells.add(pair)
                 continue
             for cell_key, cme in cells.items():
-                self.cme_cache[cell_key] = cme
-                self.runtime_cache[cell_key] = float(getattr(cme, self.latency_attr))
-                self.energy_cache[cell_key] = float(cme.energy_total)
-            self.area_cache[pair[1]] = area
+                self.costs.add(cell_key, cme)
+            self.costs.area[pair[1]] = area
 
     # ------------------------------------------------------------------------------------ measuring ----------
 
@@ -453,17 +466,18 @@ class GraphEvolutionStage(ScheduleExplorationStage):
         return AcceleratorFactory(accelerator_data).create(), design_key_of_core
 
     def _measure_genome(self, genome: GraphGenome, save_yaml: bool = False):
+        """Schedule one genome with the downstream stages, on a cost LUT assembled from the cache."""
         context = self._context(genome.tiling)
         assert context is not None
-        self._use(context)
         workload = pickle_deepcopy(context.workload)
         yaml_path = os.path.join(self.graph_search_dir, "accelerator.yaml") if save_yaml else None
         accelerator, design_key_of_core = self._assemble(genome, workload, yaml_path)
-        cost_lut = self._assemble_cost_lut(workload, accelerator, design_key_of_core)
-        return self._measure_accelerator(workload, accelerator, cost_lut)
+        cost_lut = self.costs.assemble_cost_lut(workload, accelerator, design_key_of_core, context.shape_class_of_tile)
+        return self.pipeline.measure(workload, accelerator, cost_lut)
 
     def _area(self, genome: GraphGenome) -> float:
-        return sum(self.area_cache[self._key_of(values)] for values in genome.nodes.values())
+        """Total compute-core area of a genome's graph (offchip excluded, as in the other searches)."""
+        return sum(self.costs.area[self._key_of(values)] for values in genome.nodes.values())
 
     def _is_feasible(self, genome: GraphGenome) -> bool:
         context = self._context(genome.tiling)
@@ -846,7 +860,7 @@ class GraphEvolutionStage(ScheduleExplorationStage):
     def _log_generation(self, generation: int, front) -> None:
         logger.info(
             f"GraphEvolutionStage: {self.step} generation {generation}: {len(self.fitness_of_key)} distinct "
-            f"genome(s), {len(self.contexts)} tiling(s), {len(self.area_cache)} design(s) cost-modelled, "
+            f"genome(s), {len(self.contexts)} tiling(s), {len(self.costs.area)} design(s) cost-modelled, "
             f"front={len(front)}, best EDP={self._best_edp(front):.4g}, "
             f"core counts on front={sorted({g.nb_cores for g in front})}."
         )

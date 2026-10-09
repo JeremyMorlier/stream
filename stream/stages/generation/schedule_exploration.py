@@ -38,7 +38,6 @@ runs the exhaustive search for exactly that comparison.
 """
 
 import csv
-import hashlib
 import logging
 import math
 import os
@@ -57,12 +56,22 @@ from stream.stages.generation.core_architecture_exploration import (
     ParetoCoreSearchResult,
     assemble_custom_accelerator,
 )
+from stream.stages.generation.schedule_evaluation import (
+    OBJECTIVES,
+    TILE_KEY_T,
+    ParetoArchive,
+    _UnusedLeafStage,
+    core_dict_key,
+    format_ranks,
+    strip_unpicklable,
+    tile_key,
+)
 from stream.stages.generation.tiled_workload_accelerator_generation import (
     derive_group_dedicated_topology,
     get_original_nodes,
     get_tiles_by_original_node,
 )
-from stream.stages.stage import MainStage, Stage, StageCallable
+from stream.stages.stage import MainStage, StageCallable
 from stream.utils import CostModelEvaluationLUT
 from stream.visualization.hardware_graph import plot_hardware_graph, topology_from_connectivity
 from stream.visualization.schedule_tradeoff import plot_schedule_tradeoffs
@@ -70,91 +79,6 @@ from stream.visualization.topology_report import design_payload, write_topology_
 from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
-
-OBJECTIVES = ("latency", "energy", "area")
-TILE_KEY_T = tuple[int, int]
-
-
-def dominates(a: tuple[float, ...], b: tuple[float, ...]) -> bool:
-    """True if `a` is at least as good as `b` on every objective and strictly better on at least one."""
-    return all(x <= y for x, y in zip(a, b, strict=True)) and any(x < y for x, y in zip(a, b, strict=True))
-
-
-def core_dict_key(core_dict: dict[str, Any]) -> str:
-    """Content-addressed identity of a core design, ignoring its name: two front designs that decode to the same
-    hardware are the same accelerator, and must not be searched (or cost-modelled) twice."""
-    without_name = {key: value for key, value in core_dict.items() if key != "name"}
-    return hashlib.sha1(repr(_freeze(without_name)).encode()).hexdigest()[:16]
-
-
-def _freeze(value: Any) -> Any:
-    if isinstance(value, dict):
-        return tuple(sorted((key, _freeze(item)) for key, item in value.items()))
-    if isinstance(value, list | tuple):
-        return tuple(_freeze(item) for item in value)
-    return value
-
-
-# Record fields that exist only while the search runs (big, and not plain data), stripped before anything is
-# pickled or written.
-TRANSIENT_RECORD_KEYS = ("occupancy",)
-
-
-def strip_unpicklable(record: dict[str, Any]) -> dict[str, Any]:
-    """A record without its transient in-memory fields -- what gets persisted."""
-    return {key: value for key, value in record.items() if key not in TRANSIENT_RECORD_KEYS}
-
-
-def format_ranks(ranks: tuple[int, ...]) -> str:
-    """Stable text form of a rank tuple, shared by record ids, `schedules.csv` and topology filenames so a row,
-    an id and a figure can be matched by eye."""
-    return "-".join(str(rank) for rank in ranks)
-
-
-def tile_key(tile: ComputationNode) -> TILE_KEY_T:
-    """Identity of a tile that survives `pickle_deepcopy`, unlike `id(...)`: every combination is measured on
-    its own copy of the workload, but `(id, sub_id)` names the same tile in all of them."""
-    return (tile.id, tile.sub_id)
-
-
-class _UnusedLeafStage(Stage):
-    """Placeholder sub-stage for stages this module instantiates only to call one of their methods (e.g.
-    `ZigZagCoreMappingEstimationStage.update_cost_lut`). `Stage.__init__` rejects an empty `list_of_callables`
-    on a non-leaf stage, and these are never `run()`."""
-
-    def is_leaf(self) -> bool:
-        return True
-
-    def run(self):
-        yield from ()
-
-
-class ParetoArchive:
-    """Non-dominated set of *measured* schedules, serving as both the search's result and its pruning oracle.
-
-    Only measured points are ever stored, which is what makes the pruning sound: a bound dominated by one of
-    these can never beat it, whatever the bounded schedule's true cost turns out to be."""
-
-    def __init__(self) -> None:
-        self.entries: list[tuple[tuple[float, float, float], dict[str, Any]]] = []
-
-    def is_dominated(self, point: tuple[float, float, float]) -> bool:
-        return any(dominates(stored, point) for stored, _ in self.entries)
-
-    def add(self, point: tuple[float, float, float], payload: dict[str, Any]) -> bool:
-        """Insert a measured point, dropping every point it dominates. Returns whether it was kept."""
-        if self.is_dominated(point):
-            return False
-        self.entries = [(p, load) for p, load in self.entries if not dominates(point, p)]
-        self.entries.append((point, payload))
-        return True
-
-    def sorted_by(self, objective: str) -> list[tuple[tuple[float, float, float], dict[str, Any]]]:
-        """Entries ordered by one objective, or by `edp` (latency x energy)."""
-        if objective == "edp":
-            return sorted(self.entries, key=lambda entry: entry[0][0] * entry[0][1])
-        index = OBJECTIVES.index(objective)
-        return sorted(self.entries, key=lambda entry: entry[0][index])
 
 
 class ScheduleExplorationStage(CoreArchitectureExplorationStage):

@@ -15,7 +15,8 @@ import itertools
 import random
 from types import SimpleNamespace
 
-from stream.stages.generation.schedule_exploration import ScheduleExplorationStage, dominates
+from stream.stages.generation.schedule_evaluation import dominates
+from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
 
 
 def build_stage(seed: int, nb_classes: int = 3, nb_ranks: int = 4) -> ScheduleExplorationStage:

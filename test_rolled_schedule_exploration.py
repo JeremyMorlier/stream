@@ -22,14 +22,17 @@ import random
 from types import SimpleNamespace
 
 from stream.stages.generation.rolled_schedule_exploration import (
-    CoreOccupancy,
     RolledScheduleExplorationStage,
     canonical,
-    coalesce,
     partition_key,
+)
+from stream.stages.generation.schedule_evaluation import (
+    CoreOccupancy,
+    ParetoArchive,
+    coalesce,
+    core_dict_key,
     union_overlap,
 )
-from stream.stages.generation.schedule_exploration import ParetoArchive, core_dict_key
 from stream.stages.generation.tiled_workload_accelerator_generation import (
     fold_core_pair_bits,
     renumber_merged_cores,

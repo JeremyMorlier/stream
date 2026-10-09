@@ -38,7 +38,7 @@ import math
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Literal
 
@@ -46,17 +46,21 @@ from zigzag.utils import pickle_deepcopy
 
 from stream.stages.estimation.zigzag_core_mapping_estimation import ZigZagCoreMappingEstimationStage
 from stream.stages.generation.core_architecture_exploration import assemble_rolled_accelerator
-from stream.stages.generation.schedule_exploration import (
+from stream.stages.generation.schedule_evaluation import (
+    INTERVAL_T,
+    CoreOccupancy,
     ParetoArchive,
-    ScheduleExplorationStage,
     _UnusedLeafStage,
     core_dict_key,
+    core_occupancy,
     format_ranks,
+    interval_overlap,
     strip_unpicklable,
+    union_overlap,
 )
+from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
 from stream.stages.stage import StageCallable
 from stream.visualization.hardware_graph import topology_from_connectivity
-from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
 
@@ -70,91 +74,6 @@ def _warm_up_column_worker(item: tuple[str, dict[str, Any]]) -> tuple[dict, dict
     stage.cme_cache, stage.runtime_cache, stage.energy_cache, stage.area_cache = {}, {}, {}, {}
     stage._warm_up_uniform_design(*item, workload)
     return stage.cme_cache, stage.runtime_cache, stage.energy_cache, stage.area_cache
-
-
-INTERVAL_T = tuple[int, int]
-
-
-# ----------------------------------------------------------------------------- interval arithmetic -----------
-
-
-def coalesce(intervals: list[INTERVAL_T]) -> list[INTERVAL_T]:
-    """Sorted, non-overlapping cover of `intervals`. Touching intervals are merged: a core that runs one tile
-    straight into the next is busy throughout, and splitting that into two windows would only make the overlap
-    arithmetic below more expensive without changing any answer."""
-    merged: list[INTERVAL_T] = []
-    for start, end in sorted(intervals):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def interval_overlap(a: INTERVAL_T, b: INTERVAL_T) -> int:
-    return max(0, min(a[1], b[1]) - max(a[0], b[0]))
-
-
-def union_overlap(a: list[INTERVAL_T], b: list[INTERVAL_T]) -> int:
-    """Total time two coalesced busy sets are busy at once, by a two-pointer merge -- linear, not quadratic."""
-    total = 0
-    i = j = 0
-    while i < len(a) and j < len(b):
-        total += interval_overlap(a[i], b[j])
-        if a[i][1] <= b[j][1]:
-            i += 1
-        else:
-            j += 1
-    return total
-
-
-@dataclass
-class CoreOccupancy:
-    """When each compute core was actually busy in one measured schedule."""
-
-    intervals: dict[int, list[INTERVAL_T]] = field(default_factory=dict)
-    load: dict[int, int] = field(default_factory=dict)
-    hull: dict[int, INTERVAL_T] = field(default_factory=dict)
-    node_groups: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
-    makespan: int = 0
-
-
-def core_occupancy(scme: Any, core_ids: list[int]) -> CoreOccupancy:
-    """Per-core busy windows of a measured schedule, read off the scheduled tiles.
-
-    `CoalaScheduler` stamps `start`/`end` on the very node objects the `StreamCostModelEvaluation` holds, so
-    this needs nothing the cost model doesn't already produce. Cores in `core_ids` that never ran a tile get an
-    empty busy set -- they are free to merge with anything.
-
-    Only *compute* occupancy is visible this way; see the module docstring for why that is a floor, not a
-    guarantee."""
-    offchip_core_id = getattr(scme.accelerator, "offchip_core_id", None)
-    raw: dict[int, list[INTERVAL_T]] = {core_id: [] for core_id in core_ids}
-    node_groups: dict[int, set[tuple[int, int]]] = {core_id: set() for core_id in core_ids}
-    makespan = 0
-    for node in scme.workload.node_list:
-        if not isinstance(node, ComputationNode):
-            continue
-        core_id = node.chosen_core_allocation
-        if core_id is None or core_id == offchip_core_id or core_id not in raw:
-            continue
-        start, end = int(node.start), int(node.end)
-        if start < 0 or end < start:
-            continue
-        raw[core_id].append((start, end))
-        node_groups[core_id].add((node.id, node.group))
-        makespan = max(makespan, end)
-
-    intervals = {core_id: coalesce(windows) for core_id, windows in raw.items()}
-    return CoreOccupancy(
-        intervals=intervals,
-        load={core_id: sum(end - start for start, end in windows) for core_id, windows in intervals.items()},
-        hull={
-            core_id: (windows[0][0], windows[-1][1]) if windows else (0, 0) for core_id, windows in intervals.items()
-        },
-        node_groups=node_groups,
-        makespan=makespan,
-    )
 
 
 # --------------------------------------------------------------------------------------- colouring -----------

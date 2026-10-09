@@ -2,7 +2,6 @@ import logging
 from typing import Any
 
 from onnx import NodeProto
-from zigzag.datatypes import Constants
 from zigzag.parser.onnx.utils import parse_onnx_model_from_path
 
 from stream.hardware.architecture.accelerator import Accelerator
@@ -36,7 +35,6 @@ from stream.parser.onnx.squeeze import SqueezeParser
 from stream.parser.onnx.ssm import SSMParser
 from stream.parser.onnx.transpose import TransposeParser
 from stream.parser.onnx.unsqueeze import UnsqueezeParser
-from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.mapping import InterCoreMappingAttributes
 from stream.workload.onnx_workload import ONNXWorkload
 

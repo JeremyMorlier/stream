@@ -1,3 +1,5 @@
+import logging
+
 import networkx as nx
 
 # if TYPE_CHECKING:
@@ -18,6 +20,8 @@ from stream.workload.steady_state.transfer import SteadyStateTransfer, TransferT
 from stream.workload.steady_state.workload import SteadyStateWorkload
 from stream.workload.tensor import Tensor
 from stream.workload.utils import get_real_in_edges, get_real_out_edges
+
+logger = logging.getLogger(__name__)
 
 
 class SteadyStateScheduler:
@@ -60,13 +64,9 @@ class SteadyStateScheduler:
         # At this point, the only nodes without an allocation are the transfer nodes
         offchip_core_id = self.accelerator.offchip_core_id
         tta = TransferAndTensorAllocator(ssw, tsa, offchip_core_id=offchip_core_id, iterations=self.iterations)
-        tsa_upd, total_latency = tta.solve()
-        print(tsa_upd)
-        tot, per_iter, ov = tsa_upd.compute_latency(iterations=self.iterations)
-        print(f"Total latency: {tot}, per iteration: {per_iter}, overlap: {ov}")
-        # tla = TensorLifetimeAnalyzer(ssw)
-        # tla.summary()
-        # tla.visualize()
+        tsa_upd, _total_latency = tta.solve()
+        total, per_iteration, overlap = tsa_upd.compute_latency(iterations=self.iterations)
+        logger.info(f"Steady-state latency: total={total}, per iteration={per_iteration}, overlap={overlap}.")
         return tsa_upd
 
     def prepare_graph(self, allocation: "TimeSlotAllocation") -> SteadyStateWorkload:
@@ -75,19 +75,14 @@ class SteadyStateScheduler:
         ssw = SteadyStateWorkload()
         # Add all computation nodes from the subgraph to the SteadyStateWorkload
         ssw = self.add_computation_nodes(ssw, steady_state_subgraph, allocation)
-        ssw.visualize_to_file("steady_state_workload_0.png")
         # Add the ConstantTensorNodes to the SteadyStateWorkload
         ssw = self.add_constant_tensor_nodes(ssw, steady_state_subgraph)
-        ssw.visualize_to_file("steady_state_workload_1.png")
         # Add the non-constant tensors from this iteration to the SteadyStateWorkload
         ssw = self.add_this_iteration_nonconstant_tensor_nodes(ssw)
-        ssw.visualize_to_file("steady_state_workload_2.png")
         # Add the TransferNodes to the SteadyStateWorkload
         ssw = self.add_transfer_nodes(ssw)
-        ssw.visualize_to_file("steady_state_workload_3.png")
         # Bufferize the non-constant steady state tensors
         ssw = self.bufferize_nonconstant_tensors(ssw)
-        ssw.visualize_to_file("steady_state_workload_4.png")
         return ssw
 
     def get_workload_subgraph(self, allocation: "TimeSlotAllocation") -> ComputationNodeWorkload:

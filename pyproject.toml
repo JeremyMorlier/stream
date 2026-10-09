@@ -32,6 +32,10 @@ dependencies = [
     "pydot>=4.0.1",
     "torch>=2.13.0",
     "graphviz>=0.21",
+    "matplotlib",
+    "networkx",
+    "seaborn",
+    "pyyaml",
 ]
 requires-python = ">=3.11"
 
@@ -44,9 +48,6 @@ profiling = [
 
 [project.urls]
 Homepage = "https://github.com/ZigZag-Project/stream"
-
-[project.scripts]
-realpython = "stream.__main__:main"
 
 [tool.bumpver]
 current_version = "0.0.8"

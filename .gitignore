@@ -148,12 +148,16 @@ outputs*/*.png
 *.png
 
 
-# docs makefile and make.bat
-docs/Makefile
-docs/make.bat
-
 # html files
 *.html
 
 # json files (for perfetto)
 *.json
+
+# local experiment and profiling leftovers
+logs/
+*.prof
+benchmark*.txt
+result.csv
+*.zip
+*.ipynb

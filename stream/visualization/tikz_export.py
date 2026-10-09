@@ -655,7 +655,7 @@ def pareto_topology_tikz(  # noqa: PLR0913
         "    stream front axis,",
         # The insets are placed against the axis box, so it has to be the box that is sized and anchored --
         # `scale only axis` keeps `width`/`height` off the labels and the colour bar.
-        f"    at={{(0cm,0cm)}}, anchor=south west, scale only axis=true,",
+        "    at={(0cm,0cm)}, anchor=south west, scale only axis=true,",
         f"    width={axis_width:.3f}cm, height={axis_height:.3f}cm,",
         f"    xlabel={{{_axis_label(x_key)}}}, ylabel={{{_axis_label(y_key)}}},",
         "    xmode=log, ymode=log,",

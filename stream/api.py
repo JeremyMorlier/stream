@@ -1,6 +1,17 @@
+"""Entry points of Stream: one function per design-space exploration, each assembling and running a chain of
+stages (see `docs/source/optimization.md` for the chains).
+
+- `optimize_allocation_ga` / `optimize_allocation_co`: layer-core allocation on a fixed accelerator and tiling.
+- `optimize_tiling`: genetic search over the tiling, optionally with a per-tile core-design search.
+- `optimize_schedules`: Pareto search over combinations of per-tile core designs.
+- `optimize_rolled_schedules`: the same, plus folding the accelerators onto fewer cores.
+- `optimize_rolled_tiling`: the tiling search wrapped around the rolled schedule search.
+- `optimize_graph_evolution`: evolving-graph search of the hardware graph and the mapping.
+"""
+
 import csv
-import math
 import logging as _logging
+import math
 import os
 import time as _time
 from typing import Any, Literal
@@ -16,11 +27,17 @@ from stream.opt.search_budget import SearchBudget
 from stream.stages.allocation.constraint_optimization_allocation import ConstraintOptimizationAllocationStage
 from stream.stages.allocation.genetic_algorithm_allocation import GeneticAlgorithmAllocationStage
 from stream.stages.estimation.zigzag_core_mapping_estimation import ZigZagCoreMappingEstimationStage
-from stream.stages.generation.core_architecture_exploration import CoreArchitectureExplorationStage, CoreParamRanges
+from stream.stages.generation.core_architecture_exploration import (
+    CoreArchitectureExplorationStage,
+    CoreDesignSelectionStage,
+    CoreParamRanges,
+    CustomCoreAcceleratorGenerationStage,
+)
 from stream.stages.generation.graph_evolution import GraphEvolutionStage
 from stream.stages.generation.layer_stacks_generation import LayerStacksGenerationStage
-from stream.stages.generation.rolled_schedule_exploration import RolledScheduleExplorationStage
 from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
+from stream.stages.generation.schedule_rolling import ScheduleRollingStage
+from stream.stages.generation.schedule_selection import ScheduleSelectionStage
 from stream.stages.generation.scheduling_order_generation import SchedulingOrderGenerationStage
 from stream.stages.generation.tiled_workload_generation import TiledWorkloadGenerationStage
 from stream.stages.generation.tiling_exploration import TilingExplorationStage, scme_objective
@@ -29,11 +46,26 @@ from stream.stages.parsing.accelerator_parser import AcceleratorParserStage
 from stream.stages.parsing.onnx_model_parser import ONNXModelParserStage as StreamONNXModelParserStage
 from stream.stages.set_fixed_allocation_performance import SetFixedAllocationPerformanceStage
 from stream.stages.stage import MainStage
+from stream.stages.visualization.schedule_results import ScheduleResultsWriterStage
+from stream.stages.visualization.schedule_tradeoff_plot import ScheduleTradeoffPlotStage
+from stream.stages.visualization.topology_report import TopologyReportStage
 from stream.utils import get_exclusive_stage_times, wrap_stages_with_timing
 
 _logging_level = _logging.INFO
 _logging_format = "%(asctime)s - %(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
 _logging.basicConfig(level=_logging_level, format=_logging_format)
+
+# The stages that schedule one fixed accelerator: the genetic-algorithm allocation needs a fixed scheduling order
+# and pre-fixed single-core allocations before it searches. The schedule searches measure every candidate by
+# running these.
+MEASUREMENT_STAGES = [
+    SetFixedAllocationPerformanceStage,
+    SchedulingOrderGenerationStage,
+    GeneticAlgorithmAllocationStage,
+]
+# Draw a schedule search's results. They sit before the search stages so they see what the search yields; the
+# innermost one (results writer) runs first.
+SCHEDULE_REPORT_STAGES = [TopologyReportStage, ScheduleTradeoffPlotStage, ScheduleResultsWriterStage]
 
 
 def _sanity_check_inputs(
@@ -79,6 +111,16 @@ def optimize_allocation_ga(  # noqa: PLR0913
     temporal_mapping_type: str = "uneven",
     profile: bool = False,
 ) -> StreamCostModelEvaluation:
+    """Schedule `workload` on the fixed `hardware` with the tiling of `mapping`, searching the layer-core
+    allocation with a genetic algorithm of `nb_ga_generations` generations of `nb_ga_individuals` individuals.
+
+    The tiled workload, the cost LUT and the resulting schedule are saved under
+    `{output_path}/{experiment_id}/`; with `skip_if_exists`, a saved schedule is loaded instead of re-running.
+    `profile` logs how long each stage took.
+
+    Returns:
+        The best schedule found, as a `StreamCostModelEvaluation`.
+    """
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
 
     # Create experiment_id path
@@ -112,9 +154,7 @@ def optimize_allocation_ga(  # noqa: PLR0913
             TilingGenerationStage,
             TiledWorkloadGenerationStage,
             ZigZagCoreMappingEstimationStage,
-            SetFixedAllocationPerformanceStage,
-            SchedulingOrderGenerationStage,
-            GeneticAlgorithmAllocationStage,
+            *MEASUREMENT_STAGES,
         ]
         timings: dict[str, list[float]] = {}
         list_of_callables = stage_classes
@@ -163,6 +203,15 @@ def optimize_allocation_co(  # noqa: PLR0913
     skip_if_exists: bool = False,
     temporal_mapping_type: str = "uneven",
 ) -> StreamCostModelEvaluation:
+    """Schedule `workload` on the fixed `hardware` with the tiling of `mapping`, allocating layers to cores by
+    constraint optimization (needs a Gurobi license).
+
+    The tiled workload, cost LUTs, allocations and the resulting schedule are saved under
+    `{output_path}/{experiment_id}/`; with `skip_if_exists`, a saved schedule is loaded instead of re-running.
+
+    Returns:
+        The resulting schedule, as a `StreamCostModelEvaluation`.
+    """
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
     _sanity_check_gurobi_license()
 
@@ -269,8 +318,10 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
     `(latency, energy, area)` -- `area` via `Core.get_area()`, `latency`/`energy` from the
     `CostModelEvaluation` ZigZag returns for that tile on that candidate core. Each unique tile's top
     `core_pareto_points` Pareto-front designs are also evaluated on every *other* unique tile and everything is
-    logged to a candidate-results CSV (see `CoreArchitectureExplorationStage`'s docstring). Runs once per
-    tiling-GA individual, nested inside `TilingExplorationStage`'s own worker processes.
+    logged to a candidate-results CSV (see `CoreArchitectureExplorationStage`'s docstring).
+    `CoreDesignSelectionStage` then keeps each front's best design by `sort_key` and
+    `CustomCoreAcceleratorGenerationStage` builds the accelerator from them. Runs once per tiling-GA individual,
+    nested inside `TilingExplorationStage`'s own worker processes.
 
     Args:
         nb_tiling_ga_generations: number of generations for the outer tiling-search genetic algorithm run by
@@ -334,17 +385,10 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
         logger.info(f"Loaded SCME from {scme_path}")
         return scme, []
 
-    # GA needs a fixed scheduling order and pre-fixed single-core allocations before searching (see
-    # optimize_allocation_ga).
     allocation_stage_kwargs: dict[str, Any] = {
         "nb_ga_generations": nb_ga_generations,
         "nb_ga_individuals": nb_ga_individuals,
     }
-    allocation_stage_classes = [
-        SetFixedAllocationPerformanceStage,
-        SchedulingOrderGenerationStage,
-        GeneticAlgorithmAllocationStage,
-    ]
 
     # Stages up to and including TilingExplorationStage run once in this process; everything after it
     # (TilingGenerationStage onward) runs per-candidate inside worker processes spawned by
@@ -355,17 +399,21 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
         LayerStacksGenerationStage,
         TilingExplorationStage,  # Sweeps candidate intra-/inter-core tiling configurations
     ]
-    # CoreArchitectureExplorationStage replaces the fixed-template accelerator generation: it runs once per
-    # tiling-GA individual (inside TilingExplorationStage's own worker processes) and searches per-layer core
-    # designs with its own nested NSGA2 GA before handing off to ZigZagCoreMappingEstimationStage. See its
-    # docstring for the resulting nested-multiprocessing caveat (core_max_workers defaults to 1 to avoid
-    # oversubscription).
+    # The core search replaces the fixed-template accelerator generation: once per tiling-GA individual (inside
+    # TilingExplorationStage's own worker processes) it searches per-tile core designs with its own nested NSGA2
+    # GA, keeps the best design per tile and assembles the accelerator ZigZagCoreMappingEstimationStage then
+    # runs on (core_max_workers defaults to 1 to avoid oversubscribing the machine).
+    core_search_stage_classes = [
+        CoreArchitectureExplorationStage,
+        CoreDesignSelectionStage,
+        CustomCoreAcceleratorGenerationStage,
+    ]
     per_candidate_stage_classes = [
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
-        *([CoreArchitectureExplorationStage] if explore_cores else []),
+        *(core_search_stage_classes if explore_cores else []),
         ZigZagCoreMappingEstimationStage,
-        *allocation_stage_classes,
+        *MEASUREMENT_STAGES,
     ]
     timings: dict[str, list[float]] = {}
     if profile:
@@ -406,7 +454,7 @@ def optimize_tiling(  # noqa: PLR0913, PLR0915
         layer_stacks=layer_stacks,
         tiling_candidates_dir=tiling_candidates_dir,  # required by TilingExplorationStage
         scme_path=scme_path,  # required by TilingExplorationStage
-        sort_key=sort_key,  # required by TilingExplorationStage (and forwarded on to CoreArchitectureExplorationStage)
+        sort_key=sort_key,  # required by TilingExplorationStage (and forwarded on to CoreDesignSelectionStage)
         max_workers=max_workers,  # required by TilingExplorationStage
         nb_tiling_ga_generations=nb_tiling_ga_generations,  # required by TilingExplorationStage
         nb_tiling_ga_individuals=nb_tiling_ga_individuals,  # required by TilingExplorationStage
@@ -477,11 +525,12 @@ def optimize_schedules(  # noqa: PLR0913
     over every combination of the per-tile Pareto core designs -- the multi-objective counterpart of
     `optimize_allocation_ga`, which evaluates a single fixed accelerator.
 
-    `CoreArchitectureExplorationStage` (used by `optimize_tiling`) searches a Pareto front of core designs per
-    unique tile and then collapses each front to its single best design by `sort_key`, so only one accelerator
-    is ever scheduled. Here `ScheduleExplorationStage` keeps every design instead and searches the product of
-    the fronts, measuring combinations through the real scheduler; the result is the set of schedules that are
-    non-dominated on all three objectives at once -- e.g. the one that gives up 5% latency for half the area.
+    `optimize_tiling` searches a Pareto front of core designs per unique tile (`CoreArchitectureExplorationStage`)
+    and then collapses each front to its single best design by `sort_key` (`CoreDesignSelectionStage`), so only
+    one accelerator is ever scheduled. Here `ScheduleExplorationStage` keeps every design instead and searches the
+    product of the fronts, measuring combinations through the real scheduler; the result is the set of schedules
+    that are non-dominated on all three objectives at once -- e.g. the one that gives up 5% latency for half the
+    area. `ScheduleSelectionStage` re-measures the best one by `sort_key`.
 
     The enumeration is a branch and bound, not a sweep: the accelerator topology is derived once (it does not
     depend on the designs), each distinct `(tile, design)` pair is cost-modelled by ZigZag exactly once, and
@@ -502,9 +551,9 @@ def optimize_schedules(  # noqa: PLR0913
 
     Returns:
         The best schedule by `sort_key` as a `StreamCostModelEvaluation`, and the full Pareto set as plain
-        records (ranks, latency, energy, area, bounds). The same records, the trade-off figure and the measured
-        schedules' CSV are written under `{output_path}/{experiment_id}/schedule_search/` -- see
-        `ScheduleExplorationStage`'s docstring for the artifact list.
+        records (ranks, latency, energy, area, bounds). The same records, the trade-off figure, the topology
+        report and the measured schedules' CSV are written under `{output_path}/{experiment_id}/schedule_search/`
+        by the visualization stages (see `stream.stages.visualization`).
     """
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
     os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
@@ -529,7 +578,7 @@ def optimize_schedules(  # noqa: PLR0913
         logger.info(f"Loaded SCME from {scme_path}")
         return scme, []
 
-    # ScheduleExplorationStage measures each combination by running the stages after it itself, with a cost LUT
+    # The schedule search measures each combination by running the measurement stages itself, with a cost LUT
     # it assembles from its own warm-up -- hence no ZigZagCoreMappingEstimationStage in this chain.
     stage_classes = [
         AcceleratorParserStage,
@@ -537,10 +586,11 @@ def optimize_schedules(  # noqa: PLR0913
         LayerStacksGenerationStage,
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
+        *SCHEDULE_REPORT_STAGES,
+        CoreArchitectureExplorationStage,
         ScheduleExplorationStage,
-        SetFixedAllocationPerformanceStage,
-        SchedulingOrderGenerationStage,
-        GeneticAlgorithmAllocationStage,
+        ScheduleSelectionStage,
+        *MEASUREMENT_STAGES,
     ]
 
     # Same one-off CACTI precompute as optimize_tiling: the core GA and every accelerator the schedule search
@@ -569,8 +619,8 @@ def optimize_schedules(  # noqa: PLR0913
         operands_to_prefetch=[],  # required by GeneticAlgorithmAllocationStage
         nb_ga_generations=nb_ga_generations,  # required by GeneticAlgorithmAllocationStage
         nb_ga_individuals=nb_ga_individuals,  # required by GeneticAlgorithmAllocationStage
-        sort_key=sort_key,  # required by ScheduleExplorationStage (inherited from CoreArchitectureExplorationStage)
-        nb_core_ga_generations=nb_core_ga_generations,  # required by the inherited per-tile core search
+        sort_key=sort_key,  # required by ScheduleSelectionStage
+        nb_core_ga_generations=nb_core_ga_generations,  # required by CoreArchitectureExplorationStage
         nb_core_ga_individuals=nb_core_ga_individuals,
         core_max_workers=core_max_workers,
         core_pareto_points=core_pareto_points,
@@ -674,7 +724,7 @@ def optimize_rolled_schedules(  # noqa: PLR0913
 
     Returns:
         The best schedule by `sort_key`, and the combined Pareto set as plain records. Artifacts are written
-        under `{output_path}/{experiment_id}/rolled_search/` -- see `RolledScheduleExplorationStage`.
+        under `{output_path}/{experiment_id}/rolled_search/` -- see `ScheduleRollingStage`.
     """
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
     os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
@@ -699,18 +749,20 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         logger.info(f"Loaded SCME from {scme_path}")
         return scme, []
 
-    # As in `optimize_schedules`, the exploration stage supplies its own cost LUT, so no
-    # ZigZagCoreMappingEstimationStage in this chain.
+    # As in `optimize_schedules`, the search supplies its own cost LUT, so no ZigZagCoreMappingEstimationStage in
+    # this chain. The rolling stage extends the unrolled search's archive before the best schedule is selected.
     stage_classes = [
         AcceleratorParserStage,
         StreamONNXModelParserStage,
         LayerStacksGenerationStage,
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
-        RolledScheduleExplorationStage,
-        SetFixedAllocationPerformanceStage,
-        SchedulingOrderGenerationStage,
-        GeneticAlgorithmAllocationStage,
+        *SCHEDULE_REPORT_STAGES,
+        CoreArchitectureExplorationStage,
+        ScheduleExplorationStage,
+        ScheduleRollingStage,
+        ScheduleSelectionStage,
+        *MEASUREMENT_STAGES,
     ]
 
     # Must happen before `mainstage.run()` forks anything, so every worker inherits the patch.
@@ -849,9 +901,7 @@ def optimize_graph_evolution(  # noqa: PLR0913
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
         GraphEvolutionStage,
-        SetFixedAllocationPerformanceStage,
-        SchedulingOrderGenerationStage,
-        GeneticAlgorithmAllocationStage,
+        *MEASUREMENT_STAGES,
     ]
 
     # Must happen before anything forks, so every worker inherits the patch.
@@ -928,10 +978,11 @@ def optimize_rolled_tiling(  # noqa: PLR0913
     fold_overlap: Literal["hull", "exact"] = "exact",
     fold_tolerances: tuple[float, ...] = (0.0, 0.25, 1.0),
 ) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
-    """The full rolled methodology: a GA over intra-/inter-core tilings, where every tiling candidate generates
-    its own hardware graph through `RolledScheduleExplorationStage` -- a per-tile core NSGA2 (stopping on front
-    hypervolume convergence), the unrolled schedule search over the per-tile fronts, then rolling onto fewer
-    cores -- and is scored by the best EDP on its (latency, energy, area) front.
+    """The full rolled methodology: a GA over intra-/inter-core tilings (`TilingExplorationStage`), where every
+    tiling candidate generates its own hardware graph -- a per-tile core NSGA2 stopping on front hypervolume
+    convergence (`CoreArchitectureExplorationStage`), the unrolled schedule search over the per-tile fronts
+    (`ScheduleExplorationStage`), then rolling onto fewer cores (`ScheduleRollingStage`) -- and is scored by the
+    best EDP on its (latency, energy, area) front.
 
     Candidates run one at a time in this process (their inner searches use `core_max_workers`), and every
     schedule measured anywhere is recorded on `search_budget`. The budget never cuts work that has started: a
@@ -966,10 +1017,12 @@ def optimize_rolled_tiling(  # noqa: PLR0913
     per_candidate_stage_classes = [
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
-        RolledScheduleExplorationStage,
-        SetFixedAllocationPerformanceStage,
-        SchedulingOrderGenerationStage,
-        GeneticAlgorithmAllocationStage,
+        *SCHEDULE_REPORT_STAGES,
+        CoreArchitectureExplorationStage,
+        ScheduleExplorationStage,
+        ScheduleRollingStage,
+        ScheduleSelectionStage,
+        *MEASUREMENT_STAGES,
     ]
 
     # Must happen before anything forks, so every worker inherits the patch.

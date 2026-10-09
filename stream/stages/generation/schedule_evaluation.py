@@ -319,3 +319,47 @@ class MeasurementPipeline:
         kwargs["cost_lut"] = cost_lut
         scme, _ = MainStage(list(self.list_of_callables), **kwargs).run()[0]
         return scme
+
+
+# ------------------------------------------------------------------------------------- search stages ----------
+
+
+class ScheduleSearchStage(Stage):
+    """Base of the stages that search schedules over core designs and hand their state down the chain
+    (`ScheduleExplorationStage` -> `ScheduleRollingStage` -> `ScheduleSelectionStage`).
+
+    The stages *after the last* schedule search stage in a chain form its measurement pipeline (see
+    `measurement_tail`): every search measures a schedule by running them, and the selection stage runs them
+    once more on the winner. A search stage can ask the ones before it for extra work through the class
+    attributes below, which upstream stages read with `downstream_requires` -- so placing a stage in the chain
+    is all it takes to switch that work on."""
+
+    # The full (tile shape x design) cost matrix rather than only the diagonal the unrolled search needs.
+    requires_full_cost_matrix: bool = False
+    # Per-core busy windows on every measured schedule (`core_occupancy`).
+    requires_core_occupancy: bool = False
+    # Class-level default so stages built without `__init__` (the synthetic tests) run unbudgeted.
+    search_budget: Any = None
+
+
+def measurement_tail(list_of_callables: list[StageCallable]) -> list[StageCallable]:
+    """The stages that schedule one accelerator: everything after the last `ScheduleSearchStage` in
+    `list_of_callables` (all of it if there is none)."""
+    last_search = max(
+        (index for index, stage in enumerate(list_of_callables) if _is_search_stage(stage)),
+        default=-1,
+    )
+    tail = list(list_of_callables[last_search + 1 :])
+    if not tail:
+        raise ValueError("A schedule search needs measurement stages after it (e.g. the allocation stages).")
+    return tail
+
+
+def downstream_requires(list_of_callables: list[StageCallable], requirement: str) -> bool:
+    """Whether any stage in `list_of_callables` sets the class attribute `requirement` (see
+    `ScheduleSearchStage`)."""
+    return any(getattr(stage, requirement, False) for stage in list_of_callables)
+
+
+def _is_search_stage(stage: StageCallable) -> bool:
+    return isinstance(stage, type) and issubclass(stage, ScheduleSearchStage)

@@ -1,3 +1,15 @@
+"""Per-tile core-architecture search: one NSGA2 Pareto front of core designs per unique tile shape, and the
+stages that turn those fronts into an accelerator.
+
+- `CoreArchitectureExplorationStage` searches the fronts (or reuses saved ones) and hands them down as
+  `core_pareto_fronts`.
+- `CoreDesignSelectionStage` collapses each front to its single best design, and
+  `CustomCoreAcceleratorGenerationStage` assembles the group-dedicated accelerator from those designs -- the
+  single-accelerator path `optimize_tiling` uses.
+- The schedule searches (`ScheduleExplorationStage` and the stages after it) instead keep every design and
+  search their combinations.
+"""
+
 import array
 import copy
 import csv
@@ -16,7 +28,7 @@ from typing import Any
 import yaml
 from deap import base, creator, tools
 from zigzag.mapping.temporal_mapping import TemporalMappingType
-from zigzag.utils import pickle_deepcopy, pickle_save
+from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
 
 from stream.hardware.architecture.accelerator import Accelerator
 from stream.hardware.architecture.core_generator import (
@@ -33,6 +45,7 @@ from stream.stages.estimation.zigzag_core_mapping_estimation import (
     evaluate_node_on_core,
     lowest_memory_level_violations,
 )
+from stream.stages.generation.schedule_evaluation import downstream_requires
 from stream.stages.generation.tiled_workload_accelerator_generation import (
     RolledTopology,
     derive_group_dedicated_topology,
@@ -179,6 +192,7 @@ class CoreGeneLayout:
 
     @property
     def n_genes_per_node(self) -> int:
+        """Length of one core's gene segment."""
         return len(self.low)
 
     def decode_node(self, values: "array.array | list[float] | tuple[float, ...]", name: str) -> dict[str, Any]:
@@ -241,8 +255,8 @@ class CoreGeneLayout:
 class ParetoCoreSearchResult:
     """Everything the per-tile core search produced, in plain data.
 
-    Returned by `search_pareto_fronts` so callers that want the *whole* front per tile -- rather than the
-    single best design `run` picks -- can have it without re-running the GA (see `ScheduleExplorationStage`)."""
+    Handed down the chain as `core_pareto_fronts`: `CoreDesignSelectionStage` keeps one design per tile,
+    `ScheduleExplorationStage` searches combinations of all of them."""
 
     designs_per_tile: list[list[dict[str, Any]]]  # per unique tile: [{"core_dict": ..., "fitness": (l, e, a)}]
     unique_tiles: list[ComputationNode]
@@ -283,6 +297,8 @@ class CustomCoreAcceleratorGenerationStage(Stage):
         yield from sub_stage.run()
 
     def build_custom_accelerator(self, save_yaml: bool = True) -> Accelerator:
+        """Assemble the accelerator (pinning every tile to its core), saving it to `accelerator.yaml` next to the
+        tiled workload unless `save_yaml` is False."""
         return assemble_custom_accelerator(
             self.workload,
             self.original_workload,
@@ -487,30 +503,27 @@ class CoreArchitectureExplorationStage(Stage):
 
     Each unique tile gets its own independent NSGA2 run, evaluated directly via
     `stream.stages.estimation.zigzag_core_mapping_estimation.evaluate_node_on_core` -- no accelerator assembly,
-    no full downstream pipeline per candidate, unlike the old whole-accelerator-per-individual search. Once a
-    tile's search finishes, up to `core_pareto_points` representative designs are selected from its Pareto
-    front (crowding-distance-diverse, via `tools.selNSGA2`), and *every* one of them is also evaluated on
-    *every other* unique tile (an `n_tiles x core_pareto_points x (n_tiles - 1)` cross sweep) -- this surfaces
-    designs that generalize well across tile shapes, not just ones overfit to their own tile. Every evaluated
-    `(origin_tile, design, evaluated_on_tile)` triple is written to `candidate_results_csv_path`.
+    no full downstream pipeline per candidate. Once a tile's search finishes, up to `core_pareto_points`
+    representative designs are selected from its Pareto front (crowding-distance-diverse, via
+    `tools.selNSGA2`). Unless the chain later cost-models the full shape x design matrix itself (a stage with
+    `requires_full_cost_matrix`, see `ScheduleSearchStage`), every one of them is also evaluated on *every other*
+    unique tile -- this surfaces designs that generalize well across tile shapes, not just ones overfit to their
+    own tile. Every evaluated `(origin_tile, design, evaluated_on_tile)` triple is written to
+    `candidate_results_csv_path`.
 
-    Finally, for each unique tile, the design with the best native (`origin == evaluated_on`) `sort_key` value
-    is picked to populate `node_core_dicts` (one design per original workload node, via a
-    representative-tile-shape match), and handed to `CustomCoreAcceleratorGenerationStage` to assemble the real
-    accelerator and run the actual downstream pipeline (`ZigZagCoreMappingEstimationStage` + allocation) --
-    exactly once, since the search itself no longer needs to.
+    The fronts are handed to the next stage as `core_pareto_fronts` (a `ParetoCoreSearchResult`), together with
+    the `workload`, `original_workload`, `accelerator`, `tiled_workload_path` and `core_max_workers` this stage
+    consumed: `CoreDesignSelectionStage` to build one accelerator from them, or `ScheduleExplorationStage` to
+    search their combinations.
 
-    Drop-in replacement for `TiledWorkloadAcceleratorGenerationStage` in `optimize_tiling`'s per-candidate
-    pipeline: under a joint tiling+hardware search this stage runs once per tiling-GA individual, *inside*
-    `TilingExplorationStage`'s own worker processes -- but since each evaluation here is a single direct
-    ZigZag call (not a full nested pipeline run), that nesting is much cheaper than it used to be.
+    Under a joint tiling+hardware search this stage runs once per tiling-GA individual, *inside*
+    `TilingExplorationStage`'s own worker processes -- but since each evaluation here is a single direct ZigZag
+    call (not a full nested pipeline run), that nesting stays affordable.
     """
 
     # Class-level defaults so stages built without `__init__` (the synthetic tests) run the unbudgeted search.
     search_budget: "SearchBudget | None" = None
     core_convergence_patience: int | None = None
-    # Evaluate every tile's kept designs on every other tile shape (results go to `candidate_results.csv`).
-    # Subclasses that cost-model the full shape x design matrix themselves turn it off.
     cross_tile_evaluation: bool = True
 
     def __init__(  # noqa: PLR0913
@@ -521,7 +534,6 @@ class CoreArchitectureExplorationStage(Stage):
         original_workload: ONNXWorkload,
         accelerator: Accelerator,
         tiled_workload_path: str,
-        sort_key: str = "latency",
         core_max_workers: int | None = 1,
         nb_core_ga_generations: int = 4,
         nb_core_ga_individuals: int = 8,
@@ -532,8 +544,29 @@ class CoreArchitectureExplorationStage(Stage):
         all_evaluated_cores_csv_path: str | None = None,
         core_convergence_patience: int | None = None,
         core_rel_tol: float = 0.005,
+        reuse_pareto_fronts: bool = False,
+        cross_tile_evaluation: bool | None = None,
         **kwargs: Any,
     ):
+        """
+        Args:
+            core_max_workers: worker processes for the GA's design evaluations.
+            nb_core_ga_generations: hard cap on each tile's NSGA2 generations.
+            nb_core_ga_individuals: NSGA2 population (rounded up to a multiple of 4).
+            core_pareto_points: designs kept per tile front.
+            core_max_pareto_schedules: cap on the per-tile design combinations enumerated into
+                `core_search/pareto_schedules.pickle` for offline evaluation.
+            core_param_ranges: overrides for `CoreParamRanges`.
+            candidate_results_csv_path, all_evaluated_cores_csv_path: where the cross-tile results and every
+                evaluated design go; default to `core_search/` next to the tiled workload.
+            core_convergence_patience: stop a tile's GA once its front hypervolume gained less than `core_rel_tol`
+                over this many generations (no convergence stop when None).
+            core_rel_tol: relative hypervolume gain counted as progress.
+            reuse_pareto_fronts: reuse `core_search/pareto_fronts.pickle` from an earlier run instead of
+                re-running the GA, when it matches this workload's unique tile count.
+            cross_tile_evaluation: evaluate every kept design on every other tile shape. Defaults to doing so
+                unless a later stage cost-models the full shape x design matrix itself.
+        """
         super().__init__(list_of_callables, **kwargs)
         # Each tile's NSGA2 stops on convergence (front hypervolume gaining < `core_rel_tol` over
         # `core_convergence_patience` generations) when a patience is given, or before a new generation once the
@@ -546,18 +579,26 @@ class CoreArchitectureExplorationStage(Stage):
         self.original_workload = original_workload
         self.accelerator = accelerator
         self.tiled_workload_path = tiled_workload_path
-        self.sort_key = sort_key
         self.max_workers = core_max_workers
         self.nb_core_ga_generations = nb_core_ga_generations
         self.nb_core_ga_individuals = nb_core_ga_individuals
         self.core_pareto_points = core_pareto_points
         self.max_pareto_schedules = core_max_pareto_schedules
         self.gene_ranges = CoreParamRanges(**(core_param_ranges or {}))
+        self.core_search_dir = os.path.join(os.path.dirname(tiled_workload_path), "core_search")
         self.candidate_results_csv_path = candidate_results_csv_path or os.path.join(
-            os.path.dirname(tiled_workload_path), "core_search", "candidate_results.csv"
+            self.core_search_dir, "candidate_results.csv"
         )
         self.all_evaluated_cores_csv_path = all_evaluated_cores_csv_path or os.path.join(
-            os.path.dirname(tiled_workload_path), "core_search", "all_evaluated_cores.csv"
+            self.core_search_dir, "all_evaluated_cores.csv"
+        )
+        self.reuse_pareto_fronts = reuse_pareto_fronts
+        # The full-matrix warm-up of a later stage runs every design on every tile shape with the complete
+        # ZigZag stage, so the lighter cross-tile pass would only recompute the same pairs.
+        self.cross_tile_evaluation = (
+            not downstream_requires(list_of_callables, "requires_full_cost_matrix")
+            if cross_tile_evaluation is None
+            else cross_tile_evaluation
         )
 
     def _unique_tiles(self) -> tuple[list[ComputationNode], dict[int, int]]:
@@ -672,10 +713,8 @@ class CoreArchitectureExplorationStage(Stage):
         return (tools.selNSGA2(list(pareto_front), n_points) if n_points else []), history
 
     def search_pareto_fronts(self) -> ParetoCoreSearchResult:  # noqa: PLR0915
-        """Search every unique tile's Pareto front of core designs.
-
-        Split out of `run` so subclasses can take the *whole* front per tile instead of the single best design
-        `run` collapses it to -- `ScheduleExplorationStage` searches combinations across those fronts."""
+        """Search every unique tile's Pareto front of core designs, saving them to
+        `core_search/pareto_fronts.pickle`."""
         loma_lpf_limit = self.kwargs["loma_lpf_limit"]
         temporal_mapping_type = self.kwargs["temporal_mapping_type"]
 
@@ -848,9 +887,8 @@ class CoreArchitectureExplorationStage(Stage):
                 ]
             )
 
-        pareto_fronts_dir = os.path.join(os.path.dirname(self.tiled_workload_path), "core_search")
-        os.makedirs(pareto_fronts_dir, exist_ok=True)
-        pareto_fronts_path = os.path.join(pareto_fronts_dir, "pareto_fronts.pickle")
+        os.makedirs(self.core_search_dir, exist_ok=True)
+        pareto_fronts_path = os.path.join(self.core_search_dir, "pareto_fronts.pickle")
         pickle_save(decoded_designs_per_tile, pareto_fronts_path)  # type: ignore
         logger.info(
             f"CoreArchitectureExplorationStage: saved {sum(len(f) for f in decoded_designs_per_tile)} pareto-front "
@@ -867,98 +905,50 @@ class CoreArchitectureExplorationStage(Stage):
             tiles_by_original=tiles_by_original,
         )
 
-    @staticmethod
-    def _extra_shapes_per_unique_tile(search: ParetoCoreSearchResult) -> dict[int, set[int]]:
-        """Which *other* tile shape classes each unique tile's chosen design will also have to run.
-
-        `_build_node_core_dicts` gives every tile of an original node the design its *representative* tile
-        picked, so a node whose tiles are not all the same shape makes one design responsible for several
-        shapes -- and the per-tile GA only ever checked it against its own. Empty for every unique tile whose
-        node is uniformly shaped, which is the usual case."""
-        extra: dict[int, set[int]] = {}
-        for tiles in search.tiles_by_original.values():
-            representative = search.tile_to_unique_index[id(tiles[0])]
-            others = {search.tile_to_unique_index[id(tile)] for tile in tiles} - {representative}
-            if others:
-                extra.setdefault(representative, set()).update(others)
-        return extra
-
-    def _designs_running(
-        self,
-        unique_index: int,
-        designs: list[dict[str, Any]],
-        unique_tiles: list[ComputationNode],
-        extra_shapes: dict[int, set[int]],
-    ) -> list[dict[str, Any]]:
-        """`designs` restricted to the ones that can also map the other shapes they will have to run (see
-        `_extra_shapes_per_unique_tile`). A design that cannot raises `NoValidLoopOrderingFoundException` in the
-        downstream `ZigZagCoreMappingEstimationStage`, which aborts the whole pipeline."""
-        shapes = extra_shapes.get(unique_index)
-        if not shapes:
-            return designs
-        usable = [
-            design
-            for design in designs
-            if not any(
-                lowest_memory_level_violations(
-                    unique_tiles[shape], build_core_from_dict(design["core_dict"], core_id=0)
-                )
-                for shape in sorted(shapes)
+    def _load_pareto_fronts(self) -> list[list[dict[str, Any]]] | None:
+        fronts_path = os.path.join(self.core_search_dir, "pareto_fronts.pickle")
+        if not (self.reuse_pareto_fronts and os.path.exists(fronts_path)):
+            return None
+        fronts = pickle_load(fronts_path)
+        unique_tiles, _ = self._unique_tiles()
+        if not isinstance(fronts, list) or len(fronts) != len(unique_tiles):
+            logger.warning(
+                f"CoreArchitectureExplorationStage: ignoring {fronts_path} -- it holds {len(fronts)} front(s) but "
+                f"this workload has {len(unique_tiles)} unique tile(s)."
             )
-        ]
-        if not usable:
-            raise ValueError(
-                f"CoreArchitectureExplorationStage: no design on tile {unique_index}'s front can map the other "
-                f"tile shapes {sorted(shapes)} of its node. Widen `core_param_ranges` so larger innermost "
-                f"memories are reachable."
-            )
-        if len(usable) < len(designs):
-            logger.info(
-                f"CoreArchitectureExplorationStage: {len(designs) - len(usable)} of tile {unique_index}'s "
-                f"design(s) cannot map the other shapes {sorted(shapes)} its node runs; picking among the rest."
-            )
-        return usable
+            return None
+        logger.info(
+            f"CoreArchitectureExplorationStage: reusing {sum(map(len, fronts))} core design(s) from {fronts_path}."
+        )
+        return fronts
 
-    def run(self):
-        """Search every unique tile's Pareto front, then collapse each front to its single best design by
-        `sort_key` and hand the resulting accelerator to the rest of the pipeline."""
-        search = self.search_pareto_fronts()
-
-        sort_index = {"latency": 0, "energy": 1, "area": 2}[self.sort_key]
-        extra_shapes = self._extra_shapes_per_unique_tile(search)
-        best_design_per_tile: list[dict[str, Any]] = []
-        for unique_index, designs in enumerate(search.designs_per_tile):
-            usable = self._designs_running(unique_index, designs, search.unique_tiles, extra_shapes)
-            best_design_per_tile.append(min(usable, key=lambda design: design["fitness"][sort_index])["core_dict"])
-        node_core_dicts = self._build_node_core_dicts(
-            best_design_per_tile, search.original_nodes, search.tiles_by_original, search.tile_to_unique_index
+    def get_pareto_fronts(self) -> ParetoCoreSearchResult:
+        """The per-tile fronts: reused from an earlier run when `reuse_pareto_fronts` allows it, else searched."""
+        fronts = self._load_pareto_fronts()
+        if fronts is None:
+            return self.search_pareto_fronts()
+        unique_tiles, tile_to_unique_index = self._unique_tiles()
+        original_nodes = get_original_nodes(self.original_workload)
+        return ParetoCoreSearchResult(
+            designs_per_tile=fronts,
+            unique_tiles=unique_tiles,
+            tile_to_unique_index=tile_to_unique_index,
+            original_nodes=original_nodes,
+            tiles_by_original=get_tiles_by_original_node(self.workload, original_nodes),
         )
 
+    def run(self):
+        """Search (or reuse) every unique tile's Pareto front and hand it to the next stage."""
         kwargs = self.kwargs.copy()
+        kwargs["core_pareto_fronts"] = self.get_pareto_fronts()
+        # Forwarded by reference: `tile_to_unique_index` is keyed by `id()` of this very workload's tiles.
         kwargs["workload"] = self.workload
         kwargs["original_workload"] = self.original_workload
         kwargs["accelerator"] = self.accelerator
-        kwargs["node_core_dicts"] = node_core_dicts
         kwargs["tiled_workload_path"] = self.tiled_workload_path
-        sub_stage = CustomCoreAcceleratorGenerationStage(self.list_of_callables, **kwargs)
+        kwargs["core_max_workers"] = self.max_workers
+        sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
         yield from sub_stage.run()
-
-    def _build_node_core_dicts(
-        self,
-        design_per_tile: list[dict[str, Any]],
-        original_nodes: list[ComputationNode],
-        tiles_by_original: dict[ComputationNode, list[ComputationNode]],
-        tile_to_unique_index: dict[int, int],
-    ) -> dict[int, dict[str, Any]]:
-        """Map one core-dict choice per unique tile onto every original workload node (via a representative-
-        tile-shape match). Shared by the single-best-design path and every enumerated schedule (see
-        `_save_pareto_schedules`) so the assembly logic isn't duplicated."""
-        node_core_dicts: dict[int, dict[str, Any]] = {}
-        for original_node in original_nodes:
-            representative_tile = tiles_by_original[original_node][0]
-            unique_index = tile_to_unique_index[id(representative_tile)]
-            node_core_dicts[original_node.id] = design_per_tile[unique_index]
-        return node_core_dicts
 
     def _save_pareto_schedules(
         self,
@@ -993,7 +983,7 @@ class CoreArchitectureExplorationStage(Stage):
                         {"tile_index": t, "rank": r, "fitness": decoded_designs_per_tile[t][r]["fitness"]}
                         for t, r in enumerate(rank_combo)
                     ],
-                    "node_core_dicts": self._build_node_core_dicts(
+                    "node_core_dicts": build_node_core_dicts(
                         design_per_tile, original_nodes, tiles_by_original, tile_to_unique_index
                     ),
                 }
@@ -1003,3 +993,119 @@ class CoreArchitectureExplorationStage(Stage):
             f"CoreArchitectureExplorationStage: generated and saved {len(schedules)} full pareto-schedule "
             f"combination(s) to {schedules_path}."
         )
+
+
+def build_node_core_dicts(
+    design_per_tile: list[dict[str, Any]],
+    original_nodes: list[ComputationNode],
+    tiles_by_original: dict[ComputationNode, list[ComputationNode]],
+    tile_to_unique_index: dict[int, int],
+) -> dict[int, dict[str, Any]]:
+    """Map one core-dict choice per unique tile onto every original workload node (via a representative-tile-shape
+    match). Shared by the single-best-design path and every enumerated schedule (see `_save_pareto_schedules`) so
+    the assembly logic isn't duplicated."""
+    node_core_dicts: dict[int, dict[str, Any]] = {}
+    for original_node in original_nodes:
+        representative_tile = tiles_by_original[original_node][0]
+        unique_index = tile_to_unique_index[id(representative_tile)]
+        node_core_dicts[original_node.id] = design_per_tile[unique_index]
+    return node_core_dicts
+
+
+def extra_shapes_per_unique_tile(search: ParetoCoreSearchResult) -> dict[int, set[int]]:
+    """Which *other* tile shape classes each unique tile's chosen design will also have to run.
+
+    `build_node_core_dicts` gives every tile of an original node the design its *representative* tile picked, so a
+    node whose tiles are not all the same shape makes one design responsible for several shapes -- and the per-tile
+    GA only ever checked it against its own. Empty for every unique tile whose node is uniformly shaped, which is
+    the usual case."""
+    extra: dict[int, set[int]] = {}
+    for tiles in search.tiles_by_original.values():
+        representative = search.tile_to_unique_index[id(tiles[0])]
+        others = {search.tile_to_unique_index[id(tile)] for tile in tiles} - {representative}
+        if others:
+            extra.setdefault(representative, set()).update(others)
+    return extra
+
+
+class CoreDesignSelectionStage(Stage):
+    """Collapses each per-tile front (`core_pareto_fronts`) to its single best design by `sort_key` (`latency`,
+    `energy` or `area`, on the design's own tile), maps those designs onto the original nodes and hands
+    `node_core_dicts` to the next stage -- normally `CustomCoreAcceleratorGenerationStage`, which builds the
+    accelerator the rest of the pipeline runs on."""
+
+    def __init__(  # noqa: PLR0913
+        self,
+        list_of_callables: list[StageCallable],
+        *,
+        core_pareto_fronts: ParetoCoreSearchResult,
+        workload: ComputationNodeWorkload,
+        original_workload: ONNXWorkload,
+        accelerator: Accelerator,
+        tiled_workload_path: str,
+        sort_key: str = "latency",
+        **kwargs: Any,
+    ):
+        super().__init__(list_of_callables, **kwargs)
+        self.core_pareto_fronts = core_pareto_fronts
+        self.workload = workload
+        self.original_workload = original_workload
+        self.accelerator = accelerator
+        self.tiled_workload_path = tiled_workload_path
+        self.sort_key = sort_key
+
+    @staticmethod
+    def _designs_running(
+        unique_index: int,
+        designs: list[dict[str, Any]],
+        unique_tiles: list[ComputationNode],
+        extra_shapes: dict[int, set[int]],
+    ) -> list[dict[str, Any]]:
+        """`designs` restricted to the ones that can also map the other shapes they will have to run (see
+        `extra_shapes_per_unique_tile`). A design that cannot raises `NoValidLoopOrderingFoundException` in the
+        downstream `ZigZagCoreMappingEstimationStage`, which aborts the whole pipeline."""
+        shapes = extra_shapes.get(unique_index)
+        if not shapes:
+            return designs
+        usable = [
+            design
+            for design in designs
+            if not any(
+                lowest_memory_level_violations(
+                    unique_tiles[shape], build_core_from_dict(design["core_dict"], core_id=0)
+                )
+                for shape in sorted(shapes)
+            )
+        ]
+        if not usable:
+            raise ValueError(
+                f"CoreDesignSelectionStage: no design on tile {unique_index}'s front can map the other tile shapes "
+                f"{sorted(shapes)} of its node. Widen `core_param_ranges` so larger innermost memories are "
+                f"reachable."
+            )
+        if len(usable) < len(designs):
+            logger.info(
+                f"CoreDesignSelectionStage: {len(designs) - len(usable)} of tile {unique_index}'s design(s) cannot "
+                f"map the other shapes {sorted(shapes)} its node runs; picking among the rest."
+            )
+        return usable
+
+    def run(self):
+        search = self.core_pareto_fronts
+        sort_index = {"latency": 0, "energy": 1, "area": 2}[self.sort_key]
+        extra_shapes = extra_shapes_per_unique_tile(search)
+        best_design_per_tile: list[dict[str, Any]] = []
+        for unique_index, designs in enumerate(search.designs_per_tile):
+            usable = self._designs_running(unique_index, designs, search.unique_tiles, extra_shapes)
+            best_design_per_tile.append(min(usable, key=lambda design: design["fitness"][sort_index])["core_dict"])
+
+        kwargs = self.kwargs.copy()
+        kwargs["workload"] = self.workload
+        kwargs["original_workload"] = self.original_workload
+        kwargs["accelerator"] = self.accelerator
+        kwargs["node_core_dicts"] = build_node_core_dicts(
+            best_design_per_tile, search.original_nodes, search.tiles_by_original, search.tile_to_unique_index
+        )
+        kwargs["tiled_workload_path"] = self.tiled_workload_path
+        sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
+        yield from sub_stage.run()

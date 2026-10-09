@@ -8,7 +8,8 @@ The stubbed measurement deliberately returns a *coupled* latency/energy above th
 coupling, from contention and transfers, is exactly what the bounds cannot see), so the test exercises the real
 situation rather than one where bounds happen to be tight.
 
-Run directly with `python test_schedule_exploration.py`, or collect with `pytest test_schedule_exploration.py`.
+Run directly with `python test_schedule_exploration.py`, or collect with
+`pytest test_schedule_exploration.py`.
 """
 
 import itertools
@@ -17,6 +18,7 @@ from types import SimpleNamespace
 
 from stream.stages.generation.schedule_evaluation import dominates
 from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
+from stream.stages.generation.schedule_space import ScheduleSpace
 
 
 def build_stage(seed: int, nb_classes: int = 3, nb_ranks: int = 4) -> ScheduleExplorationStage:
@@ -24,45 +26,46 @@ def build_stage(seed: int, nb_classes: int = 3, nb_ranks: int = 4) -> ScheduleEx
     tile DAG and two cores, with `_measure` stubbed by a deterministic pseudo-scheduler."""
     rng = random.Random(seed)
     stage = object.__new__(ScheduleExplorationStage)
+    space = stage.space = object.__new__(ScheduleSpace)
 
-    stage.decision_classes = list(range(nb_classes))
-    stage.depth_of_class = {class_index: class_index for class_index in range(nb_classes)}
-    stage.designs_per_class = [
+    space.decision_classes = list(range(nb_classes))
+    space.depth_of_class = {class_index: class_index for class_index in range(nb_classes)}
+    space.designs_per_class = [
         [{"core_dict": {"name": f"core_{c}_{r}", "knob": rng.randrange(10**6)}} for r in range(nb_ranks)]
         for c in range(nb_classes)
     ]
 
     # One cost pair per class, plus an extra pair on class 0 to exercise "this tile shape, that class's design".
-    stage.cost_pairs = [(c, c) for c in range(nb_classes)] + [(nb_classes, 0)]
-    stage.pair_depth = [c for c in range(nb_classes)] + [0]
-    stage.pair_multiplicity = [rng.randint(1, 4) for _ in stage.cost_pairs]
+    space.cost_pairs = [(c, c) for c in range(nb_classes)] + [(nb_classes, 0)]
+    space.pair_depth = [c for c in range(nb_classes)] + [0]
+    space.pair_multiplicity = [rng.randint(1, 4) for _ in space.cost_pairs]
 
-    stage.pair_runtime = [[rng.uniform(10, 200) for _ in range(nb_ranks)] for _ in stage.cost_pairs]
-    stage.pair_energy = [[rng.uniform(1e3, 1e5) for _ in range(nb_ranks)] for _ in stage.cost_pairs]
+    stage.pair_runtime = [[rng.uniform(10, 200) for _ in range(nb_ranks)] for _ in space.cost_pairs]
+    stage.pair_energy = [[rng.uniform(1e3, 1e5) for _ in range(nb_ranks)] for _ in space.cost_pairs]
     stage.pair_min_runtime = [min(runtimes) for runtimes in stage.pair_runtime]
     stage.pair_min_energy = [min(energies) for energies in stage.pair_energy]
     stage.class_area = [[rng.uniform(100, 5000) for _ in range(nb_ranks)] for _ in range(nb_classes)]
     stage.class_min_area = [min(areas) for areas in stage.class_area]
 
     # Two cores, each hosting some of the pairs, and a chain of tiles for the critical-path bound.
-    stage.counts_per_core = [
-        [(index, count) for index, count in enumerate(stage.pair_multiplicity) if index % 2 == parity]
+    space.counts_per_core = [
+        [(index, count) for index, count in enumerate(space.pair_multiplicity) if index % 2 == parity]
         for parity in (0, 1)
     ]
-    stage.topo_pair_index = [index for index, count in enumerate(stage.pair_multiplicity) for _ in range(count)]
-    stage.topo_predecessors = [
-        [] if position == 0 else [position - 1] for position in range(len(stage.topo_pair_index))
+    space.topo_pair_index = [index for index, count in enumerate(space.pair_multiplicity) for _ in range(count)]
+    space.topo_predecessors = [
+        [] if position == 0 else [position - 1] for position in range(len(space.topo_pair_index))
     ]
 
     # Cores carrying each decision class -- only used for the `nb_cores` field on a measured record.
-    stage.cores_per_class = dict.fromkeys(range(nb_classes), 1)
+    space.cores_per_class = dict.fromkeys(range(nb_classes), 1)
 
     stage.rank_order = [list(range(nb_ranks)) for _ in range(nb_classes)]
     stage.nb_combinations = nb_ranks**nb_classes
     stage.max_schedule_evaluations = 10**6
     stage.max_search_nodes = 10**6
 
-    def fake_measure(ranks, save_yaml=False):
+    def fake_measure(ranks):
         """Stand-in for the scheduler: never faster or cheaper than the bounds, but coupled across classes so
         the bounds stay loose, the way contention and transfers make them in a real schedule."""
         latency_bound, energy_bound, _area = stage._bounds(ranks)
@@ -125,7 +128,7 @@ def test_bounds_are_monotone_in_the_assignment():
     stage = build_stage(seed=7)
     for ranks in itertools.product(*(range(len(r)) for r in stage.rank_order)):
         previous = stage._bounds(ranks, depth=0)
-        for depth in range(1, len(stage.decision_classes) + 1):
+        for depth in range(1, len(stage.space.decision_classes) + 1):
             current = stage._bounds(ranks, depth=depth)
             assert all(c >= p - 1e-9 for c, p in zip(current, previous, strict=True)), (
                 f"bound decreased at depth {depth} for {ranks}: {previous} -> {current}"

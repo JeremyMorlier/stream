@@ -1,3 +1,11 @@
+"""Genetic search over every layer's intra-/inter-core tiling (`TilingExplorationStage`).
+
+Each individual assigns every layer one intra-core tiling factor per dimension and at most one inter-core split;
+it is decoded onto a copy of the workload and evaluated by running the rest of the stage chain on it -- in
+worker processes, or one at a time in this process (`evaluate_in_process`) when the chain is itself parallel.
+Results are cached on disk per candidate, so identical individuals are only ever evaluated once.
+"""
+
 import array
 import csv
 import functools
@@ -72,6 +80,7 @@ def prime_divisors(n: int) -> list[int]:
 
 
 def prime_factors(n: int) -> set[int]:
+    """The distinct prime factors of `n`."""
     factors: set[int] = set()
     d = 2
     while d * d <= n:
@@ -338,7 +347,7 @@ def scme_objective(scme: Any, sort_key: str) -> float:
 
 def _candidate_fitness(scme: Any, sub_extra_info: Any, sort_key: str) -> float:
     """A candidate's fitness: its returned schedule's `sort_key`, or -- when the per-candidate pipeline returns a
-    whole Pareto set (`RolledScheduleExplorationStage`) -- the best `sort_key` over that set."""
+    whole Pareto set (a schedule search ending in `ScheduleSelectionStage`) -- the best `sort_key` over that set."""
     if isinstance(sub_extra_info, dict) and sub_extra_info.get("pareto_schedules"):
         records = sub_extra_info["pareto_schedules"]
         if sort_key == "edp":
@@ -417,13 +426,6 @@ def _evaluate_tiling_individual(  # noqa: PLR0913
     extra_info = {"tiling_config": per_node, "candidate_index": key, "fitness": fitness}
     if isinstance(sub_extra_info, dict) and "pareto_schedules" in sub_extra_info:
         extra_info["pareto_schedules"] = sub_extra_info["pareto_schedules"]
-    # CoreArchitectureExplorationStage (if present in the per-candidate chain) yields its own extra_info with
-    # the winning core design's identifying keys -- surface it here so it isn't silently dropped.
-    if isinstance(sub_extra_info, dict) and "core_node_ids" in sub_extra_info:
-        extra_info["core_config"] = {
-            "candidate_index": sub_extra_info.get("candidate_index"),
-            "core_node_ids": sub_extra_info.get("core_node_ids"),
-        }
     pickle_save((scme, extra_info), result_path)  # type: ignore
 
     with scme_lock:

@@ -186,7 +186,7 @@ def derive_rolled_topology(
 ) -> RolledTopology:
     """Fold the group-dedicated topology by merging every unrolled compute core that shares a label in
     `merge_of_core` (a graph colouring of cores whose busy windows don't collide -- see
-    `RolledScheduleExplorationStage`) into one physical core.
+    `ScheduleRollingStage`) into one physical core.
 
     Three things have to be re-derived rather than carried over:
 

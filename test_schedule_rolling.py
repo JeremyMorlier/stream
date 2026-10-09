@@ -1,4 +1,4 @@
-"""Tests for `RolledScheduleExplorationStage`'s folding.
+"""Tests for `ScheduleRollingStage`'s folding.
 
 Folding is where a wrong answer is easy to miss: a colouring that merges two cores which are in fact busy at
 the same time still *runs*, it just quietly serializes, and an area that accidentally counts the offchip core
@@ -12,27 +12,26 @@ So the properties checked here are the ones whose violation would be invisible i
 - the re-derived link set drops what became intra-core and coalesces the rest,
 - the pre-screen never drops a point the exhaustive fold would have kept.
 
-All synthetic, as in `test_schedule_exploration.py`: the stage is built with `object.__new__` and its
-measurement stubbed, so these run in milliseconds instead of the minutes a real workload costs.
+All synthetic, as in `test_schedule_exploration.py`: the stage and its `ScheduleSpace` are built with
+`object.__new__` and the measurement stubbed, so these run in milliseconds instead of the minutes a real workload
+costs.
 
-Run directly with `python test_rolled_schedule_exploration.py`, or collect with pytest.
+Run directly with `python test_schedule_rolling.py`, or collect with pytest.
 """
 
 import random
 from types import SimpleNamespace
 
-from stream.stages.generation.rolled_schedule_exploration import (
-    RolledScheduleExplorationStage,
-    canonical,
-    partition_key,
-)
 from stream.stages.generation.schedule_evaluation import (
     CoreOccupancy,
+    CostCaches,
     ParetoArchive,
     coalesce,
     core_dict_key,
     union_overlap,
 )
+from stream.stages.generation.schedule_rolling import ScheduleRollingStage, canonical, partition_key
+from stream.stages.generation.schedule_space import ScheduleSpace
 from stream.stages.generation.tiled_workload_accelerator_generation import (
     fold_core_pair_bits,
     renumber_merged_cores,
@@ -44,50 +43,60 @@ NB_CORES = 4
 NB_DESIGNS = 3
 
 
-def build_stage(seed: int = 0, **overrides) -> RolledScheduleExplorationStage:
-    """A rolled stage with a synthetic plan: 4 unrolled cores over 3 layers, 3 shape classes, 3 designs each."""
+def build_space(seed: int = 0, nb_cores: int = NB_CORES) -> ScheduleSpace:
+    """A synthetic plan: 4 unrolled cores over 3 layers, 3 shape classes, 3 designs each, with a full cost matrix.
+    `nb_cores` above 4 only widens the core list the colourings run over."""
     rng = random.Random(seed)
-    stage = object.__new__(RolledScheduleExplorationStage)
+    space = object.__new__(ScheduleSpace)
 
-    stage.decision_classes = [0, 1, 2]
-    stage.depth_of_class = {0: 0, 1: 1, 2: 2}
-    stage.designs_per_class = [
+    space.decision_classes = [0, 1, 2]
+    space.depth_of_class = {0: 0, 1: 1, 2: 2}
+    space.designs_per_class = [
         [{"core_dict": {"name": f"core_{c}_{r}", "knob": c * 10 + r}} for r in range(NB_DESIGNS)] for c in range(3)
     ]
-    stage.design_class_of_node = {0: 0, 1: 1, 2: 2}
-    stage.core_ids_of_node = dict(CORE_IDS_OF_NODE)
-    stage.unrolled_core_ids = [0, 1, 2, 3]
-    stage.design_class_of_core = {0: 0, 1: 0, 2: 1, 3: 2}
-    stage.cores_per_class = {0: 2, 1: 1, 2: 1}
+    space.design_class_of_node = {0: 0, 1: 1, 2: 2}
+    space.core_ids_of_node = dict(CORE_IDS_OF_NODE)
+    space.unrolled_core_ids = list(range(nb_cores))
+    space.design_class_of_core = {0: 0, 1: 0, 2: 1, 3: 2}
+    space.cores_per_class = {0: 2, 1: 1, 2: 1}
 
     # Two tiles per core, one shape class per layer.
     shape_of_core = {0: 0, 1: 0, 2: 1, 3: 2}
-    stage.shape_class_of_tile = {}
-    stage.unrolled_core_of_tile = {}
-    for core_id in stage.unrolled_core_ids:
+    space.shape_class_of_tile = {}
+    space.unrolled_core_of_tile = {}
+    for core_id in range(NB_CORES):
         for sub_id in range(2):
             key = (core_id, sub_id)
-            stage.shape_class_of_tile[key] = shape_of_core[core_id]
-            stage.unrolled_core_of_tile[key] = core_id
-    stage.shape_counts_of_core = {core_id: {shape_of_core[core_id]: 2} for core_id in stage.unrolled_core_ids}
+            space.shape_class_of_tile[key] = shape_of_core[core_id]
+            space.unrolled_core_of_tile[key] = core_id
+    space.shape_counts_of_core = {core_id: {shape_of_core[core_id]: 2} for core_id in range(NB_CORES)}
 
     # A chain over the tiles, so the critical-path term of the bound is exercised.
-    stage.topo_tile_keys = sorted(stage.shape_class_of_tile)
-    stage.topo_predecessors = [[] if i == 0 else [i - 1] for i in range(len(stage.topo_tile_keys))]
+    space.topo_tile_keys = sorted(space.shape_class_of_tile)
+    space.topo_predecessors = [[] if i == 0 else [i - 1] for i in range(len(space.topo_tile_keys))]
 
-    # Full shape x design cost matrix, keyed exactly as the stage keys it -- by `core_dict_key` of the design,
-    # which is also what `_design_key_of_core` produces, so the two must not be stubbed apart.
+    # Full shape x design cost matrix, keyed exactly as the space keys it -- by `core_dict_key` of the design,
+    # which is also what `design_key_of_core` produces, so the two must not be stubbed apart.
     design_dicts = {
-        core_dict_key(stage.designs_per_class[c][r]["core_dict"]): stage.designs_per_class[c][r]["core_dict"]
+        core_dict_key(space.designs_per_class[c][r]["core_dict"]): space.designs_per_class[c][r]["core_dict"]
         for c in range(3)
         for r in range(NB_DESIGNS)
     }
     keys = sorted(design_dicts)
-    stage.runtime_cache = {(s, k): rng.uniform(10, 200) for s in range(3) for k in keys}
-    stage.energy_cache = {(s, k): rng.uniform(1e3, 1e5) for s in range(3) for k in keys}
-    stage.area_cache = {k: rng.uniform(100, 5000) for k in keys}
-    stage._distinct_designs = lambda _d=design_dicts: dict(_d)
+    space.costs = CostCaches(
+        runtime={(s, k): rng.uniform(10, 200) for s in range(3) for k in keys},
+        energy={(s, k): rng.uniform(1e3, 1e5) for s in range(3) for k in keys},
+        area={k: rng.uniform(100, 5000) for k in keys},
+    )
+    space.full_matrix = True
+    space.distinct_designs = lambda _d=design_dicts: dict(_d)
+    return space
 
+
+def build_stage(seed: int = 0, nb_cores: int = NB_CORES, **overrides) -> ScheduleRollingStage:
+    """A rolling stage over `build_space`, with the default fold settings overridable by keyword."""
+    stage = object.__new__(ScheduleRollingStage)
+    stage.space = build_space(seed, nb_cores)
     stage.fold_overlap = "hull"
     stage.fold_tolerances = (0.0, 0.5, 1.0)
     stage.rolled_core_count_targets = None
@@ -100,9 +109,8 @@ def build_stage(seed: int = 0, **overrides) -> RolledScheduleExplorationStage:
     stage.fold_source = "pareto"
     stage.prune_rolled = True
     stage.forbidden_pairs = {canonical(0, 1)}  # layer 0's two slices
-    stage._plan_of_record = {}
     stage.fold_log = []
-    stage.all_results = []
+    stage.records = []
     for key, value in overrides.items():
         setattr(stage, key, value)
     return stage
@@ -194,7 +202,7 @@ def test_exact_mode_never_uses_more_colours_than_hull_mode():
         occupancy = random_occupancy(rng, nb_cores=6)
         counts = {}
         for mode in ("hull", "exact"):
-            stage = build_stage(fold_overlap=mode, forbidden_pairs=set(), unrolled_core_ids=list(range(6)))
+            stage = build_stage(fold_overlap=mode, forbidden_pairs=set(), nb_cores=6)
             colour_of = stage._colour(occupancy, stage._conflicts(occupancy, 0.0))
             counts[mode] = len(set(colour_of.values()))
         assert counts["exact"] <= counts["hull"], f"seed {seed}: {counts}"
@@ -214,7 +222,7 @@ def test_tolerance_ladder_is_monotone():
     for seed in range(20):
         rng = random.Random(seed)
         occupancy = random_occupancy(rng, nb_cores=6)
-        stage = build_stage(fold_overlap="hull", forbidden_pairs=set(), unrolled_core_ids=list(range(6)))
+        stage = build_stage(fold_overlap="hull", forbidden_pairs=set(), nb_cores=6)
         counts = [
             len(set(stage._colour(occupancy, stage._conflicts(occupancy, t)).values())) for t in (0.0, 0.25, 0.5, 1.0)
         ]
@@ -252,8 +260,9 @@ def test_rolled_area_never_exceeds_unrolled():
     occupancy = occupancy_from({0: [(0, 10)], 1: [(0, 10)], 2: [(20, 30)], 3: [(40, 50)]})
     stage = build_stage()
     record = source_record(occupancy=occupancy)
+    space = stage.space
     unrolled_area = sum(
-        stage.area_cache[key] for key in stage._design_key_of_core(stage._node_core_dicts(record["ranks"])).values()
+        space.costs.area[key] for key in space.design_key_of_core(space.node_core_dicts(record["ranks"])).values()
     )
     for plan in stage._fold_plans(record):
         assert stage._fold_area(plan) <= unrolled_area + 1e-9
@@ -263,15 +272,16 @@ def test_identity_fold_reproduces_the_unrolled_area():
     """The sharpest guard on area comparability: folding nothing must give exactly the unrolled number, i.e.
     compute cores only, never `Accelerator.area`, which also counts the offchip core."""
     stage = build_stage()
+    space = stage.space
     record = source_record()
-    design_of_core = stage._design_key_of_core(stage._node_core_dicts(record["ranks"]))
-    unrolled_area = sum(stage.area_cache[key] for key in design_of_core.values())
+    design_of_core = space.design_key_of_core(space.node_core_dicts(record["ranks"]))
+    unrolled_area = sum(space.costs.area[key] for key in design_of_core.values())
 
-    colour_of = {core: core for core in stage.unrolled_core_ids}  # every core its own class
+    colour_of = {core: core for core in space.unrolled_core_ids}  # every core its own class
     rolled_of, design_key_of_core, _dicts = stage._choose_designs(record, colour_of, "area")
     plan = SimpleNamespace(design_key_of_core=design_key_of_core, nb_cores=len(design_key_of_core))
     assert abs(stage._fold_area(plan) - unrolled_area) < 1e-9
-    assert all(rolled_of[core] == core for core in stage.unrolled_core_ids)
+    assert all(rolled_of[core] == core for core in space.unrolled_core_ids)
 
 
 def test_merged_core_design_is_cost_modelled_for_every_layer_it_hosts():
@@ -281,11 +291,11 @@ def test_merged_core_design_is_cost_modelled_for_every_layer_it_hosts():
     stage = build_stage()
     for plan in stage._fold_plans(source_record(occupancy=occupancy)):
         hosted: dict[int, set[int]] = {}
-        for tile, core in stage.unrolled_core_of_tile.items():
-            hosted.setdefault(plan.rolled_of[core], set()).add(stage.shape_class_of_tile[tile])
+        for tile, core in stage.space.unrolled_core_of_tile.items():
+            hosted.setdefault(plan.rolled_of[core], set()).add(stage.space.shape_class_of_tile[tile])
         for rolled_id, shapes in hosted.items():
             for shape in shapes:
-                assert (shape, plan.design_key_of_core[rolled_id]) in stage.runtime_cache
+                assert (shape, plan.design_key_of_core[rolled_id]) in stage.space.costs.runtime
 
 
 # ------------------------------------------------------------------------------------- topology ---------------
@@ -324,7 +334,7 @@ def test_rolled_measurements_respect_their_bounds():
     occupancy = occupancy_from({0: [(0, 10)], 1: [(0, 10)], 2: [(20, 30)], 3: [(40, 50)]})
     stage = build_stage()
     archive, _ = run_roll(stage, occupancy)
-    rolled = [r for r in stage.all_results if r["kind"] == "rolled"]
+    rolled = [r for r in stage.records if r["kind"] == "rolled"]
     assert rolled
     for record in rolled:
         assert record["latency"] >= record["latency_bound"] - 1e-6
@@ -347,13 +357,13 @@ def test_infeasible_fold_is_recorded_not_raised():
     occupancy = occupancy_from({0: [(0, 10)], 1: [(0, 10)], 2: [(20, 30)], 3: [(40, 50)]})
     stage = build_stage()
 
-    def explode(plan, save_yaml=False):
+    def explode(plan):
         raise ValueError("Inserting tensor caused memory overflow.")
 
     stage._measure_fold = explode
     archive = ParetoArchive()
     archive.add((1e6, 1e9, 1e4), source_record(occupancy=occupancy))
-    fold_stats = stage._roll(archive, {})
+    fold_stats = stage._roll(archive)
     assert fold_stats["infeasible"] > 0
     assert fold_stats["measured"] == 0
     assert any(entry["status"] == "infeasible" for entry in stage.fold_log)
@@ -379,10 +389,10 @@ def test_coalesce_merges_touching_windows():
     assert union_overlap([(0, 10)], [(10, 20)]) == 0
 
 
-def run_roll(stage: RolledScheduleExplorationStage, occupancy: CoreOccupancy):
+def run_roll(stage: ScheduleRollingStage, occupancy: CoreOccupancy):
     """Roll one source schedule with a stubbed scheduler that is never better than the analytic bound."""
 
-    def fake_measure(plan, save_yaml=False):
+    def fake_measure(plan):
         latency, energy, _area = stage._fold_bounds(plan)
         coupling = (hash(plan.key) % 1000) / 1000
         scme = SimpleNamespace(latency=latency * (1 + 0.3 * coupling), energy=energy * (1 + 0.3 * (1 - coupling)))
@@ -393,10 +403,10 @@ def run_roll(stage: RolledScheduleExplorationStage, occupancy: CoreOccupancy):
 
     stage._measure_fold = fake_measure
     record = source_record(occupancy=occupancy)
-    stage.all_results = [record]
+    stage.records = [record]
     archive = ParetoArchive()
     archive.add((record["latency"], record["energy"], record["area"]), record)
-    fold_stats = stage._roll(archive, {})
+    fold_stats = stage._roll(archive)
     return archive, fold_stats
 
 
@@ -404,4 +414,4 @@ if __name__ == "__main__":
     for name, function in sorted(globals().items()):
         if name.startswith("test_") and callable(function):
             function()
-    print("All rolled schedule exploration tests passed.")
+    print("All schedule rolling tests passed.")

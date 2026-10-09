@@ -7,11 +7,13 @@ grows with the workload and each core sits idle outside its layer's window. This
 question -- *is a core that has finished its layer free to run a later one?* -- and answers it by measurement:
 
 1. Every schedule the unrolled search measured reports, per core, the windows in which it was actually busy
-   (`core_occupancy`, read off the scheduled nodes' `start`/`end`).
+   (`core_occupancy`, read off the scheduled nodes' `start`/`end`; the search keeps them because this stage
+   sets `requires_core_occupancy`).
 2. Cores whose busy windows don't collide can share one physical core. Which cores may share is a graph
    colouring; the colour classes are the folded cores (`_fold_plans`).
-3. Each folded core needs a design that runs *all* the layers now on it -- which is why the warm-up here builds
-   the full `shape x design` cost-model matrix instead of the diagonal its parent needs (`_warm_up_cme_cache`).
+3. Each folded core needs a design that runs *all* the layers now on it -- which is why this stage sets
+   `requires_full_cost_matrix`, so the warm-up builds the full `shape x design` cost-model matrix instead of the
+   diagonal the unrolled search alone needs.
 4. The fold changes the hardware graph: traffic between two merged cores becomes free intra-core traffic and
    its link disappears, while a folded core inherits the union of its members' neighbours, so *new* links
    appear and previously separate traffic coalesces onto them (`derive_rolled_topology`).
@@ -25,55 +27,33 @@ Two things are deliberately not assumed:
   and a folded core streams more weights over the same fixed-bandwidth bus. So even a zero-overlap fold can
   lose latency. Nothing here estimates that -- the re-measurement is the ground truth, and the analytic bounds
   are only used to skip folds that are *already* dominated (`_fold_bounds`), which is sound for the same reason
-  the parent's branch and bound is.
+  the unrolled branch and bound is.
 - **Layer fusion leaves little idle time.** In `fused` mode a layer's tiles interleave with the next layer's,
   so the strict "never overlap" graph can admit no merge at all. That is why folding is swept over a
   *tolerance* ladder that also admits overlapping cores, paying serialization for area -- the trade-off the
   combined front is there to expose.
 """
 
-import csv
 import logging
 import math
-import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Literal
 
-from zigzag.utils import pickle_deepcopy
-
-from stream.stages.estimation.zigzag_core_mapping_estimation import ZigZagCoreMappingEstimationStage
-from stream.stages.generation.core_architecture_exploration import assemble_rolled_accelerator
 from stream.stages.generation.schedule_evaluation import (
     INTERVAL_T,
     CoreOccupancy,
     ParetoArchive,
-    _UnusedLeafStage,
-    core_dict_key,
-    core_occupancy,
+    ScheduleSearchStage,
     format_ranks,
     interval_overlap,
-    strip_unpicklable,
     union_overlap,
 )
-from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
+from stream.stages.generation.schedule_space import ScheduleSearchState, ScheduleSpace
 from stream.stages.stage import StageCallable
-from stream.visualization.hardware_graph import topology_from_connectivity
 
 logger = logging.getLogger(__name__)
-
-# `(stage, reference workload)` a forked warm-up worker reads; set right before the pool forks.
-_WARM_UP_STAGE: tuple[Any, Any] | None = None
-
-
-def _warm_up_column_worker(item: tuple[str, dict[str, Any]]) -> tuple[dict, dict, dict, dict]:
-    assert _WARM_UP_STAGE is not None
-    stage, workload = _WARM_UP_STAGE
-    stage.cme_cache, stage.runtime_cache, stage.energy_cache, stage.area_cache = {}, {}, {}, {}
-    stage._warm_up_uniform_design(*item, workload)
-    return stage.cme_cache, stage.runtime_cache, stage.energy_cache, stage.area_cache
 
 
 # --------------------------------------------------------------------------------------- colouring -----------
@@ -129,6 +109,7 @@ def dsatur_colouring(
 
 
 def canonical(a: int, b: int) -> tuple[int, int]:
+    """An unordered core pair in a fixed order, so it can be looked up in a set."""
     return (a, b) if a <= b else (b, a)
 
 
@@ -166,32 +147,32 @@ class FoldPlan:
 
     @property
     def id(self) -> str:
+        """Readable identity: source ranks, core count, design objective and tolerance."""
         return f"r{format_ranks(self.source_ranks)}-c{self.nb_cores}-{self.objective}-t{self.tolerance:g}"
 
 
-class RolledScheduleExplorationStage(ScheduleExplorationStage):
-    """Runs the inherited unrolled schedule search, then folds each schedule it found onto fewer cores and
-    measures the result, returning one Pareto front over both families.
+class ScheduleRollingStage(ScheduleSearchStage):
+    """Folds the schedules the unrolled search found (`schedule_search`, from `ScheduleExplorationStage`) onto
+    fewer cores, measures each fold, and inserts it into the same archive, so the next stage receives one Pareto
+    front over both families. Every measured fold is appended to the shared records too.
 
-    Artifacts, all under `rolled_search/` (see `_save_results`, `fold_log.csv` and the parent's list):
-        - `schedules.csv`: every measured schedule, unrolled and rolled, with the fold parameters that produced
-          it and whether it survived on the front.
-        - `fold_log.csv`: every fold *considered*, including those skipped as dominated, duplicate or
-          infeasible -- the diagnostic for whether the sweep is producing variety or collapsing.
-        - `pareto_schedules.pickle`: rolled entries carry the full fold (`merge_of_core`, `members_of_core`,
-          `hosted_node_groups`, `design_key_of_core`, `core_dict_of_core`, `node_core_ids`, `link_connections`,
-          `bus_connection`), i.e. enough to rebuild the accelerator or draw its topology without re-running.
-        - `cost_lut_design_<design_key>.pickle`: the full-matrix warm-up, content-addressed so it is reusable.
+    Its report goes to `rolled_search/` instead of `schedule_search/`: the visualization stages write there
+    `schedules.csv` (with the fold parameters that produced each schedule), `fold_log.csv` (every fold
+    *considered*, including those skipped as dominated, duplicate or infeasible -- the diagnostic for whether the
+    sweep produces variety or collapses) and the topology figures. Rolled entries carry the full fold
+    (`merge_of_core`, `members_of_core`, `hosted_node_groups`, `design_key_of_core`, `core_dict_of_core`,
+    `node_core_ids`, `link_connections`, `bus_connection`), i.e. enough to rebuild the accelerator or draw its
+    topology without re-running.
     """
 
-    # The full-matrix warm-up (`_warm_up_cme_cache`) runs every design on every tile shape with the complete
-    # ZigZag stage, so the core search's lighter cross-tile pass would only recompute the same pairs.
-    cross_tile_evaluation = False
+    requires_full_cost_matrix = True
+    requires_core_occupancy = True
 
     def __init__(  # noqa: PLR0913
         self,
         list_of_callables: list[StageCallable],
         *,
+        schedule_search: ScheduleSearchState,
         rolled_search_dir: str | None = None,
         fold_overlap: Literal["hull", "exact"] = "hull",
         fold_tolerances: tuple[float, ...] = (0.0, 0.05, 0.15, 0.35, 0.6, 1.0),
@@ -204,13 +185,13 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         max_rolled_evaluations: int = 200,
         fold_source: Literal["pareto", "all"] = "pareto",
         prune_rolled: bool = True,
-        max_cme_matrix_cells: int = 2000,
         **kwargs: Any,
     ):
         """
         Args:
-            rolled_search_dir: where this stage's artifacts and its cost-model cache go. Defaults to
-                `rolled_search/` next to the tiled workload.
+            schedule_search: the unrolled search's state, extended in place.
+            rolled_search_dir: where this stage's report goes. Defaults to `rolled_search/` next to the tiled
+                workload (where `ScheduleExplorationStage` also caches the full cost matrix).
             fold_overlap: `"hull"` compares cores by their first-busy-to-last-busy span -- an interval graph, so
                 the colouring is optimal, and hull-disjoint implies genuinely disjoint. `"exact"` compares the
                 true busy sets, which can fold further when layers interleave, at the cost of a heuristic
@@ -234,14 +215,14 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
             max_rolled_evaluations: cap on rolled schedules actually measured.
             fold_source: fold only the schedules that survived on the front (`"pareto"`), or every measured one.
             prune_rolled: skip folds whose lower bound is already dominated by a measured schedule.
-            max_cme_matrix_cells: guard on the full `shape x design` warm-up; above it the stage falls back to
-                the parent's diagonal warm-up and only folds within what that covers.
         """
         super().__init__(list_of_callables, **kwargs)
+        self.schedule_search = schedule_search
+        self.space: ScheduleSpace = schedule_search.space
+        self.records: list[dict[str, Any]] = schedule_search.records
         self.rolled_search_dir = rolled_search_dir or os.path.join(
-            os.path.dirname(self.tiled_workload_path), "rolled_search"
+            os.path.dirname(self.space.tiled_workload_path), "rolled_search"
         )
-        self.cme_cache_dir = self.rolled_search_dir
         self.fold_overlap = fold_overlap
         self.fold_tolerances = tuple(sorted(set(fold_tolerances)))
         self.rolled_core_count_targets = rolled_core_count_targets
@@ -253,134 +234,17 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         self.max_rolled_evaluations = max_rolled_evaluations
         self.fold_source = fold_source
         self.prune_rolled = prune_rolled
-        self.max_cme_matrix_cells = max_cme_matrix_cells
-
-        self._full_matrix = False
-        self._plan_of_record: dict[str, FoldPlan] = {}
+        self.search_budget = kwargs.get("search_budget")
         self.fold_log: list[dict[str, Any]] = []
-
-    # ------------------------------------------------------------------------------------- plan --------------
-
-    def _build_plan(self, search: Any, workload: Any) -> None:
-        super()._build_plan(search, workload)
-        self.unrolled_core_ids: list[int] = sorted(
-            {core_id for core_ids in self.core_ids_of_node.values() for core_id in core_ids}
-        )
-        # Which decision class supplies each unrolled core's design, and how many tiles of each shape class it
-        # runs -- the two things choosing a merged core's design needs.
-        self.design_class_of_core: dict[int, int] = {
-            core_id: self.design_class_of_node[node_id]
-            for node_id, core_ids in self.core_ids_of_node.items()
-            for core_id in core_ids
-        }
-        self.shape_counts_of_core: dict[int, dict[int, int]] = {core_id: {} for core_id in self.unrolled_core_ids}
-        for tile_id, core_id in self.unrolled_core_of_tile.items():
-            counts = self.shape_counts_of_core.setdefault(core_id, {})
-            shape_class = self.shape_class_of_tile[tile_id]
-            counts[shape_class] = counts.get(shape_class, 0) + 1
 
         # Cores of one layer are its inter-core slices: never merged unless explicitly allowed.
         self.forbidden_pairs: set[tuple[int, int]] = set()
         if not self.fold_allow_sibling_merge:
             self.forbidden_pairs = {
                 canonical(a, b)
-                for core_ids in self.core_ids_of_node.values()
+                for core_ids in self.space.core_ids_of_node.values()
                 for a, b in combinations(sorted(core_ids), 2)
             }
-
-    # -------------------------------------------------------------------- full shape x design warm-up --------
-
-    def _shapes_needing_design(self, design_class: int) -> list[int]:
-        """Every shape in the workload, not just the ones this class's own cores run: a folded core hosts the
-        layers of all the cores merged into it, so any design can end up running any shape -- and the
-        full-matrix warm-up puts each design on a *uniform* accelerator, cost-modelling it against every shape
-        at once. A design that cannot map one of them would abort that accelerator's `update_cost_lut`."""
-        return sorted(set(self.shape_class_of_tile.values()))
-
-    def _distinct_designs(self) -> dict[str, dict[str, Any]]:
-        """Every core design the fronts hold, deduplicated by what it decodes to."""
-        designs: dict[str, dict[str, Any]] = {}
-        for class_index in self.decision_classes:
-            for rank in range(len(self.designs_per_class[class_index])):
-                core_dict = self._design(class_index, rank)["core_dict"]
-                designs.setdefault(core_dict_key(core_dict), core_dict)
-        return designs
-
-    def _warm_up_cme_cache(self, workload: Any) -> None:
-        """Cost-model every `(tile shape, design)` pair, not just the diagonal the parent needs.
-
-        A folded core runs layers that were never meant for its design, so the search needs the whole matrix.
-        It is filled one *uniform* accelerator per distinct design -- every node given the same design -- which
-        covers that design's entire column at once: all its compute cores are hardware-identical, so ZigZag runs
-        once per shape class and `update_cost_lut` copies the rest. That is `S` real ZigZag runs per design
-        rather than one per cell."""
-        designs = self._distinct_designs()
-        nb_shapes = len({shape for shape in self.shape_class_of_tile.values()})
-        cells = nb_shapes * len(designs)
-        if cells > self.max_cme_matrix_cells:
-            logger.warning(
-                f"RolledScheduleExplorationStage: the full cost matrix would be {nb_shapes} shape(s) x "
-                f"{len(designs)} design(s) = {cells} cell(s), over max_cme_matrix_cells="
-                f"{self.max_cme_matrix_cells}. Falling back to the diagonal warm-up; folds will be restricted "
-                f"to designs it already covers."
-            )
-            super()._warm_up_cme_cache(workload)
-            return
-
-        self.cme_cache: dict[tuple[int, str], Any] = {}
-        self.runtime_cache: dict[tuple[int, str], float] = {}
-        self.energy_cache: dict[tuple[int, str], float] = {}
-        self.area_cache: dict[str, float] = {}
-        os.makedirs(self.cme_cache_dir, exist_ok=True)
-        logger.info(
-            f"RolledScheduleExplorationStage: warming up the full cost matrix, {nb_shapes} shape(s) x "
-            f"{len(designs)} design(s) = {cells} cell(s), with {len(designs)} uniform accelerator(s)."
-        )
-        if (self.max_workers or 1) > 1 and len(designs) > 1:
-            self._warm_up_designs_in_parallel(designs, workload)
-        else:
-            for design_key, core_dict in designs.items():
-                self._warm_up_uniform_design(design_key, core_dict, workload)
-        self._full_matrix = True
-        self._check_cme_cache_complete()
-
-    def _warm_up_uniform_design(self, design_key: str, core_dict: dict[str, Any], workload: Any) -> None:
-        """One column of the cost matrix: every node on `core_dict`, harvested into the caches."""
-        node_core_dicts = dict.fromkeys(self.design_class_of_node, core_dict)
-        accelerator = self._build_accelerator(node_core_dicts, workload)
-        estimation = ZigZagCoreMappingEstimationStage(
-            [_UnusedLeafStage],
-            workload=workload,
-            accelerator=accelerator,
-            loma_lpf_limit=self.kwargs["loma_lpf_limit"],
-            cost_lut_path=os.path.join(self.cme_cache_dir, f"cost_lut_design_{design_key}.pickle"),
-            layer_stacks=self.kwargs["layer_stacks"],
-            temporal_mapping_type=self.kwargs["temporal_mapping_type"],
-        )
-        estimation.update_cost_lut()
-        self._harvest_cmes(estimation.cost_lut, workload, accelerator, self._design_key_of_core(node_core_dicts))
-
-    def _warm_up_designs_in_parallel(self, designs: dict[str, dict[str, Any]], workload: Any) -> None:
-        """The columns are independent, so fill them on `core_max_workers` forked processes. Each worker starts
-        from empty caches and sends back only what it harvested; the parent merges."""
-        global _WARM_UP_STAGE  # noqa: PLW0603
-        _WARM_UP_STAGE = (self, workload)
-        mp_context = multiprocessing.get_context("fork")
-        with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=mp_context) as executor:
-            for caches in executor.map(_warm_up_column_worker, list(designs.items())):
-                for cache, harvested in zip(
-                    (self.cme_cache, self.runtime_cache, self.energy_cache, self.area_cache), caches, strict=True
-                ):
-                    cache.update(harvested)
-
-    def _required_cme_keys(self) -> list[tuple[int, str]]:
-        if not self._full_matrix:
-            return super()._required_cme_keys()
-        shapes = sorted({shape for shape in self.shape_class_of_tile.values()})
-        return [(shape, design_key) for shape in shapes for design_key in self._distinct_designs()]
-
-    def _measured_extras(self, scme: Any) -> dict[str, Any]:
-        return {"occupancy": core_occupancy(scme, self.unrolled_core_ids)}
 
     # ------------------------------------------------------------------------------------ folding ------------
 
@@ -404,22 +268,23 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         return conflicts
 
     def _colour(self, occupancy: CoreOccupancy, conflicts: set[tuple[int, int]]) -> dict[int, int]:
+        """Colour the unrolled cores so no two conflicting ones share a colour: hull mode's conflicts form an
+        interval graph (greedy is optimal), exact mode's do not (DSATUR)."""
         colouring = greedy_interval_colouring if self.fold_overlap == "hull" else dsatur_colouring
-        return colouring(self.unrolled_core_ids, conflicts, occupancy.hull)
+        return colouring(self.space.unrolled_core_ids, conflicts, occupancy.hull)
 
     def _merged_design_key(self, hosted_shape_counts: dict[int, int], candidate_keys: list[str], objective: str) -> str:
         """The cheapest design in `candidate_keys` for the tiles this merged core actually hosts."""
+        costs = self.space.costs
 
         def cost(design_key: str) -> float:
             if objective == "area":
-                return self.area_cache[design_key]
-            table = self.runtime_cache if objective == "latency" else self.energy_cache
+                return costs.area[design_key]
+            table = costs.runtime if objective == "latency" else costs.energy
             return sum(count * table[(shape, design_key)] for shape, count in hosted_shape_counts.items())
 
         feasible = [
-            key
-            for key in sorted(candidate_keys)
-            if all((shape, key) in self.runtime_cache for shape in hosted_shape_counts)
+            key for key in sorted(candidate_keys) if all((shape, key) in costs.runtime for shape in hosted_shape_counts)
         ]
         if not feasible:
             raise KeyError("no candidate design is cost-modelled for every shape this core hosts")
@@ -429,8 +294,9 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         self, record: dict[str, Any], colour_of: dict[int, int], objective: str
     ) -> tuple[dict[int, int], dict[int, str], dict[int, dict[str, Any]]]:
         """Assign one design per merged core, and renumber the colours the way `derive_rolled_topology` will."""
-        source_design_of_core = self._design_key_of_core(self._node_core_dicts(record["ranks"]))
-        designs = self._distinct_designs()
+        space = self.space
+        source_design_of_core = space.design_key_of_core(space.node_core_dicts(record["ranks"]))
+        designs = space.distinct_designs()
 
         # Same first-appearance-over-sorted-ids renumbering `derive_rolled_topology` uses, so the rolled core
         # ids here and the ones in the assembled accelerator agree.
@@ -450,15 +316,15 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
                 continue
             hosted: dict[int, int] = {}
             for member in members:
-                for shape, count in self.shape_counts_of_core[member].items():
+                for shape, count in space.shape_counts_of_core[member].items():
                     hosted[shape] = hosted.get(shape, 0) + count
             if self.merged_design_pool == "all":
                 candidates = list(designs)
             else:
                 candidates = [
-                    self._design_key(self.design_class_of_core[member], rank)
+                    space.design_key(space.design_class_of_core[member], rank)
                     for member in members
-                    for rank in range(len(self.designs_per_class[self.design_class_of_core[member]]))
+                    for rank in range(len(space.designs_per_class[space.design_class_of_core[member]]))
                 ]
             design_key_of_core[rolled_id] = self._merged_design_key(hosted, candidates, objective)
 
@@ -477,7 +343,7 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         for tolerance in self.fold_tolerances:
             colour_of = self._colour(occupancy, self._conflicts(occupancy, tolerance))
             nb_cores = len(set(colour_of.values()))
-            if nb_cores >= len(self.unrolled_core_ids):  # nothing merged
+            if nb_cores >= len(self.space.unrolled_core_ids):  # nothing merged
                 continue
             key = partition_key(colour_of)
             if key in seen_partitions:
@@ -498,8 +364,8 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
                     )
                 except KeyError as exc:
                     logger.warning(
-                        f"RolledScheduleExplorationStage: skipping a {nb_cores}-core fold of {record['id']} "
-                        f"on {objective}: {exc}."
+                        f"ScheduleRollingStage: skipping a {nb_cores}-core fold of {record['id']} on {objective}: "
+                        f"{exc}."
                     )
                     continue
                 plans.append(
@@ -549,26 +415,27 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
     def _fold_bounds(self, plan: FoldPlan) -> tuple[float, float, float]:
         """Lower bound on `(latency, energy, area)` for a fold, with area exact.
 
-        The same two arguments the parent's latency bound rests on still hold after folding: a core runs its
+        The same two arguments the unrolled latency bound rests on still hold after folding: a core runs its
         tiles one at a time (so the busiest folded core's serial load is a floor, and *this* is the term that
         sees the serialization a fold pays for), and a tile never starts before its predecessors finish. Energy
         is the per-tile compute/memory sum, to which the schedule only adds non-negative transfer energy."""
+        space = self.space
         runtime_of_tile: dict[tuple[int, int], float] = {}
         energy_of_tile: dict[tuple[int, int], float] = {}
         load_of_core: dict[int, float] = dict.fromkeys(range(plan.nb_cores), 0.0)
         energy = 0.0
-        for tile_id, shape_class in self.shape_class_of_tile.items():
-            rolled_id = plan.rolled_of[self.unrolled_core_of_tile[tile_id]]
+        for tile_id, shape_class in space.shape_class_of_tile.items():
+            rolled_id = plan.rolled_of[space.unrolled_core_of_tile[tile_id]]
             key = (shape_class, plan.design_key_of_core[rolled_id])
-            runtime_of_tile[tile_id] = self.runtime_cache[key]
-            energy_of_tile[tile_id] = self.energy_cache[key]
+            runtime_of_tile[tile_id] = space.costs.runtime[key]
+            energy_of_tile[tile_id] = space.costs.energy[key]
             load_of_core[rolled_id] += runtime_of_tile[tile_id]
             energy += energy_of_tile[tile_id]
 
-        finish = [0.0] * len(self.topo_tile_keys)
+        finish = [0.0] * len(space.topo_tile_keys)
         critical_path = 0.0
-        for position, tile_id in enumerate(self.topo_tile_keys):
-            start = max((finish[p] for p in self.topo_predecessors[position]), default=0.0)
+        for position, tile_id in enumerate(space.topo_tile_keys):
+            start = max((finish[p] for p in space.topo_predecessors[position]), default=0.0)
             finish[position] = start + runtime_of_tile[tile_id]
             critical_path = max(critical_path, finish[position])
 
@@ -579,30 +446,21 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
     def _fold_area(self, plan: FoldPlan) -> float:
         """Exact area of a folded accelerator: the sum over its *compute* cores.
 
-        Offchip is excluded, exactly as the parent's `_bounds` excludes it -- the two numbers share one Pareto
+        Offchip is excluded, exactly as the unrolled bounds exclude it -- the two numbers share one Pareto
         archive, so they have to be measured the same way."""
-        return sum(self.area_cache[plan.design_key_of_core[core_id]] for core_id in range(plan.nb_cores))
+        return sum(self.space.costs.area[plan.design_key_of_core[core_id]] for core_id in range(plan.nb_cores))
 
-    def _measure_fold(self, plan: FoldPlan, save_yaml: bool = False):
-        """Build a fold's accelerator, hand the remaining stages a cost LUT assembled from the full matrix, and
-        let them schedule it."""
-        workload = pickle_deepcopy(self.workload)
-        accelerator, topology = assemble_rolled_accelerator(
-            workload,
-            self.original_workload,
-            self.accelerator,
-            plan.merge_of_core,
-            plan.core_dict_of_core,
-            yaml_path=os.path.join(os.path.dirname(self.tiled_workload_path), "accelerator.yaml")
-            if save_yaml
-            else None,
+    def _measure_fold(self, plan: FoldPlan):
+        """Build a fold's accelerator, hand the measurement stages a cost LUT assembled from the full matrix, and
+        let them schedule it. Returns the schedule and the folded topology."""
+        workload, accelerator, cost_lut, topology = self.space.assemble_rolled(
+            plan.merge_of_core, plan.core_dict_of_core, plan.design_key_of_core
         )
-        cost_lut = self._assemble_cost_lut(workload, accelerator, plan.design_key_of_core)
-        return self._measure_accelerator(workload, accelerator, cost_lut), topology
+        return self.space.measure(workload, accelerator, cost_lut), topology
 
     # ------------------------------------------------------------------------------------- roll --------------
 
-    def _roll(self, archive: ParetoArchive, stats: dict[str, Any]) -> dict[str, Any]:
+    def _roll(self, archive: ParetoArchive) -> dict[str, Any]:
         """Fold every source schedule and measure what survives the pre-screen, inserting into `archive`."""
         fold_stats = {
             "plans": 0,
@@ -616,9 +474,9 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         if self.fold_source == "pareto":
             sources = [record for _point, record in list(archive.entries) if record["kind"] == "unrolled"]
         else:
-            sources = [record for record in list(self.all_results) if record["kind"] == "unrolled"]
+            sources = [record for record in list(self.records) if record["kind"] == "unrolled"]
         logger.info(
-            f"RolledScheduleExplorationStage: folding {len(sources)} source schedule(s) over tolerances "
+            f"ScheduleRollingStage: folding {len(sources)} source schedule(s) over tolerances "
             f"{list(self.fold_tolerances)} in '{self.fold_overlap}' mode."
         )
 
@@ -634,12 +492,12 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
                         "objective": plan.objective,
                         "overlap_mode": plan.overlap_mode,
                         "nb_cores": plan.nb_cores,
-                        "nb_merges": len(self.unrolled_core_ids) - plan.nb_cores,
+                        "nb_merges": len(self.space.unrolled_core_ids) - plan.nb_cores,
                         "status": status,
                     }
                 )
         logger.info(
-            f"RolledScheduleExplorationStage: {fold_stats['plans']} fold(s) considered -- "
+            f"ScheduleRollingStage: {fold_stats['plans']} fold(s) considered -- "
             f"{fold_stats['measured']} measured, {fold_stats['pruned']} pruned, "
             f"{fold_stats['duplicate']} duplicate, {fold_stats['infeasible']} infeasible; "
             f"{len(archive.entries)} schedule(s) on the combined front."
@@ -647,6 +505,8 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
         return fold_stats
 
     def _try_plan(self, plan: FoldPlan, archive: ParetoArchive, fold_stats: dict[str, Any], seen: set[tuple]) -> str:
+        """Measure one fold unless it is a duplicate, already dominated by its bound, or over budget; return what
+        happened to it (the `status` column of `fold_log.csv`)."""
         if plan.key in seen:
             fold_stats["duplicate"] += 1
             return "duplicate"
@@ -666,8 +526,7 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
             # A folded core holds several layers' working sets, so it can overflow its memory and leave the
             # scheduler with nothing runnable. That is a property of the fold, not a bug: record and move on.
             logger.warning(
-                f"RolledScheduleExplorationStage: fold {plan.id} ({plan.nb_cores} core(s)) is infeasible.",
-                exc_info=True,
+                f"ScheduleRollingStage: fold {plan.id} ({plan.nb_cores} core(s)) is infeasible.", exc_info=True
             )
             fold_stats["infeasible"] += 1
             if self.search_budget is not None:
@@ -702,11 +561,10 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
             "link_connections": list(topology.link_connections),
             "bus_connection": dict(topology.bus_connection),
         }
-        self._plan_of_record[plan.id] = plan
-        self.all_results.append(record)
+        self.records.append(record)
         archive.add(point, record)
         logger.info(
-            f"RolledScheduleExplorationStage: measured fold {plan.id}: {len(self.unrolled_core_ids)} -> "
+            f"ScheduleRollingStage: measured fold {plan.id}: {len(self.space.unrolled_core_ids)} -> "
             f"{plan.nb_cores} core(s), latency={point[0]:.6g}, energy={point[1]:.6g}, area={point[2]:.6g} "
             f"(front: {len(archive.entries)})."
         )
@@ -715,73 +573,17 @@ class RolledScheduleExplorationStage(ScheduleExplorationStage):
     # ------------------------------------------------------------------------------------- run ---------------
 
     def run(self):
-        archive, stats = self._explore()
-        stats["rolled"] = self._roll(archive, stats)
-        self._report(archive, stats, self.rolled_search_dir)
-        best_record = self._best_record(archive)
-        best_scme = self._measure_record(best_record, save_yaml=True)
-        yield best_scme, self._extra_info(archive, stats)
-
-    def _measure_record(self, record: dict[str, Any], save_yaml: bool = False):
-        if record.get("kind") != "rolled":
-            return super()._measure_record(record, save_yaml=save_yaml)
-        scme, _topology = self._measure_fold(self._plan_of_record[record["id"]], save_yaml=save_yaml)
-        return scme
-
-    # ------------------------------------------------------------------------------- artifacts ---------------
-
-    CSV_COLUMNS = (
-        *ScheduleExplorationStage.CSV_COLUMNS,
-        "fold_tolerance",
-        "fold_objective",
-        "fold_overlap",
-        "source_id",
-    )
-
-    def _csv_row(self, index: int, record: dict[str, Any], pareto_ids: set[str]) -> list[Any]:
-        return [
-            *super()._csv_row(index, record, pareto_ids),
-            record.get("fold_tolerance", ""),
-            record.get("fold_objective", ""),
-            record.get("fold_overlap", ""),
-            record.get("source_id", ""),
-        ]
-
-    def _topology_of_record(self, record: dict[str, Any]):
-        """A folded design has its own hardware graph -- fewer cores, merged traffic gone and new links in its
-        place -- so it is drawn from the connectivity the fold produced, not the unrolled one."""
-        if record.get("kind") != "rolled":
-            return super()._topology_of_record(record)
-        design_key_of_core = record["design_key_of_core"]
-        return topology_from_connectivity(
-            name=f"{self.accelerator.name} [{record['id']}]",
-            node_core_ids=record["node_core_ids"],
-            offchip_core_id=record["nb_cores"],
-            bus_connection=record["bus_connection"],
-            link_connections=record["link_connections"],
-            design_keys=design_key_of_core,
-            areas={core: self.area_cache[key] for core, key in design_key_of_core.items()},
-            layer_names=self.layer_names,
-            layer_order=self.layer_order,
-        )
-
-    def _pareto_payload(self, record: dict[str, Any]) -> dict[str, Any]:
-        if record.get("kind") != "rolled":
-            return super()._pareto_payload(record)
-        # A rolled entry already carries its whole topology; the parent's `node_core_dicts` would describe the
-        # unrolled accelerator this was folded from, which is not what it runs on.
-        return strip_unpicklable(record)
-
-    def _report(self, archive: ParetoArchive, stats: dict[str, Any], out_dir: str) -> None:
-        super()._report(archive, stats, out_dir)
-        self._save_fold_log(out_dir)
-
-    def _save_fold_log(self, out_dir: str) -> None:
-        columns = ("source_id", "tolerance", "objective", "overlap_mode", "nb_cores", "nb_merges", "status")
-        path = os.path.join(out_dir, "fold_log.csv")
-        with open(path, "w", newline="") as csv_file:
-            writer = csv.writer(csv_file)
-            writer.writerow(columns)
-            for entry in self.fold_log:
-                writer.writerow([entry[column] for column in columns])
-        logger.info(f"RolledScheduleExplorationStage: saved {len(self.fold_log)} fold attempt(s) to {path}.")
+        state = self.schedule_search
+        if not self.space.full_matrix:
+            logger.warning(
+                "ScheduleRollingStage: the cost model only covers the diagonal, so folds are restricted to designs "
+                "every hosted shape was cost-modelled on."
+            )
+        os.makedirs(self.rolled_search_dir, exist_ok=True)
+        state.stats["rolled"] = self._roll(state.archive)
+        state.report["out_dir"] = self.rolled_search_dir
+        state.report["fold_log"] = self.fold_log
+        kwargs = self.kwargs.copy()
+        kwargs["schedule_search"] = state
+        sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
+        yield from sub_stage.run()

@@ -7,7 +7,7 @@ real `Core` object with a consistent memory hierarchy, and finally runs a handfu
 through Stream/ZigZag's actual hardware cost-model evaluation (`evaluate_core`) to confirm the
 generated architectures are not just schema-valid but actually estimable.
 
-Run directly with `python test_generate_core.py`, or collect with `pytest test_generate_core.py`.
+Run directly with `python tests/test_generate_core.py`, or collect with `pytest tests/test_generate_core.py`.
 """
 
 import logging

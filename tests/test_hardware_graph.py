@@ -8,7 +8,7 @@ wrong and the picture is a hairball, or silently halves a bandwidth.
 So these build the graph through the real `get_bidirectional_edges` + `CoreGraph` -- the same code the factory
 calls -- with a stub standing in only for `Core`, which would otherwise drag in ZigZag and CACTI for nothing.
 
-Run directly with `python test_hardware_graph.py`, or collect with `pytest test_hardware_graph.py`.
+Run directly with `python tests/test_hardware_graph.py`, or collect with `pytest tests/test_hardware_graph.py`.
 """
 
 import json

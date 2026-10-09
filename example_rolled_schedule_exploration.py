@@ -1,4 +1,4 @@
-"""Minimal example of `RolledScheduleExplorationStage` (via `stream.api.optimize_rolled_schedules`).
+"""Minimal example of the rolled schedule search (via `stream.api.optimize_rolled_schedules`).
 
 Where `optimize_schedules` searches which core *design* each layer gets on a fully unrolled accelerator -- one
 dedicated core per `(layer, inter-core group)` -- this adds the *rolling* axis: cores that have finished their
@@ -19,7 +19,6 @@ from pathlib import Path
 import onnx
 import torch
 from onnx.shape_inference import infer_shapes_path
-from torch import nn
 
 from stream.api import optimize_rolled_schedules
 from stream.inputs.examples.workload.comparison_workloads import Bottleneck
@@ -28,18 +27,6 @@ from stream.visualization.tikz_export import write_figures
 _logging_level = _logging.INFO
 _logging_format = "%(asctime)s - %(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
 _logging.basicConfig(level=_logging_level, format=_logging_format)
-
-
-class TwoConvBlock(nn.Module):
-    """Same tiny block as `example_schedule_exploration.py`, so the search finishes in well under a minute."""
-
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False)
-
-    def forward(self, input_tensor):
-        return self.conv2(self.conv1(input_tensor))
 
 
 ############################################PATHS############################################
@@ -80,7 +67,7 @@ best_scme, pareto_schedules = optimize_rolled_schedules(
     output_path=output_path,
     skip_if_exists=False,
     sort_key="latency",
-    # Per-tile core search (inherited): its front size is the schedule search's branching factor, and its
+    # Per-tile core search: its front size is the schedule search's branching factor, and its
     # designs are the pool a folded core picks from.
     nb_core_ga_generations=16,
     nb_core_ga_individuals=16,

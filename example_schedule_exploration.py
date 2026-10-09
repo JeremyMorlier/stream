@@ -18,25 +18,13 @@ from pathlib import Path
 import onnx
 import torch
 from onnx.shape_inference import infer_shapes_path
-from torch import nn
 
 from stream.api import optimize_schedules
+from stream.inputs.examples.workload.comparison_workloads import TwoConvBlock
 
 _logging_level = _logging.INFO
 _logging_format = "%(asctime)s - %(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
 _logging.basicConfig(level=_logging_level, format=_logging_format)
-
-
-class TwoConvBlock(nn.Module):
-    """Same tiny block as `example_tiling_exploration.py`, so the search finishes in well under a minute."""
-
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False)
-
-    def forward(self, input_tensor):
-        return self.conv2(self.conv1(input_tensor))
 
 
 ############################################INPUTS############################################

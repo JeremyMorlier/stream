@@ -24,5 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Run without errors
+        env:
+          PYTHONPATH: .
         run: |
-          python test_co.py
+          python tests/test_co.py

@@ -8,8 +8,8 @@ The stubbed measurement deliberately returns a *coupled* latency/energy above th
 coupling, from contention and transfers, is exactly what the bounds cannot see), so the test exercises the real
 situation rather than one where bounds happen to be tight.
 
-Run directly with `python test_schedule_exploration.py`, or collect with
-`pytest test_schedule_exploration.py`.
+Run directly with `python tests/test_schedule_exploration.py`, or collect with
+`pytest tests/test_schedule_exploration.py`.
 """
 
 import itertools

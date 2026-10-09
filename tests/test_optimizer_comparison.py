@@ -1,7 +1,7 @@
 """Smoke tests for the optimizer-comparison plumbing: the search budget's stop rules, the hypervolume
 helper, the generated tpu_like grids and the evolving-graph genome operators.
 
-Run: python test_optimizer_comparison.py
+Run: python tests/test_optimizer_comparison.py
 """
 
 import os

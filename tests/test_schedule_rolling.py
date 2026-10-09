@@ -16,7 +16,7 @@ All synthetic, as in `test_schedule_exploration.py`: the stage and its `Schedule
 `object.__new__` and the measurement stubbed, so these run in milliseconds instead of the minutes a real workload
 costs.
 
-Run directly with `python test_schedule_rolling.py`, or collect with pytest.
+Run directly with `python tests/test_schedule_rolling.py`, or collect with pytest.
 """
 
 import random

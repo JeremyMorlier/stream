@@ -1,5 +1,8 @@
-"""Workloads of the optimizer comparison (`benchmark_optimizer_comparison.py`), exported to ONNX from torch.
+"""Torch workloads of the examples and the optimizer comparison (`benchmark_optimizer_comparison.py`), exported
+to ONNX.
 
+- `TwoConvBlock`: two 3x3 convolutions, small enough for the tiling and schedule examples to finish in about a
+  minute.
 - `export_resnet_bottleneck`: the ResNet-50 first bottleneck `example_rolled_schedule_exploration.py` searches.
 - `export_attention_block`: the attention half of an LLM decoder layer -- Q/K/V projections, multi-head scaled
   dot-product attention, output projection and the residual connection.
@@ -17,7 +20,22 @@ from onnx.shape_inference import infer_shapes_path
 from torch import nn
 
 
+class TwoConvBlock(nn.Module):
+    """Two 3x3 convolutions, 16 -> 32 -> 32 channels."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False)
+
+    def forward(self, input_tensor):
+        return self.conv2(self.conv1(input_tensor))
+
+
 class Bottleneck(nn.Module):
+    """A ResNet bottleneck: 1x1 reduce, 3x3, 1x1 expand (x4), each with batch norm, plus the residual
+    connection."""
+
     expansion = 4
 
     def __init__(self, in_channels, out_channels, stride=1):
@@ -101,10 +119,13 @@ def _export(module: nn.Module, dummy_input: torch.Tensor, path: str) -> str:
 
 
 def export_resnet_bottleneck(path: str) -> str:
+    """Export ResNet-50's first bottleneck (256 -> 64 -> 256 channels, 56x56) to `path`; returns `path`."""
     return _export(Bottleneck(256, 64), torch.randn(1, 256, 56, 56), path)
 
 
 def export_attention_block(path: str, seq: int = 128, d_model: int = 512, heads: int = 8) -> str:
+    """Export an attention block over `seq` tokens of width `d_model` with `heads` heads to `path`; returns
+    `path`."""
     return _export(AttentionBlock(d_model, heads), torch.randn(1, seq, d_model), path)
 
 

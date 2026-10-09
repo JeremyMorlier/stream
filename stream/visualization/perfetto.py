@@ -1,3 +1,5 @@
+"""Export a schedule (`StreamCostModelEvaluation`) as a Perfetto/Chrome trace JSON."""
+
 import json
 import logging
 
@@ -44,6 +46,8 @@ def parse_non_base_attrs(row: pd.Series, base_attrs: list[str]) -> dict:
 
 
 def add_preamble_to_events(df: pd.DataFrame, events: list, process_name: str):
+    """Prepend the metadata events naming the process and one thread per resource (compute cores first, then
+    communication links), so Perfetto shows one ordered track per resource."""
     # Extract and sort unique compute resources
     compute_resources = sorted(
         set(row["Resource"] for _, row in df.iterrows() if row["Type"] == "compute"),
@@ -77,6 +81,7 @@ def add_preamble_to_events(df: pd.DataFrame, events: list, process_name: str):
 
 
 def get_task_name(row: pd.Series, unknown_string: str) -> str:
+    """The event name of one dataframe row (`unknown_string` when the row has no task)."""
     task_name = row["Task"]
     if pd.isna(task_name):
         return unknown_string
@@ -97,6 +102,10 @@ def convert_scme_to_perfetto_json(
     process_name: str = PROCESS_NAME,
     unknown_string: str = UNKNOWN_STRING,
 ) -> str:
+    """Write the schedule of `scme` as a Chrome/Perfetto trace (open it in https://ui.perfetto.dev): one track
+    per core and per communication link, one slice per computation or transfer, restricted to `layer_ids` (all
+    layers by default). `cost_lut` adds each computation's spatial utilization and energy breakdown to its
+    slice. Returns `json_path`."""
     # Get the layer ids from the scme if not provided
     if layer_ids is None:
         layer_ids = sorted(set(n.id for n in scme.workload.node_list))

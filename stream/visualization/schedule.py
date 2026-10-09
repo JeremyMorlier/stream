@@ -1,3 +1,5 @@
+"""Gantt-chart plots of a schedule (`StreamCostModelEvaluation`) on broken axes."""
+
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -121,6 +123,9 @@ def plot_timeline_brokenaxes(
     plot_data_transfer: bool = False,
     fig_path: str = "outputs/schedule_plot.png",
 ) -> None:
+    """Plot the schedule as a Gantt chart, one row per core (and per link when `plot_data_transfer`), coloured
+    by layer, with optional dependency arrows. `section_start_percent` and `percent_shown` pick the slices of the
+    timeline shown on broken axes, so long schedules stay readable."""
     G: ComputationNodeWorkload = scme.workload
     accelerator: Accelerator = scme.accelerator
 
@@ -338,6 +343,7 @@ def _plot_dependency_lines(ctx):
 
 
 def legend_without_duplicate_labels(bax, loc, ncol):
+    """A legend on broken axes with each layer label once, sorted by layer number."""
     handles, labels = zip(*bax.get_legend_handles_labels(), strict=False)
     handles = [item for sublist in handles for item in sublist]
     labels = [item for sublist in labels for item in sublist]
@@ -351,4 +357,5 @@ def legend_without_duplicate_labels(bax, loc, ncol):
 
 
 def major_formatter(x, pos):
+    """Tick formatter with thousands separators."""
     return f"{int(x):,}"

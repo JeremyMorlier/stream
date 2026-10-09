@@ -1,3 +1,5 @@
+"""Export a constraint-optimization allocation (`TimeSlotAllocation`) as a Perfetto trace."""
+
 import json
 import logging
 from typing import TYPE_CHECKING

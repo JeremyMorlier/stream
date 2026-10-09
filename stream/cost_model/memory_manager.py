@@ -1,3 +1,6 @@
+"""Tracks, per top-level memory instance of every core, which tensors are stored there and when, so the scheduler
+can tell whether a tensor fits, where it already lives, and what to evict to make room."""
+
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -97,6 +100,9 @@ class MemoryManager:
         return instances_storing_tensor, available_since_timesteps
 
     def find_tensor(self, tensor: Tensor):
+        """Where `tensor` is stored: parallel lists of the cores holding it, the index of the top-level instance
+        within each core's list, and the timestep since which it is available there. A memory shared by several
+        cores is reported once, for the first of them."""
         instances_storing_tensor, available_since_timesteps = self.find_tensor_in_top_instances(tensor)
         cores_storing_tensor: list[int] = []
         top_instance_idxs: list[int] = []
@@ -195,6 +201,9 @@ class MemoryManager:
         timestep: int,
         exceptions: list[Tensor],
     ) -> list[Tensor]:
+        """The tensors to evict from `top_instance` so `tensor_to_add` fits at `timestep` (empty if it already
+        fits): the lowest priority x size tensors first, the fewest that free enough space. Tensors in
+        `exceptions` are never evicted. Raises `ValueError` when no eviction can make room."""
         # Get the total capacity of this top instance
         capacity = self.top_instance_capacities[top_instance]
         # Sanity check on the tensor we want to add and the memory's capacity
@@ -249,6 +258,8 @@ class MemoryManager:
         tensor: Tensor,
         timestep: int,
     ):
+        """Remove `tensor` (matched by equality hash) from `top_instance` from `timestep` on. A tensor that is not
+        stored there is ignored."""
         # Get the instance on the storing core
         try:
             equivalent_tensor = next(

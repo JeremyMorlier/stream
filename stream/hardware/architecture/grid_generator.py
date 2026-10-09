@@ -25,10 +25,13 @@ BUS_BANDWIDTH = 128
 
 
 def grid_name(rows: int, cols: int) -> str:
+    """Accelerator name (and file stem) of a `rows x cols` grid."""
     return f"tpu_like_grid_{rows}x{cols}"
 
 
 def tpu_grid_dict(rows: int, cols: int) -> dict[str, Any]:
+    """The accelerator description of a `rows x cols` grid, in the hardware YAML schema (see the module docstring
+    for the core numbering and the links)."""
     nb_compute = rows * cols
     simd_id, offchip_id = nb_compute, nb_compute + 1
     cores: dict[int, str] = dict.fromkeys(range(nb_compute), "tpu_like.yaml")

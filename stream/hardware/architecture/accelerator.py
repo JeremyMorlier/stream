@@ -1,3 +1,6 @@
+"""The multi-core accelerator model: a graph of cores joined by communication links, plus the memory and
+communication managers the scheduler uses to track where tensors live and when links are busy."""
+
 from math import ceil
 from typing import Any
 
@@ -32,7 +35,13 @@ class Accelerator:
         nb_shared_mem_groups: int,
         offchip_core_id: int | None = None,
     ):
-        """ """
+        """
+        Args:
+            name: accelerator name.
+            cores: the cores, with an edge per directed communication link.
+            nb_shared_mem_groups: number of groups of cores that share their top-level memories.
+            offchip_core_id: id of the core modelling off-chip memory (DRAM), if any.
+        """
         self.name = name
         self.cores = cores
         self.offchip_core_id = offchip_core_id
@@ -53,12 +62,14 @@ class Accelerator:
         return self.get_core(self.offchip_core_id)
 
     def get_top_instances_of_core(self, core: int | Core) -> list[MemoryInstance]:
+        """The top-level memory instances of a core (one per memory shared by a set of operands)."""
         if isinstance(core, int):
             core = self.get_core(core)
         top_instances = self.memory_manager.top_instances_per_core[core]
         return top_instances
 
     def get_top_instance_of_core(self, core: Core | int, mem_op: MemoryOperand) -> MemoryInstance:
+        """The top-level memory instance of `core` that stores operand `mem_op`."""
         # Memoized: the scheduler asks this hundreds of thousands of times per schedule, and each uncached lookup
         # hashes `MemoryInstance`s (a frozenset of all their attributes, rebuilt per call). The memory topology is
         # fixed once the accelerator is built, so the answer never changes.
@@ -164,44 +175,55 @@ class Accelerator:
         return storing_instance, available_since_timestep
 
     def get_available_timestep(self, tensor: Tensor, suggested_core: Core | None):
+        """Timestep since which `tensor` is available in the memory it would be read from (preferring
+        `suggested_core`'s)."""
         _, available_since_timestep = self.get_storing_memory_instance_and_timestep(tensor, suggested_core)
         return available_since_timestep
 
     def get_storing_memory_instance(self, tensor: Tensor, suggested_core: Core | None):
+        """Top-level memory instance `tensor` would be read from (preferring `suggested_core`'s)."""
         storing_instance, _ = self.get_storing_memory_instance_and_timestep(tensor, suggested_core)
         return storing_instance
 
     def get_storing_cores(self, tensor: Tensor, suggested_core: Core | None):
+        """Cores sharing the top-level memory instance `tensor` would be read from."""
         storing_instance, _ = self.get_storing_memory_instance_and_timestep(tensor, suggested_core)
         storing_cores = self.memory_manager.cores_per_top_instance[storing_instance]
         return storing_cores
 
     def get_tensors_stored_in_core(self, core: Core, memory_operand: MemoryOperand, timestep: int):
+        """Tensors held at `timestep` in the top-level memory of `core` that stores `memory_operand`."""
         top_instance = self.get_top_instance_of_core(core, memory_operand)
         tensors = self.memory_manager.get_tensors_stored_at_timestep(top_instance, timestep)
         return tensors
 
     def core_contains_tensor(self, tensor: Tensor, core: int | Core):
+        """Whether `tensor` is currently stored in `core`'s top-level memory for its operand."""
         memory_op = tensor.memory_operand
         top_instance = self.get_top_instance_of_core(core, memory_op)
         assert isinstance(top_instance, MemoryInstance)
         return self.memory_manager.contains(tensor, top_instance)
 
     def contains_tensor(self, tensor: Tensor, top_instance: int | MemoryInstance):
+        """Whether `tensor` is currently stored in `top_instance` (or, given a core id, in that core)."""
         if isinstance(top_instance, int):  # assume core id
             return self.core_contains_tensor(tensor, top_instance)
         assert isinstance(top_instance, MemoryInstance)
         return self.memory_manager.contains(tensor, top_instance)
 
     def find_tensor(self, tensor: Tensor):
+        """Where `tensor` is stored; see `MemoryManager.find_tensor`."""
         return self.memory_manager.find_tensor(tensor)
 
     def find_tensor_in_top_instances(self, tensor: Tensor):
+        """Where `tensor` is stored; see `MemoryManager.find_tensor_in_top_instances`."""
         return self.memory_manager.find_tensor_in_top_instances(tensor)
 
     def find_best_tensor_combination_to_evict_fast(
         self, tensor: Tensor, core: Core, timestep: int, exceptions: list[Tensor] | None = None
     ):
+        """Tensors to evict from `core`'s top-level memory so `tensor` fits at `timestep`, never evicting one in
+        `exceptions`; see `MemoryManager.find_best_tensor_combination_to_evict_fast`."""
         if exceptions is None:
             exceptions = []
         top_instance = self.get_top_instance_of_core(core, tensor.memory_operand)
@@ -336,6 +358,8 @@ class Accelerator:
         sender_memory_operand: MemoryOperand,
         receiver_memory_operand: MemoryOperand,
     ):
+        """Energy of reading `tensor` from the sender's top-level memory and writing it into the receiver's, at
+        each memory's minimal bandwidth granularity. Link energy is not included."""
         # Convert given sender and receiver to Core object if given as ids
         if isinstance(sender, int):
             sender = self.get_core(sender)
@@ -368,10 +392,14 @@ class Accelerator:
         duration: int,
         cn: ComputationNode,
     ) -> int:
+        """Reserve the off-chip links `cn` needs for the operands too large for `core_id`'s memories; see
+        `CommunicationManager.block_offchip_links`. Returns the timestep the links are free from."""
         return self.communication_manager.block_offchip_links(too_large_operands, core_id, start_timestep, duration, cn)
 
     @property
     def area(self) -> float:
+        """Total area of every core, the off-chip one included (cores whose area cannot be computed count as
+        0). The schedule searches compare compute-core area only, so they do not use this."""
         total_area = 0.0
         for core in self.core_list:
             try:
@@ -385,6 +413,7 @@ class Accelerator:
 
     @property
     def core_list(self) -> list[Core]:
+        """Every core, the off-chip one included."""
         return list(self.cores.node_list)
 
     def __str__(self) -> str:

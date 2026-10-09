@@ -1,3 +1,5 @@
+"""Bar charts comparing the energy breakdowns of several schedules."""
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -5,6 +7,7 @@ from stream.cost_model.cost_model import StreamCostModelEvaluation
 
 
 def bar_plot_stream_cost_model_evaluations_breakdown(scmes: list[StreamCostModelEvaluation], fig_path: str):
+    """Grouped bars of every `*energy*` attribute of each schedule, for side-by-side comparison."""
     barWidth = 0.1
 
     list_attributes = [x for x in scmes[0].__dict__.keys() if "energy" in x]

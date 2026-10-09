@@ -1,3 +1,5 @@
+"""Plot how the activation and weight sizes are distributed over the layers of a workload."""
+
 import networkx as nx
 import pandas as pd
 import plotly.express as px
@@ -45,6 +47,8 @@ def plot_activation_distribution(
 
 
 def get_sizes_per_node(workload, order):
+    """Per computation node of the pruned workload, in `order`, the sizes of its weights and of its input and
+    output activations."""
     data = []
     workload = prune_workload(
         workload,

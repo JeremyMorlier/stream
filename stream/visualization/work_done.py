@@ -1,3 +1,5 @@
+"""Plot how fast schedules complete their work over time."""
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -12,6 +14,8 @@ def plot_work_done(
     cores_for_ideal=None,
     fig_path="outputs/exploration_co/work_done_ops.html",
 ):
+    """Interactive plot (plotly HTML) of the percentage of operations completed over time for each schedule,
+    against the ideal line of `cores_for_ideal` fully utilized cores."""
     df_all = pd.DataFrame(columns=["timestep", "ops_done_percentage", "ops_done", "accelerator", "type"])
     if cores_for_ideal is None:
         cores_for_ideal = [tuple() for _ in range(len(scmes))]

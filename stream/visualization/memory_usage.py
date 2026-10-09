@@ -1,3 +1,5 @@
+"""Plot memory occupancy over time for every top-level memory of a scheduled accelerator."""
+
 import logging
 from typing import TYPE_CHECKING
 
@@ -55,6 +57,9 @@ def plot_memory_usage(
     fig_path: str = "outputs/memory_usage.png",
     fig_size: tuple[int, int] = (16, 9),
 ):
+    """Plot the occupancy over time of every top-level memory instance of the schedule's accelerator, one row per
+    instance (instances never used are left out, DRAM too unless `show_dram`). `section_start_percent` and
+    `percent_shown` pick the slices of the timeline shown on broken axes."""
     memory_manager = scme.accelerator.memory_manager
     cpti, mopti = _filter_memory_instances(memory_manager, show_dram)
     cpti, mopti = _remove_zero_usage_instances(memory_manager, cpti, mopti)

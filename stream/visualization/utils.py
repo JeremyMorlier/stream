@@ -1,3 +1,5 @@
+"""Turn a schedule into the tabular data the plots and the Perfetto export draw from."""
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,6 +15,7 @@ if TYPE_CHECKING:
 
 
 def get_communication_dicts(scme: "StreamCostModelEvaluation"):
+    """One row per communication event (transfer or link block) of the schedule, as dicts for a dataframe."""
     dicts = []
     accelerator: Accelerator = scme.accelerator
 
@@ -60,6 +63,7 @@ def get_communication_dicts(scme: "StreamCostModelEvaluation"):
 
 
 def get_real_input_tensors(n, g):
+    """The tensors `n` reads: its predecessors' outputs (other than itself) and its constant operands."""
     preds = list(g.predecessors(n))
     inputs = [pred.operand_tensors[pred.output_operand] for pred in preds if pred.id != n.id]
     inputs += [n.operand_tensors[op] for op in n.constant_operands]
@@ -69,6 +73,7 @@ def get_real_input_tensors(n, g):
 def get_spatial_utilizations(
     scme: "StreamCostModelEvaluation", node: "ComputationNode", cost_lut: "CostModelEvaluationLUT | None"
 ):
+    """`(spatial utilization, utilization)` of `node`'s MAC array on the core it ran on, NaNs without a LUT."""
     if cost_lut:
         equal_node = cost_lut.get_equal_node(node)
         assert equal_node, (
@@ -86,6 +91,7 @@ def get_spatial_utilizations(
 def get_energy_breakdown(
     scme: "StreamCostModelEvaluation", node: "ComputationNode", cost_lut: "CostModelEvaluationLUT | None"
 ):
+    """`node`'s MAC and memory energy on the core it ran on, NaNs without a LUT."""
     if cost_lut:
         equal_node = cost_lut.get_equal_node(node)
         assert equal_node, (
@@ -120,6 +126,8 @@ def get_dataframe_from_scme(
     add_communication: bool = False,
     cost_lut: "CostModelEvaluationLUT | None" = None,
 ):
+    """One row per scheduled computation of the layers in `layer_ids` (start, end, core, layer, utilization and
+    energy when `cost_lut` is given), plus the communication events when `add_communication`."""
     nodes = scme.workload.topological_sort()
     dicts = []
     for node in nodes:

@@ -28,6 +28,9 @@ TRACE_COLUMNS = ("t", "n_eval", "latency", "energy", "area", "edp", "best_edp", 
 
 
 class SearchBudget:
+    """The common stopping rule of the compared searches: a wall-clock limit plus convergence of the best EDP,
+    with a CSV trace of every measured design (see the module docstring)."""
+
     def __init__(
         self,
         max_time_s: float,
@@ -61,6 +64,7 @@ class SearchBudget:
                 csv.writer(f).writerow(TRACE_COLUMNS)
 
     def elapsed(self) -> float:
+        """Seconds since the budget was created."""
         return time.perf_counter() - self.t_start
 
     def best_edp_at(self, t: float) -> float:
@@ -88,6 +92,8 @@ class SearchBudget:
         return improved
 
     def converged(self) -> bool:
+        """Whether the best EDP improved by less than `rel_tol` over the last `window_s` seconds. Never true
+        before a full window has passed or before the first feasible point."""
         t = self.elapsed()
         if t < self.window_s or not math.isfinite(self.best_edp):
             return False
@@ -97,6 +103,8 @@ class SearchBudget:
         return previous / self.best_edp - 1 < self.rel_tol
 
     def should_stop(self) -> bool:
+        """Whether a search should start no new generation: the budget was stopped, ran out of time, or
+        converged. Latches -- once true it stays true, with the first reason kept in `stop_reason`."""
         if self.stop_reason is not None:
             return True
         if self.elapsed() >= self.max_time_s:
@@ -106,6 +114,7 @@ class SearchBudget:
         return self.stop_reason is not None
 
     def time_left(self) -> float:
+        """Seconds left before `max_time_s` (0 once it has passed)."""
         return max(0.0, self.max_time_s - self.elapsed())
 
     def stop(self, reason: str) -> None:
@@ -123,6 +132,8 @@ class SearchBudget:
         return None
 
     def summary(self) -> dict[str, Any]:
+        """The run's outcome as plain data: why and when it stopped, how many designs it measured, the best EDP
+        and the point that reached it, and how long it took to get within 1% of that best."""
         return {
             "stop_reason": self.stop_reason or "exhausted",
             "time_to_stop": self.t_stop if self.t_stop is not None else self.elapsed(),
@@ -136,6 +147,7 @@ class SearchBudget:
         }
 
     def save_summary(self, path: str, **extra: Any) -> None:
+        """Write `summary()`, plus any `extra` fields, as JSON to `path`."""
         with open(path, "w") as f:
             json.dump({**self.summary(), **extra}, f, indent=2, default=str)
 

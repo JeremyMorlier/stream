@@ -42,6 +42,9 @@ MERGED_COLOR = "0.85"  # a folded core belongs to no single layer, so it gets no
 
 @dataclass
 class TopologyNode:
+    """One drawable node: a compute core, the off-chip core, or a bus. Compute cores carry the layers (and
+    inter-core groups) they host, their design key and area, and the column the layout places them in."""
+
     id: int | str
     kind: NODE_KIND_T
     label: str
@@ -54,6 +57,7 @@ class TopologyNode:
     busy_cycles: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """The node as plain JSON-able data."""
         return {
             "id": self.id,
             "kind": self.kind,
@@ -70,6 +74,9 @@ class TopologyNode:
 
 @dataclass
 class TopologyEdge:
+    """One drawable connection: a point-to-point link (directed when its two directions differ) or a spoke
+    between a core and a bus node."""
+
     source: int | str
     target: int | str
     bandwidth: float
@@ -77,6 +84,7 @@ class TopologyEdge:
     kind: Literal["link", "bus"]
 
     def to_dict(self) -> dict[str, Any]:
+        """The edge as plain JSON-able data."""
         return {
             "source": self.source,
             "target": self.target,
@@ -88,6 +96,9 @@ class TopologyEdge:
 
 @dataclass
 class HardwareTopology:
+    """An accelerator's hardware graph reduced to what a figure needs: nodes and edges, with buses as nodes of
+    their own rather than as the all-pairs links the accelerator models them with."""
+
     name: str
     offchip_core_id: int | None
     nodes: list[TopologyNode]
@@ -95,9 +106,11 @@ class HardwareTopology:
 
     @property
     def compute_nodes(self) -> list[TopologyNode]:
+        """The compute cores (off-chip core and buses excluded)."""
         return [node for node in self.nodes if node.kind == "compute"]
 
     def to_dict(self) -> dict[str, Any]:
+        """The topology as plain JSON-able data."""
         return {
             "name": self.name,
             "offchip_core_id": self.offchip_core_id,
@@ -110,6 +123,7 @@ class HardwareTopology:
 
 
 def format_bandwidth(bandwidth: float) -> str:
+    """A bandwidth with a k/M/G suffix and 3 significant digits, for labels."""
     for limit, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
         if abs(bandwidth) >= limit:
             return f"{bandwidth / limit:.3g}{suffix}"

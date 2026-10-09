@@ -106,6 +106,9 @@ if not hasattr(creator, "GraphFitness"):
 
 @dataclass
 class GraphGenome:
+    """One individual of the graph search: a hardware graph (nodes with their core-design genes, explicit links)
+    plus the tiling and the allocation of every inter-core group onto the nodes. See the module docstring."""
+
     nodes: dict[int, list[float]]  # node label -> design gene vector
     links: set[frozenset[int]]  # node label pairs joined by a point-to-point link
     tiling: tuple[int, ...]  # tiling-gene indices (all zero = the mapping file's tiling)
@@ -121,10 +124,12 @@ class GraphGenome:
         return self
 
     def new_label(self) -> int:
+        """A node label no node of this genome uses yet."""
         return max(self.nodes, default=-1) + 1
 
     @property
     def nb_cores(self) -> int:
+        """Number of compute cores (nodes) of the graph."""
         return len(self.nodes)
 
 

@@ -5,9 +5,9 @@ paper cannot embed it, and a screenshot of it (or of the matplotlib PNGs) ages b
 document's own font size. So the same two views are re-emitted as LaTeX source: fonts, line widths and colours
 then come from the paper, and the figures stay editable.
 
-Nothing here re-runs the search. The inputs are the files `ScheduleExplorationStage` already wrote next to each
-other -- `schedules.csv` for every measured point and its Pareto flag, `topologies.json` for the cores and wires
-of the designs that got a figure -- so this can be pointed at an old output directory.
+Nothing here re-runs the search. The inputs are the files the schedule search's visualization stages already
+wrote next to each other -- `schedules.csv` for every measured point and its Pareto flag, `topologies.json` for
+the cores and wires of the designs that got a figure -- so this can be pointed at an old output directory.
 
 What comes out of `write_figures`:
 
@@ -992,6 +992,7 @@ def write_figures(  # noqa: PLR0913
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Command-line entry point: `python -m stream.visualization.tikz_export <search_dir> [options]`."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("search_dir", help="stage output directory with schedules.csv and topologies.json")
     parser.add_argument("-o", "--out-dir", default=None, help="where to write the .tex (default: <dir>/tikz)")

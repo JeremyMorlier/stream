@@ -70,6 +70,7 @@ nav:
       - Hardware: hardware.md
       - Mapping: mapping.md
       - Stages: stages.md
+      - Optimization flows: optimization.md
       - Outputs: outputs.md
   - Future Plans: future.md
   - Contributing: contribute.md

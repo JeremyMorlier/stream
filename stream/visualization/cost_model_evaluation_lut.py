@@ -1,3 +1,5 @@
+"""Plot a cost-model LUT: each unique node's latency and energy on every core."""
+
 import logging
 import os
 import pickle
@@ -56,6 +58,9 @@ def autolabel(rects, ax, indices=None, labels=None, offsets=None):
 
 
 def visualize_cost_lut_pickle(pickle_filepath, scale_factors=None, fig_path=None):
+    """Bar charts of the latency and energy of every unique node on every core of a pickled
+    `CostModelEvaluationLUT` (optionally scaled per node by `scale_factors`), saved next to the pickle unless
+    `fig_path` is given."""
     _set_matplotlib_styles()
     node_hw_performances = _load_node_hw_performances(pickle_filepath)
     scale_factors = _get_scale_factors(node_hw_performances, scale_factors)

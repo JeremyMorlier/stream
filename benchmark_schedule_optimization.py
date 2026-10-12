@@ -127,7 +127,8 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
             for row in _read_schedules_csv(
                 os.path.join(experiment_dir, f"schedule_optimization_l{level}", "schedules.csv")
             )
-            if row.get("fold_objective", "").startswith("cpsat")
+            # The levels' own records (the space builder's single unrolled schedule is not theirs).
+            if row["id"].startswith("opt")
         ]
     result = {
         "workload": workload,
@@ -177,9 +178,9 @@ def _method_points(result: dict) -> list[tuple[float, float, float]]:
     return [(r["latency"], r["energy"], r["area"]) for r in result["pareto"] if keep(r)]
 
 
-def _prediction_errors(result: dict) -> dict:
+def _prediction_errors(result: dict, rows: list[dict]) -> dict:
     errors = {"latency": [], "energy": []}
-    for row in result["measured"]:
+    for row in rows:
         for name, bound in (("latency", "latency_bound"), ("energy", "energy_bound")):
             try:
                 measured, predicted = float(row[name]), float(row[bound])
@@ -193,6 +194,13 @@ def _prediction_errors(result: dict) -> dict:
             out[f"{name}_error_median_pct"] = round(100 * statistics.median(values), 1)
             out[f"{name}_error_max_abs_pct"] = round(100 * max(abs(v) for v in values), 1)
     return out
+
+
+def _level_rows(output_dir: str, workload: str, method: str) -> list[dict]:
+    """Every solution a level measured, with the model's prediction in `latency_bound` / `energy_bound`."""
+    level = 1 if method == "level1" else 2
+    path = os.path.join(output_dir, workload, EXPERIMENT_ID, f"schedule_optimization_l{level}", "schedules.csv")
+    return [row for row in _read_schedules_csv(path) if row["id"].startswith("opt")]
 
 
 def compare(output_dir: str, workloads: list[str]) -> None:
@@ -238,7 +246,11 @@ def compare(output_dir: str, workloads: list[str]) -> None:
                     "min_energy": min(p[1] for p in front),
                     "min_area": min(p[2] for p in front),
                     "hypervolume": round(hypervolume_3d(normalized, (1.0, 1.0, 1.0)), 4),
-                    **(_prediction_errors(result) if method != "rolled" else {}),
+                    **(
+                        _prediction_errors(result, _level_rows(output_dir, workload, method))
+                        if method != "rolled"
+                        else {}
+                    ),
                 }
             )
         _plot(workload, fronts, os.path.join(output_dir, f"fronts_{workload}.png"))

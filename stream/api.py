@@ -688,6 +688,7 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     search_budget: SearchBudget | None = None,
     core_convergence_patience: int | None = None,
     core_rel_tol: float = 0.005,
+    stats_out: dict[str, Any] | None = None,
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
     """Search schedules as `optimize_schedules` does, then *roll* them: reuse cores that are idle later in the
     schedule so the accelerator needs fewer of them, and return one Pareto front over both families.
@@ -716,6 +717,8 @@ def optimize_rolled_schedules(  # noqa: PLR0913
             folded core runs layers that were never meant for its design). Above it the run falls back to the
             unrolled diagonal warm-up.
         prune_rolled: skip folds whose lower bound is already dominated by a measured schedule.
+        stats_out: if given, filled with the search statistics (counts and the `prepare_time_s`,
+            `search_time_s` and `rolled.time_s` wall times).
         core_convergence_patience: when set, each tile's core GA stops once its front hypervolume grew by less
             than `core_rel_tol` over that many generations (`nb_core_ga_generations` stays a hard cap).
         search_budget: optional wall-clock budget (see `stream.opt.search_budget`). Every measured schedule is
@@ -829,6 +832,8 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     pickle_save(best_scme, scme_path)  # type: ignore
     pareto_schedules: list[dict[str, Any]] = extra_info["pareto_schedules"]
     stats = extra_info["search_stats"]
+    if stats_out is not None:  # the search statistics, for callers comparing searches (prepare/search/roll times)
+        stats_out.update(stats)
     rolled = stats.get("rolled", {})
     nb_rolled = sum(1 for record in pareto_schedules if record.get("kind") == "rolled")
     logger.info(
@@ -1080,3 +1085,133 @@ def optimize_rolled_tiling(  # noqa: PLR0913
         f"(best EDP on its front={best_extra_info.get('fitness')})."
     )
     return best_scme, answers
+
+
+def optimize_schedule_model(  # noqa: PLR0913
+    hardware: str,
+    workload: str,
+    mapping: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    level: Literal[1, 2] = 2,
+    chunks_per_group: int = 8,
+    temporal_mapping_type: str = "uneven",
+    sort_key: Literal["latency", "energy", "area", "edp"] = "latency",
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+    nb_core_ga_generations: int = 4,
+    nb_core_ga_individuals: int = 8,
+    core_max_workers: int | None = None,
+    core_pareto_points: int = 10,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
+    reuse_pareto_fronts: bool = True,
+    max_cme_matrix_cells: int = 2000,
+    area_levels: int = 5,
+    energy_levels: int = 3,
+    solve_time_limit_s: float = 20.0,
+    solver_workers: int = 8,
+    max_optimized_evaluations: int = 200,
+    fold_allow_sibling_merge: bool = False,
+    search_budget: SearchBudget | None = None,
+    core_convergence_patience: int | None = None,
+    core_rel_tol: float = 0.005,
+) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]], dict[str, Any]]:
+    """The rolled search's hardware/schedule decisions taken by one constraint model instead of branch and bound
+    plus folding: `GroupScheduleOptimizationStage` (`level=1`, one task per layer group) or
+    `ChunkScheduleOptimizationStage` (`level=2`, `chunks_per_group` tasks per group). See
+    `stream.stages.generation.schedule_optimization`.
+
+    The chain is the rolled one with the optimization stage in place of `ScheduleRollingStage`.
+    `ScheduleExplorationStage` only builds the schedule space and the full cost matrix here (it measures a single
+    unrolled schedule), so with `reuse_pareto_fronts` and an existing `rolled_search/` cache a run on the same
+    experiment as `optimize_rolled_schedules` starts from exactly the same per-tile fronts and costs.
+
+    Returns:
+        The best schedule by `sort_key`, the combined Pareto set as plain records (the optimized ones carry
+        `predicted_latency` / `predicted_energy`), and the search statistics (`optimization_l<level>` holds the
+        model sizes and the model / solve / measurement times). The model's solves are logged to
+        `{output_path}/{experiment_id}/schedule_optimization_l<level>/solves.csv`.
+    """
+    from stream.stages.generation.schedule_optimization import (  # noqa: PLC0415
+        ChunkScheduleOptimizationStage,
+        GroupScheduleOptimizationStage,
+    )
+
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+    logger = _logging.getLogger(__name__)
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+    optimization_stage = {1: GroupScheduleOptimizationStage, 2: ChunkScheduleOptimizationStage}[level]
+
+    stage_classes = [
+        AcceleratorParserStage,
+        StreamONNXModelParserStage,
+        LayerStacksGenerationStage,
+        TilingGenerationStage,
+        TiledWorkloadGenerationStage,
+        *SCHEDULE_REPORT_STAGES,
+        CoreArchitectureExplorationStage,
+        ScheduleExplorationStage,
+        optimization_stage,
+        ScheduleSelectionStage,
+        *MEASUREMENT_STAGES,
+    ]
+
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+
+    mainstage = MainStage(
+        stage_classes,
+        accelerator=hardware,
+        workload_path=workload,
+        mapping_path=mapping,
+        loma_lpf_limit=6,
+        mode=mode,
+        layer_stacks=layer_stacks,
+        tiled_workload_path=f"{output_path}/{experiment_id}/tiled_workload.pickle",
+        cost_lut_path=f"{output_path}/{experiment_id}/cost_lut.pickle",
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],
+        nb_ga_generations=nb_ga_generations,
+        nb_ga_individuals=nb_ga_individuals,
+        sort_key=sort_key,
+        nb_core_ga_generations=nb_core_ga_generations,
+        nb_core_ga_individuals=nb_core_ga_individuals,
+        core_max_workers=core_max_workers,
+        core_pareto_points=core_pareto_points,
+        core_param_ranges=core_param_ranges,
+        reuse_pareto_fronts=reuse_pareto_fronts,
+        max_schedule_evaluations=1,
+        max_cme_matrix_cells=max_cme_matrix_cells,
+        chunks_per_group=chunks_per_group,
+        area_levels=area_levels,
+        energy_levels=energy_levels,
+        solve_time_limit_s=solve_time_limit_s,
+        solver_workers=solver_workers,
+        max_optimized_evaluations=max_optimized_evaluations,
+        fold_allow_sibling_merge=fold_allow_sibling_merge,
+        search_budget=search_budget,
+        core_convergence_patience=core_convergence_patience,
+        core_rel_tol=core_rel_tol,
+    )
+    t_start = _time.perf_counter()
+    answers = [answer for answer in mainstage.run() if answer[0] is not None]
+    if not answers:
+        raise ValueError("No schedule could be evaluated.")
+    best_scme, extra_info = answers[0]
+    pickle_save(best_scme, f"{output_path}/{experiment_id}/scme.pickle")  # type: ignore
+    stats = extra_info["search_stats"]
+    logger.info(
+        f"optimize_schedule_model (level {level}): {len(extra_info['pareto_schedules'])} pareto schedule(s) in "
+        f"{_time.perf_counter() - t_start:.1f}s; {stats.get(f'optimization_l{level}')}."
+    )
+    return best_scme, extra_info["pareto_schedules"], stats

@@ -37,6 +37,7 @@ Two things are deliberately not assumed:
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any, Literal
@@ -580,7 +581,9 @@ class ScheduleRollingStage(ScheduleSearchStage):
                 "every hosted shape was cost-modelled on."
             )
         os.makedirs(self.rolled_search_dir, exist_ok=True)
+        t_start = time.perf_counter()
         state.stats["rolled"] = self._roll(state.archive)
+        state.stats["rolled"]["time_s"] = round(time.perf_counter() - t_start, 2)
         state.report["out_dir"] = self.rolled_search_dir
         state.report["fold_log"] = self.fold_log
         kwargs = self.kwargs.copy()

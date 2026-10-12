@@ -32,6 +32,7 @@ the exhaustive search for exactly that comparison.
 import logging
 import math
 import os
+import time
 from typing import Any
 
 from stream.stages.generation.core_architecture_exploration import ParetoCoreSearchResult
@@ -375,8 +376,13 @@ class ScheduleExplorationStage(ScheduleSearchStage):
         }
 
     def run(self):
+        t_start = time.perf_counter()
         self._prepare_search()
+        t_prepared = time.perf_counter()
         archive, stats = self._search()
+        # Wall times, so the searches that extend this one can be compared without the shared preparation.
+        stats["prepare_time_s"] = round(t_prepared - t_start, 2)
+        stats["search_time_s"] = round(time.perf_counter() - t_prepared, 2)
         if not archive.entries:
             raise ValueError("ScheduleExplorationStage: no schedule could be measured.")
         logger.info(

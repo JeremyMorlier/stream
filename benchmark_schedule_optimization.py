@@ -7,6 +7,7 @@ For each workload, all methods run on one experiment directory, in this order:
    (`core_search/pareto_fronts.pickle`) and the full shape x design cost matrix (`rolled_search/cost_lut_*`).
 2. `level1`: `optimize_schedule_model(level=1)` -- one task per layer group.
 3. `level2`: `optimize_schedule_model(level=2, chunks_per_group=K)` -- K tasks per group.
+4. `level3`: `optimize_schedule_model(level=3)` -- one task per tile (solved with `--level3-solve-time`).
 
 Levels 1 and 2 reuse the fronts and the cost matrix, so all three choose from exactly the same designs with
 exactly the same per-tile costs; only the search over accelerators and schedules differs. Each method runs in its
@@ -40,15 +41,16 @@ import sys
 import time
 
 WORKLOADS = ("resnet", "attention")
-METHODS = ("rolled", "level1", "level2")
+METHODS = ("rolled", "level1", "level2", "level3")
 QUAD_CORE = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"
 MAPPINGS = {
     "resnet": "stream/inputs/examples/mapping/tpu_like_quad_core_ga.yaml",
     "attention": "stream/inputs/examples/mapping/tpu_like_quad_core_attention.yaml",
 }
 # Validated categorical slots 1-3 of the dataviz reference palette (all-pairs safe).
-COLORS = {"rolled": "#2a78d6", "level1": "#eb6834", "level2": "#1baf7a"}
-MARKERS = {"rolled": "o", "level1": "^", "level2": "s"}
+# Level 3 reuses level 2's hue (aqua) with its own marker: no fourth hue clears the all-pairs color-vision floors.
+COLORS = {"rolled": "#2a78d6", "level1": "#eb6834", "level2": "#1baf7a", "level3": "#1baf7a"}
+MARKERS = {"rolled": "o", "level1": "^", "level2": "s", "level3": "D"}
 EXPERIMENT_ID = "schedule_search"
 
 logger = logging.getLogger(__name__)
@@ -111,12 +113,12 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
     else:
         from stream.api import optimize_schedule_model
 
-        level = 1 if method == "level1" else 2
+        level = int(method[-1])
         _best, pareto, stats = optimize_schedule_model(
             **kwargs,
             level=level,
             chunks_per_group=args.chunks,
-            solve_time_limit_s=args.solve_time,
+            solve_time_limit_s=args.level3_solve_time if method == "level3" else args.solve_time,
             solver_workers=args.workers,
             area_levels=args.area_levels,
             energy_levels=args.energy_levels,
@@ -198,7 +200,7 @@ def _prediction_errors(result: dict, rows: list[dict]) -> dict:
 
 def _level_rows(output_dir: str, workload: str, method: str) -> list[dict]:
     """Every solution a level measured, with the model's prediction in `latency_bound` / `energy_bound`."""
-    level = 1 if method == "level1" else 2
+    level = int(method[-1])
     path = os.path.join(output_dir, workload, EXPERIMENT_ID, f"schedule_optimization_l{level}", "schedules.csv")
     return [row for row in _read_schedules_csv(path) if row["id"].startswith("opt")]
 
@@ -230,7 +232,7 @@ def compare(output_dir: str, workloads: list[str]) -> None:
             measured_count = (
                 stats.get("measured", 0) + stats.get("rolled", {}).get("measured", 0)
                 if method == "rolled"
-                else stats[f"optimization_l{1 if method == 'level1' else 2}"].get("measured", 0)
+                else stats[f"optimization_l{method[-1]}"].get("measured", 0)
             )
             rows.append(
                 {
@@ -313,6 +315,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=METHODS)
     parser.add_argument("--chunks", type=int, default=8, help="level 2: tasks per layer group.")
     parser.add_argument("--solve-time", type=float, default=20.0, help="CP-SAT time limit per solve, seconds.")
+    parser.add_argument(
+        "--level3-solve-time", type=float, default=60.0, help="CP-SAT time limit per level-3 solve, seconds."
+    )
     parser.add_argument("--area-levels", type=int, default=5)
     parser.add_argument("--energy-levels", type=int, default=3)
     parser.add_argument("--workers", type=int, default=8)
@@ -338,7 +343,8 @@ def main() -> None:
             for method in [m for m in METHODS if m in args.methods]:
                 log_path = os.path.join(args.log_dir, f"{workload}_{method}.log")
                 command = [sys.executable, __file__, "--single", workload, method, "--chunks", str(args.chunks),
-                           "--solve-time", str(args.solve_time), "--area-levels", str(args.area_levels),
+                           "--solve-time", str(args.solve_time), "--level3-solve-time", str(args.level3_solve_time),
+                           "--area-levels", str(args.area_levels),
                            "--energy-levels", str(args.energy_levels), "--workers", str(args.workers),
                            "--output-dir", args.output_dir]  # fmt: skip
                 print(f"[{time.strftime('%H:%M:%S')}] {workload}/{method} -> {log_path}", flush=True)

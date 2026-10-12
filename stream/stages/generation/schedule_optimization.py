@@ -16,7 +16,7 @@ stages, so `ScheduleSelectionStage` and the visualization stages work unchanged.
 point is kept next to the measurement (`predicted_latency`, `predicted_energy`), as the evidence for how much the
 model can be trusted.
 
-Two levels of detail, as two stages (see `docs/source/rolled_schedule_optimization.md`):
+Three levels of detail, as three stages (see `docs/source/rolled_schedule_optimization.md`):
 
 - `GroupScheduleOptimizationStage` (level 1): one task per layer group. Small and fast, but a consumer group only
   starts once its producer groups have finished, so layer fusion -- which Stream exploits by interleaving tiles of
@@ -25,6 +25,8 @@ Two levels of detail, as two stages (see `docs/source/rolled_schedule_optimizati
   `chunks_per_group` chunks. A chunk depends on the chunks that hold its tiles' predecessors, so consecutive layers
   pipeline at chunk granularity and fusion is approximated. The hardware decisions are the same; only the time
   model is finer.
+- `TileScheduleOptimizationStage` (level 3): one task per tile, with the tile dependency graph (transitively
+  reduced) as precedences -- the time model Stream itself schedules, minus what is listed below.
 
 What the model takes from the schedule space (all computed by the full-matrix warm-up the stages request):
 per-tile latency (`latency_attr`) and energy for every (tile shape, design) pair, design areas, and the tile
@@ -228,17 +230,26 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             for index, component in enumerate(nx.strongly_connected_components(graph))
             for chunk in component
         }
-        self.dependencies = [(a, b) for a, b in graph.edges() if component_of[a] != component_of[b]]
-        self.dropped_dependencies = graph.number_of_edges() - len(self.dependencies)
+        dependencies = [(a, b) for a, b in graph.edges() if component_of[a] != component_of[b]]
+        self.dropped_dependencies = graph.number_of_edges() - len(dependencies)
         self.chains = [
             (index, index + 1)
             for index in range(len(self.chunks) - 1)
             if self.chunks[index][0] == self.chunks[index + 1][0]
         ]
+        # Transitive reduction: transfers take no time in the model and every task lasts at least a cycle, so an
+        # edge implied by a path of others constrains nothing. Exact, and what keeps the tile level tractable
+        # (attention: ~100k tile edges, most of them implied).
+        dag = nx.DiGraph()
+        dag.add_nodes_from(range(len(self.chunks)))
+        dag.add_edges_from(dependencies + self.chains)
+        chain_set = set(self.chains)
+        self.dependencies = [edge for edge in nx.transitive_reduction(dag).edges() if edge not in chain_set]
         logger.info(
             f"{type(self).__name__}: {len(self.groups)} group(s), {len(self.chunks)} task(s), "
-            f"{len(self.design_keys)} design(s), {len(self.dependencies)} dependency edge(s) "
-            f"({self.dropped_dependencies} dropped inside mutually dependent chunk sets)."
+            f"{len(self.design_keys)} design(s), {len(self.dependencies)} dependency edge(s) after transitive "
+            f"reduction of {len(dependencies)} ({self.dropped_dependencies} dropped inside mutually dependent "
+            f"chunk sets)."
         )
 
     # ----------------------------------------------------------------------------------------- model ---------
@@ -285,22 +296,38 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
                 self.group_energy_var[group] == sum(self.group_energy[group][key] * self.y[p, key] for key in keys)
             ).OnlyEnforceIf(literal)
 
+        # A task's duration follows the design of its group's slot. Tasks of one group with the same per-design
+        # durations (same tile-shape composition) share one duration variable, so the "duration = design's
+        # duration" constraints are written once per (group, composition, slot) rather than per task -- at the tile
+        # level that is the difference between a few hundred constraints and hundreds of thousands.
+        duration_var: dict[tuple[int, tuple], Any] = {}
+        for c, (group, _index) in enumerate(self.chunks):
+            durations = self.duration[c]
+            signature = (group, tuple(durations[key] for key in keys))
+            if signature in duration_var:
+                continue
+            duration = model.NewIntVar(min(durations.values()), max(durations.values()), f"d_{len(duration_var)}")
+            duration_var[signature] = duration
+            for p in slots:
+                if (group, p) in self.x:
+                    model.Add(duration == sum(durations[key] * self.y[p, key] for key in keys)).OnlyEnforceIf(
+                        self.x[group, p]
+                    )
+
         self.start, self.end = [], []
         intervals_of_slot: dict[int, list[Any]] = {p: [] for p in slots}
         for c, (group, _index) in enumerate(self.chunks):
-            durations = self.duration[c]
-            duration = model.NewIntVar(min(durations.values()), max(durations.values()), f"d_{c}")
+            duration = duration_var[(group, tuple(self.duration[c][key] for key in keys))]
             start = model.NewIntVar(0, horizon, f"s_{c}")
             end = model.NewIntVar(0, horizon, f"c_{c}")
             self.start.append(start)
             self.end.append(end)
             model.Add(end == start + duration)
             for p in slots:
-                if (group, p) not in self.x:
-                    continue
-                literal = self.x[group, p]
-                model.Add(duration == sum(durations[key] * self.y[p, key] for key in keys)).OnlyEnforceIf(literal)
-                intervals_of_slot[p].append(model.NewOptionalIntervalVar(start, duration, end, literal, f"i_{c}_{p}"))
+                if (group, p) in self.x:
+                    intervals_of_slot[p].append(
+                        model.NewOptionalIntervalVar(start, duration, end, self.x[group, p], f"i_{c}_{p}")
+                    )
         for intervals in intervals_of_slot.values():
             model.AddNoOverlap(intervals)
         for a, b in self.dependencies + self.chains:
@@ -554,3 +581,17 @@ class ChunkScheduleOptimizationStage(ScheduleOptimizationStage):
 
     level = 2
     default_chunks_per_group = 8
+
+
+class TileScheduleOptimizationStage(ScheduleOptimizationStage):
+    """Level 3: one task per tile, with the tile dependency graph itself (transitively reduced) as precedences.
+    The hardware decisions are those of levels 1 and 2; only the time model is exact up to the per-tile costs.
+    Much larger than level 2 (every tile is an optional interval on every slot its group may use), so give it a
+    longer `solve_time_limit_s`."""
+
+    level = 3
+
+    def __init__(self, list_of_callables: list[StageCallable], **kwargs: Any):
+        kwargs.pop("chunks_per_group", None)
+        # More chunks than any group has tiles: every tile becomes its own task.
+        super().__init__(list_of_callables, chunks_per_group=10**9, **kwargs)

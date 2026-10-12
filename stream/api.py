@@ -1095,7 +1095,7 @@ def optimize_schedule_model(  # noqa: PLR0913
     layer_stacks: list[tuple[int, ...]],
     experiment_id: str,
     output_path: str,
-    level: Literal[1, 2] = 2,
+    level: Literal[1, 2, 3] = 2,
     chunks_per_group: int = 8,
     temporal_mapping_type: str = "uneven",
     sort_key: Literal["latency", "energy", "area", "edp"] = "latency",
@@ -1121,7 +1121,8 @@ def optimize_schedule_model(  # noqa: PLR0913
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]], dict[str, Any]]:
     """The rolled search's hardware/schedule decisions taken by one constraint model instead of branch and bound
     plus folding: `GroupScheduleOptimizationStage` (`level=1`, one task per layer group) or
-    `ChunkScheduleOptimizationStage` (`level=2`, `chunks_per_group` tasks per group). See
+    `ChunkScheduleOptimizationStage` (`level=2`, `chunks_per_group` tasks per group) or
+    `TileScheduleOptimizationStage` (`level=3`, one task per tile). See
     `stream.stages.generation.schedule_optimization`.
 
     The chain is the rolled one with the optimization stage in place of `ScheduleRollingStage`.
@@ -1138,6 +1139,7 @@ def optimize_schedule_model(  # noqa: PLR0913
     from stream.stages.generation.schedule_optimization import (  # noqa: PLC0415
         ChunkScheduleOptimizationStage,
         GroupScheduleOptimizationStage,
+        TileScheduleOptimizationStage,
     )
 
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
@@ -1149,7 +1151,11 @@ def optimize_schedule_model(  # noqa: PLR0913
         temporal_mapping_type = TemporalMappingType.EVEN
     else:
         raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
-    optimization_stage = {1: GroupScheduleOptimizationStage, 2: ChunkScheduleOptimizationStage}[level]
+    optimization_stage = {
+        1: GroupScheduleOptimizationStage,
+        2: ChunkScheduleOptimizationStage,
+        3: TileScheduleOptimizationStage,
+    }[level]
 
     stage_classes = [
         AcceleratorParserStage,

@@ -483,9 +483,10 @@ class ScheduleSpace:
             return workload, accelerator, cost_lut
         return self.assemble_unrolled(record["ranks"], save_yaml=save_yaml)
 
-    def measure(self, workload: Any, accelerator: Any, cost_lut: Any):
-        """Schedule an assembled accelerator with the measurement pipeline."""
-        return self.pipeline.measure(workload, accelerator, cost_lut)
+    def measure(self, workload: Any, accelerator: Any, cost_lut: Any, **extra: Any):
+        """Schedule an assembled accelerator with the measurement pipeline (`extra`: kwargs for this measurement
+        only)."""
+        return self.pipeline.measure(workload, accelerator, cost_lut, **extra)
 
     def payload(self, record: dict[str, Any]) -> dict[str, Any]:
         """One Pareto entry as plain data, carrying whatever is needed to rebuild its accelerator: an unrolled

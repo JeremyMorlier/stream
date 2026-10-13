@@ -60,6 +60,8 @@ class ScheduleSelectionStage(ScheduleSearchStage):
         workload, accelerator, cost_lut = space.assemble_record(best_record, save_yaml=True)
         kwargs = self.kwargs.copy()
         kwargs.update(workload=workload, accelerator=accelerator, cost_lut=cost_lut)
+        if best_record.get("scheduling_order"):  # measured in a given tile order: re-measure it in the same one
+            kwargs["provided_scheduling_order"] = list(best_record["scheduling_order"])
         sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **kwargs)
         for scme, _sub_extra_info in sub_stage.run():
             yield scme, extra_info

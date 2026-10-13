@@ -310,10 +310,11 @@ class MeasurementPipeline:
         self.list_of_callables = list(list_of_callables)
         self.kwargs = dict(kwargs)
 
-    def measure(self, workload: Any, accelerator: Any, cost_lut: CostModelEvaluationLUT):
+    def measure(self, workload: Any, accelerator: Any, cost_lut: CostModelEvaluationLUT, **extra: Any):
         """Schedule `workload` on `accelerator` with `cost_lut` and return the resulting
-        `StreamCostModelEvaluation` (the first answer the stages yield)."""
-        kwargs = self.kwargs.copy()
+        `StreamCostModelEvaluation` (the first answer the stages yield). `extra` kwargs reach the measurement stages
+        for this one measurement (e.g. `provided_scheduling_order`, see `ProvidedSchedulingOrderStage`)."""
+        kwargs = {**self.kwargs, **extra}
         kwargs["workload"] = workload
         kwargs["accelerator"] = accelerator
         kwargs["cost_lut"] = cost_lut

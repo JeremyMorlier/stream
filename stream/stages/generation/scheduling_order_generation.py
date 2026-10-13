@@ -285,3 +285,64 @@ class SchedulingOrderGenerationStage(Stage):
     def get_nb_generated_nodes(self, node: GeneratedComputationNode) -> int:
         """Get the number of generated nodes for a given base_id"""
         return max(gen_id for base_id, gen_id in self.base_and_gen_to_layer_id if base_id == node.base_id) + 1
+
+
+class ProvidedSchedulingOrderStage(SchedulingOrderGenerationStage):
+    """`SchedulingOrderGenerationStage` that follows a tile order given by an earlier stage, when there is one.
+
+    The scheduler pops, among the ready tiles, the one earliest in `scheduling_order`, so the order is its priority
+    (and also decides when `check_and_sync_cores` puts a barrier on all cores). A search that plans *when* every
+    tile runs -- `ScheduleOptimizationStage` with `scheduling_order_source="model"` -- passes that plan as the
+    kwarg `provided_scheduling_order: list[(layer id, sub id)]`, and the schedule is then measured in that order.
+
+    Without the kwarg it is exactly `SchedulingOrderGenerationStage`. With it, the result is always a full
+    permutation of the workload's `(id, sub_id)`: the provided entries the workload has come first, in the given
+    order, and anything the provided order misses follows in the generated order."""
+
+    def __init__(
+        self,
+        list_of_callables: list[StageCallable],
+        *,
+        provided_scheduling_order: list[tuple[int, int]] | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(list_of_callables, **kwargs)
+        self.provided_scheduling_order = provided_scheduling_order
+
+    def run(self):
+        generated = self.get_scheduling_order_fused() if self.layer_stacks else self.get_scheduling_order_lbl()
+        self.scheduling_order = (
+            generated
+            if self.provided_scheduling_order is None
+            else merge_scheduling_orders(self.provided_scheduling_order, generated)
+        )
+        self.kwargs["accelerator"] = self.accelerator
+        self.kwargs["workload"] = self.workload
+        self.kwargs["scheduling_order"] = self.scheduling_order
+        sub_stage = self.list_of_callables[0](self.list_of_callables[1:], **self.kwargs)
+        yield from sub_stage.run()
+
+
+def merge_scheduling_orders(provided: list[tuple[int, int]], generated: SCHEDULE_ORDER_T) -> SCHEDULE_ORDER_T:
+    """`provided` restricted to the entries of `generated` (which lists every node exactly once), followed by the
+    entries `provided` misses, in their generated order."""
+    known = set(generated)
+    seen: set[tuple[int, int]] = set()
+    order: SCHEDULE_ORDER_T = []
+    unknown = 0
+    for item in provided:
+        item = (int(item[0]), int(item[1]))  # noqa: PLW2901
+        if item not in known:
+            unknown += 1
+        elif item not in seen:
+            seen.add(item)
+            order.append(item)
+    missing = [item for item in generated if item not in seen]
+    order += missing
+    if unknown or missing:
+        logger.info(
+            f"ProvidedSchedulingOrderStage: {unknown} provided entr(y/ies) not in the workload dropped, "
+            f"{len(missing)} node(s) missing from the provided order appended in generated order."
+        )
+    assert len(order) == len(generated) and set(order) == known, "The merged scheduling order is not a permutation."
+    return order

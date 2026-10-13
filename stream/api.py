@@ -1118,6 +1118,11 @@ def optimize_schedule_model(  # noqa: PLR0913
     search_budget: SearchBudget | None = None,
     core_convergence_patience: int | None = None,
     core_rel_tol: float = 0.005,
+    measurement: Literal["ga", "co"] = "ga",
+    scheduling_order_source: Literal["generated", "model"] = "generated",
+    co_time_limit: int = 600,
+    optimization_search_dir: str | None = None,
+    model_solutions_path: str | None = None,
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]], dict[str, Any]]:
     """The rolled search's hardware/schedule decisions taken by one constraint model instead of branch and bound
     plus folding: `GroupScheduleOptimizationStage` (`level=1`, one task per layer group) or
@@ -1129,6 +1134,21 @@ def optimize_schedule_model(  # noqa: PLR0913
     `ScheduleExplorationStage` only builds the schedule space and the full cost matrix here (it measures a single
     unrolled schedule), so with `reuse_pareto_fronts` and an existing `rolled_search/` cache a run on the same
     experiment as `optimize_rolled_schedules` starts from exactly the same per-tile fronts and costs.
+
+    Args:
+        measurement: how every accelerator is scheduled once built. `"ga"` is the usual measurement chain
+            (fixed allocation, Stream's scheduling order, `GeneticAlgorithmAllocationStage`). `"co"` is
+            `ConstraintOptimizationAllocationStage` (Gurobi): it allocates one steady-state iteration of each fused
+            stack into time slots, unrolls it and schedules it in that order. Each layer can only run on the
+            cores its group was given, so `"co"` changes the schedule, not the placement.
+        scheduling_order_source: with `measurement="ga"`, the tile order each solution is scheduled in:
+            `"generated"` (Stream's generic order) or `"model"` (the order the model scheduled the tiles in, through
+            `ProvidedSchedulingOrderStage`).
+        co_time_limit: Gurobi time limit per steady-state allocation, with `measurement="co"`.
+        optimization_search_dir: where the optimization stage's report goes (default
+            `schedule_optimization_l<level>/`); give each measurement its own to keep both reports.
+        model_solutions_path: save the model's solutions there, or load them if the file exists, so the same
+            accelerators can be measured with both pipelines.
 
     Returns:
         The best schedule by `sort_key`, the combined Pareto set as plain records (the optimized ones carry
@@ -1151,6 +1171,19 @@ def optimize_schedule_model(  # noqa: PLR0913
         temporal_mapping_type = TemporalMappingType.EVEN
     else:
         raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+    from stream.stages.allocation.constraint_optimization_allocation import (  # noqa: PLC0415
+        IsolatedConstraintOptimizationAllocationStage,
+    )
+
+    from stream.stages.generation.scheduling_order_generation import ProvidedSchedulingOrderStage  # noqa: PLC0415
+
+    # The GA chain with `ProvidedSchedulingOrderStage`, which is `SchedulingOrderGenerationStage` unless a solution
+    # hands it its own tile order.
+    measurement_stages = (
+        [SetFixedAllocationPerformanceStage, ProvidedSchedulingOrderStage, GeneticAlgorithmAllocationStage]
+        if measurement == "ga"
+        else [IsolatedConstraintOptimizationAllocationStage]
+    )
     optimization_stage = {
         1: GroupScheduleOptimizationStage,
         2: ChunkScheduleOptimizationStage,
@@ -1168,7 +1201,7 @@ def optimize_schedule_model(  # noqa: PLR0913
         ScheduleExplorationStage,
         optimization_stage,
         ScheduleSelectionStage,
-        *MEASUREMENT_STAGES,
+        *measurement_stages,
     ]
 
     ranges = CoreParamRanges(**(core_param_ranges or {}))
@@ -1205,6 +1238,11 @@ def optimize_schedule_model(  # noqa: PLR0913
         solver_workers=solver_workers,
         max_optimized_evaluations=max_optimized_evaluations,
         fold_allow_sibling_merge=fold_allow_sibling_merge,
+        optimization_search_dir=optimization_search_dir,
+        model_solutions_path=model_solutions_path,
+        scheduling_order_source=scheduling_order_source,
+        co_time_limit=co_time_limit,
+        co_measurement_dir=f"{output_path}/{experiment_id}/co_measurements",
         search_budget=search_budget,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,

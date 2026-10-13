@@ -693,3 +693,26 @@ class ConstraintOptimizationAllocationStage(Stage):
 
     def is_leaf(self) -> bool:
         return True
+
+
+class IsolatedConstraintOptimizationAllocationStage(ConstraintOptimizationAllocationStage):
+    """`ConstraintOptimizationAllocationStage` as the measurement stage of a search that schedules many different
+    accelerators in one run (see `stream.stages.generation.schedule_optimization`).
+
+    The parent caches its re-tiled workload and its cost LUT at fixed paths and reloads them when they exist, which
+    is right for one accelerator and silently wrong for the next one. This gives every instance its own directory
+    under `co_measurement_dir` (default: next to `cost_lut_post_co_path`, or `co_measurements/`)."""
+
+    _instances = 0
+
+    def __init__(self, list_of_callables: list[StageCallable], **kwargs: Any):
+        base = kwargs.pop("co_measurement_dir", None) or os.path.join(
+            os.path.dirname(kwargs.get("cost_lut_post_co_path") or "co_measurements/x"), "co_measurements"
+        )
+        IsolatedConstraintOptimizationAllocationStage._instances += 1
+        run_dir = os.path.join(base, f"{os.getpid()}_{IsolatedConstraintOptimizationAllocationStage._instances}")
+        os.makedirs(run_dir, exist_ok=True)
+        kwargs["allocations_path"] = os.path.join(run_dir, "allocations")
+        kwargs["tiled_workload_post_co_path"] = os.path.join(run_dir, "tiled_workload_post_co.pickle")
+        kwargs["cost_lut_post_co_path"] = os.path.join(run_dir, "cost_lut_post_co.pickle")
+        super().__init__(list_of_callables, **kwargs)

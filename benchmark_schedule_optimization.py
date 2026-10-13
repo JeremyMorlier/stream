@@ -8,6 +8,9 @@ For each workload, all methods run on one experiment directory, in this order:
 2. `level1`: `optimize_schedule_model(level=1)` -- one task per layer group.
 3. `level2`: `optimize_schedule_model(level=2, chunks_per_group=K)` -- K tasks per group.
 4. `level3`: `optimize_schedule_model(level=3)` -- one task per tile (solved with `--level3-solve-time`).
+5. `level<n>_ordered`: the same level, but every solution is scheduled in the order the model planned its tiles
+   (`scheduling_order_source="model"`, through `ProvidedSchedulingOrderStage`) instead of Stream's generic order.
+   Its report goes to `schedule_optimization_l<n>_ordered/`.
 
 Levels 1 and 2 reuse the fronts and the cost matrix, so all three choose from exactly the same designs with
 exactly the same per-tile costs; only the search over accelerators and schedules differs. Each method runs in its
@@ -41,7 +44,7 @@ import sys
 import time
 
 WORKLOADS = ("resnet", "attention")
-METHODS = ("rolled", "level1", "level2", "level3")
+METHODS = ("rolled", "level1", "level2", "level3", "level1_ordered", "level2_ordered", "level3_ordered")
 QUAD_CORE = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"
 MAPPINGS = {
     "resnet": "stream/inputs/examples/mapping/tpu_like_quad_core_ga.yaml",
@@ -50,7 +53,10 @@ MAPPINGS = {
 # Validated categorical slots 1-3 of the dataviz reference palette (all-pairs safe).
 # Level 3 reuses level 2's hue (aqua) with its own marker: no fourth hue clears the all-pairs color-vision floors.
 COLORS = {"rolled": "#2a78d6", "level1": "#eb6834", "level2": "#1baf7a", "level3": "#1baf7a"}
+# An ordered variant shares its level's hue and marker, drawn hollow.
+COLORS.update({f"level{n}_ordered": COLORS[f"level{n}"] for n in (1, 2, 3)})
 MARKERS = {"rolled": "o", "level1": "^", "level2": "s", "level3": "D"}
+MARKERS.update({f"level{n}_ordered": MARKERS[f"level{n}"] for n in (1, 2, 3)})
 EXPERIMENT_ID = "schedule_search"
 
 logger = logging.getLogger(__name__)
@@ -75,6 +81,17 @@ def _common_kwargs(workload_path: str, workload: str, out_root: str, args: argpa
         "cacti_precompute_workers": args.workers,
         "reuse_pareto_fronts": True,
     }
+
+
+def _level(method: str) -> int:
+    """`level2_ordered` -> 2."""
+    return int(method.removesuffix("_ordered")[-1])
+
+
+def _out_dir_name(method: str) -> str:
+    """Report directory of a level method, next to the tiled workload."""
+    suffix = "_ordered" if method.endswith("_ordered") else ""
+    return f"schedule_optimization_l{_level(method)}{suffix}"
 
 
 def _read_schedules_csv(path: str) -> list[dict]:
@@ -113,12 +130,14 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
     else:
         from stream.api import optimize_schedule_model
 
-        level = int(method[-1])
+        level = _level(method)
         _best, pareto, stats = optimize_schedule_model(
             **kwargs,
             level=level,
             chunks_per_group=args.chunks,
-            solve_time_limit_s=args.level3_solve_time if method == "level3" else args.solve_time,
+            solve_time_limit_s=args.level3_solve_time if method.startswith("level3") else args.solve_time,
+            scheduling_order_source="model" if method.endswith("_ordered") else "generated",
+            optimization_search_dir=os.path.join(experiment_dir, _out_dir_name(method)),
             solver_workers=args.workers,
             area_levels=args.area_levels,
             energy_levels=args.energy_levels,
@@ -126,9 +145,7 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
         search_time = stats[f"optimization_l{level}"]["total_time_s"]
         measured = [
             row
-            for row in _read_schedules_csv(
-                os.path.join(experiment_dir, f"schedule_optimization_l{level}", "schedules.csv")
-            )
+            for row in _read_schedules_csv(os.path.join(experiment_dir, _out_dir_name(method), "schedules.csv"))
             # The levels' own records (the space builder's single unrolled schedule is not theirs).
             if row["id"].startswith("opt")
         ]
@@ -200,8 +217,7 @@ def _prediction_errors(result: dict, rows: list[dict]) -> dict:
 
 def _level_rows(output_dir: str, workload: str, method: str) -> list[dict]:
     """Every solution a level measured, with the model's prediction in `latency_bound` / `energy_bound`."""
-    level = int(method[-1])
-    path = os.path.join(output_dir, workload, EXPERIMENT_ID, f"schedule_optimization_l{level}", "schedules.csv")
+    path = os.path.join(output_dir, workload, EXPERIMENT_ID, _out_dir_name(method), "schedules.csv")
     return [row for row in _read_schedules_csv(path) if row["id"].startswith("opt")]
 
 
@@ -232,7 +248,7 @@ def compare(output_dir: str, workloads: list[str]) -> None:
             measured_count = (
                 stats.get("measured", 0) + stats.get("rolled", {}).get("measured", 0)
                 if method == "rolled"
-                else stats[f"optimization_l{method[-1]}"].get("measured", 0)
+                else stats[f"optimization_l{_level(method)}"].get("measured", 0)
             )
             rows.append(
                 {
@@ -292,8 +308,11 @@ def _plot(workload: str, fronts: dict[str, list], path: str) -> None:
         for method, front in fronts.items():
             if not front:
                 continue
+            hollow = method.endswith("_ordered")
             ax.scatter([p[x] for p in front], [p[y] for p in front], label=f"{method} ({len(front)})",
-                       color=COLORS[method], marker=MARKERS[method], s=36, alpha=0.85, edgecolors="none")  # fmt: skip
+                       marker=MARKERS[method], s=36, alpha=0.85,
+                       facecolors="none" if hollow else COLORS[method],
+                       edgecolors=COLORS[method] if hollow else "none", linewidths=1.4)  # fmt: skip
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlabel(xl)

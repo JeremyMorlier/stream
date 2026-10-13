@@ -50,7 +50,7 @@ import os
 import time
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Any
+from typing import Any, Literal
 
 import networkx as nx
 from ortools.sat.python import cp_model
@@ -82,10 +82,14 @@ class ModelSolution:
     latency: int
     energy: float
     area: float
+    # Every tile `(layer id, sub id)` by the model's start time (ties: sub id, then layer id). Used as the measurement's
+    # scheduling order with `scheduling_order_source="model"`.
+    scheduling_order: tuple[tuple[int, int], ...] = ()
 
     @property
     def key(self) -> tuple:
-        """The accelerator it describes, independent of how the slots are numbered."""
+        """The accelerator it describes, independent of how the slots are numbered. The order is not part of it: of
+        two solutions with the same accelerator, the first found (the anchors come first) keeps its order."""
         rolled_of = renumber_merged_cores(self.slot_of_group)
         slot_of_rolled = {rolled_of[group]: slot for group, slot in self.slot_of_group.items()}
         return (
@@ -118,6 +122,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         solver_workers: int = 8,
         max_optimized_evaluations: int = 200,
         fold_allow_sibling_merge: bool = False,
+        scheduling_order_source: Literal["generated", "model"] = "generated",
         **kwargs: Any,
     ):
         """
@@ -135,6 +140,10 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             fold_allow_sibling_merge: let two groups of the same layer share a core. Off by default, as for the
                 rolled search: those are the layer's inter-core slices, and the cost model bakes in that they run
                 in parallel.
+            scheduling_order_source: the tile order each solution is measured in. `"generated"` is Stream's
+                generic order (`SchedulingOrderGenerationStage`); `"model"` is the order the model scheduled the
+                tiles in, handed to the measurement as `provided_scheduling_order` -- which only takes effect when
+                the measurement stages include `ProvidedSchedulingOrderStage`.
         """
         super().__init__(list_of_callables, **kwargs)
         self.schedule_search = schedule_search
@@ -149,6 +158,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         self.solver_workers = solver_workers
         self.max_optimized_evaluations = max_optimized_evaluations
         self.fold_allow_sibling_merge = fold_allow_sibling_merge
+        if scheduling_order_source not in ("generated", "model"):
+            raise ValueError(f"Unknown scheduling_order_source {scheduling_order_source!r}.")
+        self.scheduling_order_source = scheduling_order_source
         self.search_budget = kwargs.get("search_budget")
         self.solve_log: list[dict[str, Any]] = []
 
@@ -181,6 +193,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         self.chunks: list[tuple[int, int]] = []  # (group, index)
         self.chunk_of_tile: dict[tuple[int, int], int] = {}
         chunk_tiles: list[list[Any]] = []
+        self.chunk_tiles = chunk_tiles  # tiles of each task, in sub id order
         for group in self.groups:
             ordered = sorted(tiles_of_group[group], key=lambda tile: tile.sub_id)
             nb_chunks = max(1, min(self.chunks_per_group, len(ordered)))
@@ -387,12 +400,19 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
     def _extract(self, solver: cp_model.CpSolver) -> ModelSolution:
         slot_of_group = {group: p for (group, p), var in self.x.items() if solver.Value(var)}
         design_of_slot = {p: key for (p, key), var in self.y.items() if solver.Value(var)}
+        # A task's tiles all take its start time and keep their sub id order inside it.
+        timed = [
+            (solver.Value(self.start[task]), tile.sub_id, tile.id)
+            for task, members in enumerate(self.chunk_tiles)
+            for tile in members
+        ]
         return ModelSolution(
             slot_of_group=slot_of_group,
             design_of_slot=design_of_slot,
             latency=solver.Value(self.latency),
             energy=solver.Value(self.energy) * ENERGY_SCALE,
             area=solver.Value(self.area) / AREA_SCALE,
+            scheduling_order=tuple((layer, sub_id) for _start, sub_id, layer in sorted(timed)),
         )
 
     def _scaled(self, solution: ModelSolution, name: str) -> int:
@@ -465,7 +485,12 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             workload, accelerator, cost_lut, topology = space.assemble_rolled(
                 merge_of_core, core_dict_of_core, design_key_of_core
             )
-            scme = space.measure(workload, accelerator, cost_lut)
+            extra = (
+                {"provided_scheduling_order": list(solution.scheduling_order)}
+                if self.scheduling_order_source == "model"
+                else {}
+            )
+            scme = space.measure(workload, accelerator, cost_lut, **extra)
         except Exception:
             logger.warning(f"{type(self).__name__}: solution {record_id} could not be scheduled.", exc_info=True)
             if self.search_budget is not None:
@@ -491,7 +516,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             "predicted_energy": solution.energy,
             "fold_tolerance": "",
             "fold_objective": f"cpsat-level{self.level}",
-            "fold_overlap": f"chunks={self.chunks_per_group}",
+            "fold_overlap": f"chunks={self.chunks_per_group} order={self.scheduling_order_source}",
             "merge_of_core": merge_of_core,
             "design_key_of_core": design_key_of_core,
             "core_dict_of_core": core_dict_of_core,
@@ -501,6 +526,8 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             "link_connections": list(topology.link_connections),
             "bus_connection": dict(topology.bus_connection),
         }
+        if self.scheduling_order_source == "model":
+            record["scheduling_order"] = list(solution.scheduling_order)
         records.append(record)
         archive.add(point, record)
         logger.info(

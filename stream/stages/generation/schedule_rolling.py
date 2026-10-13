@@ -53,6 +53,7 @@ from stream.stages.generation.schedule_evaluation import (
 )
 from stream.stages.generation.schedule_space import ScheduleSearchState, ScheduleSpace
 from stream.stages.stage import StageCallable
+from stream.visualization.design_record import design_record
 
 logger = logging.getLogger(__name__)
 
@@ -537,7 +538,7 @@ class ScheduleRollingStage(ScheduleSearchStage):
         fold_stats["measured"] += 1
         point = (float(scme.latency), float(scme.energy), bounds[2])
         if self.search_budget is not None:
-            self.search_budget.record(*point, info=f"rolled {plan.id}")
+            self.search_budget.record(*point, info=f"rolled {plan.id}", artifact=lambda: design_record(scme))
         record = {
             "id": plan.id,
             "kind": "rolled",

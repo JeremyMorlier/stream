@@ -9,9 +9,15 @@ Reads `<results-dir>/<workload>/<method>/{trace.csv, summary.json}` and writes i
   EDP (and its gap to the best method on that workload), the best point, evaluation count and the normalized
   (latency, energy, area) hypervolume;
 - `comparison.html`: an interactive page in the style of the rolled exploration's `topologies.html` -- per
-  workload, the convergence curves, every measured design on a selectable trade-off projection, and the hardware
-  topology of each run's best design (plus every design of the rolled candidates' fronts), see
-  `stream.visualization.comparison_report`.
+  workload, the convergence curves, every measured design on a selectable trade-off projection, and for every
+  point of each run's Pareto front its details, hardware topology, schedule and core memory hierarchies, see
+  `stream.visualization.comparison_report`. The heavy per-point data goes to `comparison_designs/*.js`, loaded
+  by the page on demand, so the page itself stays small.
+
+What a Pareto point shows depends on what its run saved (`resolve_point`): runs of the current benchmark save a
+design record per front point (`designs/<n_eval>.json`); older runs are rebuilt from the grid candidates'
+`result.pickle`, the rolled candidates' `pareto_schedules.pickle` (hardware, no schedule) and the run's
+`scme.pickle` (its best design). Anything else is shown with its objectives only.
 
 The hypervolume of each workload is taken on objectives normalized to [ideal, nadir * 1.1] over the union of
 all methods' fronts, so methods on one workload share a reference point and the value lies in [0, 1].
@@ -30,11 +36,11 @@ from zigzag.utils import pickle_load
 
 from stream.opt.search_budget import hypervolume_3d
 from stream.visualization.comparison_report import write_comparison_report
-from stream.visualization.hardware_graph import core_layers_from_workload, extract_topology
+from stream.visualization.design_record import design_record, format_tiling, rolled_design_record
 from stream.visualization.optimizer_comparison import plot_convergence, plot_fronts, step2_start
-from stream.visualization.topology_report import design_payload
 
 METHOD_ORDER = ("rolled", "graph_ga", "grid_2x2", "grid_4x4")
+
 
 def read_trace(path: str) -> list[dict[str, float]]:
     with open(path) as f:
@@ -46,19 +52,28 @@ def read_trace(path: str) -> list[dict[str, float]]:
                 for key in ("t", "n_eval", "latency", "energy", "area", "edp", "best_edp", "feasible")
             },
             "info": row.get("info", ""),
+            "artifact": row.get("artifact") or "",
         }
         for row in rows
     ]
 
 
 def pareto_points(trace: list[dict[str, float]]) -> list[tuple[float, float, float]]:
-    points = sorted({(r["latency"], r["energy"], r["area"]) for r in trace if r["feasible"]})
-    front: list[tuple[float, float, float]] = []
-    for point in points:
-        dominated = any(all(o <= p for o, p in zip(other, point, strict=True)) and other != point for other in points)
-        if not dominated:
-            front.append(point)
-    return front
+    return [(row["latency"], row["energy"], row["area"]) for row in pareto_rows(trace)]
+
+
+def pareto_rows(trace: list[dict[str, float]]) -> list[dict]:
+    """The trace rows on the run's (latency, energy, area) front, the first measurement of each point."""
+    first: dict[tuple[float, float, float], dict] = {}
+    for row in trace:
+        if row["feasible"]:
+            first.setdefault((row["latency"], row["energy"], row["area"]), row)
+    points = sorted(first)
+    return [
+        first[point]
+        for point in points
+        if not any(all(o <= p for o, p in zip(other, point, strict=True)) and other != point for other in points)
+    ]
 
 
 def load_runs(results_dir: str) -> dict[str, dict[str, dict]]:
@@ -101,59 +116,146 @@ def _finite(value: float | None) -> float | None:
     return value if value is not None and math.isfinite(value) else None
 
 
-def _best_design(run_dir: str, method: str) -> dict | None:
-    """The run's best design with its hardware topology, read off the `scme.pickle` it saved."""
-    path = os.path.join(run_dir, "scme.pickle")
-    if not os.path.exists(path):
-        return None
+def _same_point(latency: float, energy: float, row: dict) -> bool:
+    return math.isclose(latency, row["latency"], rel_tol=1e-9) and math.isclose(energy, row["energy"], rel_tol=1e-9)
+
+
+def _load_pickle(path: str):
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 100_000))
-    try:
-        scme = pickle_load(path)
-        workload = scme.workload
-        layer_names = {node.id: node.short_name for node in workload.node_list if hasattr(node, "short_name")}
-        topology = extract_topology(
-            scme.accelerator, core_layers=core_layers_from_workload(workload), layer_names=layer_names
-        )
-        area = sum(
-            core.get_area() for core in scme.accelerator.core_list if core.id != scme.accelerator.offchip_core_id
-        )
-    except Exception as exc:  # a missing figure must not cost the whole report
-        print(f"warning: no topology for {run_dir}: {exc!r}")
-        return None
-    nb_cores = sum(1 for node in topology.nodes if node.kind == "compute")
-    record = {
-        "id": f"{method}-best",
-        "kind": "best",
-        "nb_cores": nb_cores,
-        "latency": float(scme.latency),
-        "energy": float(scme.energy),
-        "area": float(area),
-    }
-    return {**design_payload(record, topology), "method": method, "label": f"{method} best"}
+    return pickle_load(path)
 
 
-def _rolled_front_designs(run_dir: str) -> list[dict]:
-    """Every design on each rolled tiling candidate's (latency, energy, area) front, as its stage saved them."""
-    designs = []
-    search_dir = os.path.join(run_dir, "tiling_search")
-    if not os.path.isdir(search_dir):
-        return designs
-    for candidate in sorted(os.listdir(search_dir)):
-        path = os.path.join(search_dir, candidate, "rolled_search", "topologies.json")
+class PointResolver:
+    """Finds what a run saved about each of its Pareto points (see the module docstring), loading every source
+    file at most once."""
+
+    def __init__(self, run_dir: str, method: str):
+        self.run_dir, self.method = run_dir, method
+        self._scme = None
+        self._scme_loaded = False
+        self._rolled: list[tuple[str, dict]] | None = None
+
+    def run_scme(self):
+        if not self._scme_loaded:
+            self._scme_loaded = True
+            path = os.path.join(self.run_dir, "scme.pickle")
+            if os.path.exists(path):
+                try:
+                    self._scme = _load_pickle(path)
+                except Exception as exc:
+                    print(f"warning: could not load {path}: {exc!r}")
+        return self._scme
+
+    def layer_names(self) -> dict[int, str]:
+        scme = self.run_scme()
+        if scme is None:
+            return {}
+        return {node.id: node.short_name for node in scme.workload.node_list if hasattr(node, "short_name")}
+
+    def rolled_records(self) -> list[tuple[str, dict]]:
+        """(candidate directory, record) of every rolled tiling candidate's Pareto schedules."""
+        if self._rolled is None:
+            self._rolled = []
+            search_dir = os.path.join(self.run_dir, "tiling_search")
+            for candidate in sorted(os.listdir(search_dir)) if os.path.isdir(search_dir) else []:
+                path = os.path.join(search_dir, candidate, "rolled_search", "pareto_schedules.pickle")
+                if os.path.exists(path):
+                    try:
+                        self._rolled += [(candidate, r) for r in _load_pickle(path)["pareto"]]
+                    except Exception as exc:
+                        print(f"warning: could not load {path}: {exc!r}")
+        return self._rolled
+
+    def resolve(self, row: dict) -> tuple[dict | None, str]:
+        """(design record or None, where it came from) of one Pareto trace row."""
+        for source, attempt in (
+            ("artifact", self._from_artifact),
+            ("best", self._from_run_scme),
+            ("tiling candidate", self._from_tiling_candidate),
+            ("rolled record", self._from_rolled_record),
+        ):
+            try:
+                record = attempt(row)
+            except Exception as exc:  # one unreadable design must not cost the whole report
+                print(f"warning: {self.run_dir} #{int(row['n_eval'])} ({source}): {exc!r}")
+                continue
+            if record is not None:
+                return record, source
+        return None, "objectives only"
+
+    def _from_artifact(self, row: dict) -> dict | None:
+        if not row["artifact"]:
+            return None
+        with open(os.path.join(self.run_dir, "designs", f"{row['artifact']}.json")) as f:
+            return json.load(f)
+
+    def _from_run_scme(self, row: dict) -> dict | None:
+        scme = self.run_scme()
+        if scme is None or not _same_point(float(scme.latency), float(scme.energy), row):
+            return None
+        return design_record(scme)
+
+    def _from_tiling_candidate(self, row: dict) -> dict | None:
+        kind, _, key = row["info"].partition(" ")
+        if kind != "tiling" or not key or " " in key:  # "tiling <key> failed" has no result
+            return None
+        path = os.path.join(self.run_dir, "tiling_search", f"candidate_{key}", "result.pickle")
         if not os.path.exists(path):
-            continue
-        with open(path) as f:
-            for design in json.load(f)["designs"]:
-                key = candidate.removeprefix("candidate_")[:6]
-                designs.append({**design, "method": "rolled", "label": f"rolled {key} {design['id']}"})
-    return designs
+            return None
+        scme, extra = _load_pickle(path)
+        if not _same_point(float(scme.latency), float(scme.energy), row):
+            return None
+        return design_record(scme, tiling=format_tiling(extra.get("tiling_config")))
+
+    def _from_rolled_record(self, row: dict) -> dict | None:
+        kind, _, plan_id = row["info"].partition(" ")
+        if kind != "rolled" or not plan_id or " " in plan_id:  # "rolled <id> infeasible" has no record
+            return None
+        for candidate, record in self.rolled_records():
+            if record["id"] != plan_id or not _same_point(record["latency"], record["energy"], row):
+                continue
+            # The candidate's own best design was scheduled in full: prefer it when it is this point.
+            path = os.path.join(self.run_dir, "tiling_search", candidate, "result.pickle")
+            if os.path.exists(path):
+                scme, extra = _load_pickle(path)
+                if _same_point(float(scme.latency), float(scme.energy), row):
+                    return design_record(scme, tiling=format_tiling(extra.get("tiling_config")))
+            return rolled_design_record(record, self.layer_names())
+        return None
 
 
-def build_report_data(results_dir: str, runs: dict[str, dict[str, dict]], rows: list[dict]) -> dict:
-    """Everything `comparison.html` shows, as plain JSON-safe data."""
+def _point_summary(workload: str, method: str, row: dict, record: dict | None, source: str) -> dict:
+    """What the page inlines about a Pareto point; the rest of `record` goes to its side file."""
+    n_eval = int(row["n_eval"])
+    topology = (record or {}).get("topology") or {"cores": [], "edges": []}
+    return {
+        "id": f"{workload}_{method}_{n_eval}",
+        "method": method,
+        "label": f"{method} #{n_eval}",
+        "info": row["info"],
+        "source": source,
+        "t": row["t"],
+        "n_eval": n_eval,
+        "latency": row["latency"],
+        "energy": row["energy"],
+        "area": row["area"],
+        "nb_cores": sum(1 for core in topology["cores"] if core["kind"] == "compute") or None,
+        "nb_links": sum(1 for edge in topology["edges"] if edge["kind"] == "link"),
+        "has_hardware": bool(topology["cores"]),
+        "has_schedule": bool(record and record.get("schedule")),
+        "file": f"{workload}_{method}_{n_eval}.js" if record else None,
+        "cores": topology["cores"],
+        "edges": topology["edges"],
+    }
+
+
+def build_report_data(results_dir: str, runs: dict[str, dict[str, dict]], rows: list[dict]) -> tuple[dict, dict]:
+    """Everything `comparison.html` shows, as plain JSON-safe data, and the per-point side files
+    (`{file name: design record minus its topology}`)."""
     row_of = {(row["workload"], row["method"]): row for row in rows}
     by_workload = {}
     budget = {}
+    sidecars: dict[str, dict] = {}
     for workload, methods in runs.items():
         order = [m for m in METHOD_ORDER if m in methods] + sorted(m for m in methods if m not in METHOD_ORDER)
         workload_runs, designs = {}, []
@@ -190,12 +292,18 @@ def build_report_data(results_dir: str, runs: dict[str, dict[str, dict]], rows: 
                     if entry["feasible"]
                 ],
             }
-            run_dir = os.path.join(results_dir, workload, method)
-            best = _best_design(run_dir, method)
-            if best is not None:
-                designs.append(best)
-            if method == "rolled":
-                designs += _rolled_front_designs(run_dir)
+            resolver = PointResolver(os.path.join(results_dir, workload, method), method)
+            for trace_row in pareto_rows(run["trace"]):
+                record, source = resolver.resolve(trace_row)
+                point = _point_summary(workload, method, trace_row, record, source)
+                if record is not None:
+                    sidecars[point["file"]] = {key: value for key, value in record.items() if key != "topology"}
+                designs.append(point)
+            sources = [d["source"] for d in designs if d["method"] == method]
+            print(
+                f"{workload:>9} {method:>9}: {len(sources)} Pareto point(s), "
+                + ", ".join(f"{sources.count(source)} {source}" for source in dict.fromkeys(sources))
+            )
         best_design = min(range(len(designs)), key=lambda i: designs[i]["latency"] * designs[i]["energy"], default=0)
         by_workload[workload] = {
             "methods": order,
@@ -203,7 +311,8 @@ def build_report_data(results_dir: str, runs: dict[str, dict[str, dict]], rows: 
             "designs": designs,
             "best_design": best_design,
         }
-    return {"workloads": sorted(by_workload), "by_workload": by_workload, "budget": budget}
+    data = {"workloads": sorted(by_workload), "by_workload": by_workload, "budget": budget}
+    return data, sidecars
 
 
 def main() -> None:
@@ -258,7 +367,8 @@ def main() -> None:
         )
     print(f"Wrote {out_path}")
     html_path = os.path.join(args.results_dir, "comparison.html")
-    write_comparison_report(build_report_data(args.results_dir, runs, rows), html_path)
+    data, sidecars = build_report_data(args.results_dir, runs, rows)
+    write_comparison_report(data, html_path, sidecars=sidecars)
     print(f"Wrote {html_path}")
 
 

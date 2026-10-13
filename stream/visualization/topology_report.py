@@ -17,7 +17,8 @@ import logging
 import os
 from typing import Any
 
-from stream.visualization.hardware_graph import HardwareTopology, layout_positions
+from stream.visualization.design_record import topology_payload
+from stream.visualization.hardware_graph import HardwareTopology
 
 logger = logging.getLogger(__name__)
 
@@ -310,11 +311,6 @@ def design_payload(record: dict[str, Any], topology: HardwareTopology) -> dict[s
 
     Positions are computed here, with the same `layout_positions` the PNGs use, so flipping between the page
     and a saved figure doesn't rearrange the cores."""
-    positions = layout_positions(topology)
-    cores = []
-    for node in topology.nodes:
-        x, y = positions.get(node.id, (0.0, 0.0))
-        cores.append({**node.to_dict(), "x": float(x), "y": float(y)})
     return {
         "id": record["id"],
         "kind": record.get("kind", "unrolled"),
@@ -323,8 +319,7 @@ def design_payload(record: dict[str, Any], topology: HardwareTopology) -> dict[s
         "latency": record["latency"],
         "energy": record["energy"],
         "area": record["area"],
-        "cores": cores,
-        "edges": [edge.to_dict() for edge in topology.edges],
+        **topology_payload(topology),
     }
 
 

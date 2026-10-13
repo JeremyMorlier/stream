@@ -48,6 +48,7 @@ from stream.stages.generation.schedule_evaluation import (
 )
 from stream.stages.generation.schedule_space import ScheduleSearchState, ScheduleSpace
 from stream.stages.stage import StageCallable
+from stream.visualization.design_record import design_record
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +254,9 @@ class ScheduleExplorationStage(ScheduleSearchStage):
             point = (float(scme.latency), float(scme.energy), bounds[2])
             stats["measured"] += 1
             if self.search_budget is not None:
-                self.search_budget.record(*point, info=f"unrolled {format_ranks(ranks)}")
+                self.search_budget.record(
+                    *point, info=f"unrolled {format_ranks(ranks)}", artifact=lambda: design_record(scme)
+                )
             record = {
                 "id": f"u{format_ranks(ranks)}",
                 "kind": "unrolled",

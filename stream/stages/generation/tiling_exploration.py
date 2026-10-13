@@ -29,6 +29,7 @@ from stream.hardware.architecture.accelerator import Accelerator
 from stream.opt.search_budget import map_recording
 from stream.stages.stage import MainStage, Stage, StageCallable
 from stream.utils import accumulate_stage_timings, get_exclusive_stage_times, wrap_stages_with_timing_for_workers
+from stream.visualization.design_record import design_record, format_tiling
 from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.mapping import TILING_T, TILING_WILDCARD_T
 from stream.workload.onnx_workload import ONNXWorkload
@@ -751,8 +752,14 @@ class TilingExplorationStage(Stage):
         if cached is None:
             self.search_budget.record(float("inf"), float("inf"), self.accelerator_area, info=f"tiling {key} failed")
         else:
-            scme = cached[0]
-            self.search_budget.record(scme.latency, scme.energy, self.accelerator_area, info=f"tiling {key}")
+            scme, extra_info = cached
+            self.search_budget.record(
+                scme.latency,
+                scme.energy,
+                self.accelerator_area,
+                info=f"tiling {key}",
+                artifact=lambda: design_record(scme, tiling=format_tiling(extra_info.get("tiling_config"))),
+            )
 
     def _run_until_budget(
         self,

@@ -7,6 +7,12 @@ measured design and polls `should_stop()` only before starting a new generation:
 current generation, or a search without generations -- always runs to completion, so a run may end past
 `max_time_s`. Every record is appended to a CSV trace so convergence curves can be drawn afterwards.
 
+With an `artifact_dir`, a record can also carry an artifact (a JSON-safe dict, or a zero-argument callable
+returning one -- see `stream.visualization.design_record`): it is written to `<artifact_dir>/<n_eval>.json` when
+the point is not dominated by an earlier saved one, and deleted again once a later point dominates it. The
+directory therefore ends up holding exactly the (latency, energy, area) Pareto front of the run, and the trace's
+`artifact` column names each point's file. The callable is only invoked for points that may join the front.
+
 The clock starts at construction, so anything the method does before its first measurement (CACTI precompute,
 cost-model warm-up, nested searches) is charged to it.
 
@@ -17,6 +23,7 @@ stages ship to worker processes. Only the process that owns the search should ca
 import bisect
 import csv
 import json
+import logging
 import math
 import os
 import time
@@ -24,7 +31,9 @@ from collections.abc import Callable
 from concurrent.futures import Executor, as_completed
 from typing import Any
 
-TRACE_COLUMNS = ("t", "n_eval", "latency", "energy", "area", "edp", "best_edp", "feasible", "info")
+TRACE_COLUMNS = ("t", "n_eval", "latency", "energy", "area", "edp", "best_edp", "feasible", "info", "artifact")
+
+logger = logging.getLogger(__name__)
 
 
 class SearchBudget:
@@ -37,6 +46,7 @@ class SearchBudget:
         window_s: float,
         rel_tol: float,
         trace_path: str | None = None,
+        artifact_dir: str | None = None,
     ):
         """
         Args:
@@ -45,6 +55,7 @@ class SearchBudget:
                 than `rel_tol` (relative) over the last `window_s` seconds.
             rel_tol: relative improvement threshold of the convergence rule (0.005 = 0.5%).
             trace_path: CSV file every record is appended to. Overwritten at construction.
+            artifact_dir: where the artifacts of the front's points are kept (see the module docstring).
         """
         self.max_time_s = max_time_s
         self.window_s = window_s
@@ -58,6 +69,11 @@ class SearchBudget:
         self.improvements: list[tuple[float, float]] = []
         self.stop_reason: str | None = None
         self.t_stop: float | None = None
+        self.artifact_dir = artifact_dir
+        # (latency, energy, area) and n_eval of every point whose artifact is on disk: the running front.
+        self.saved_front: list[tuple[tuple[float, float, float], int]] = []
+        if artifact_dir:
+            os.makedirs(artifact_dir, exist_ok=True)
         if trace_path:
             os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
             with open(trace_path, "w", newline="") as f:
@@ -72,8 +88,9 @@ class SearchBudget:
         index = bisect.bisect_right([time_ for time_, _ in self.improvements], t)
         return self.improvements[index - 1][1] if index else math.inf
 
-    def record(self, latency: float, energy: float, area: float, info: str = "") -> bool:
-        """Log one measured design. Returns True when it improved the best EDP."""
+    def record(self, latency: float, energy: float, area: float, info: str = "", artifact: Any = None) -> bool:
+        """Log one measured design, with its optional `artifact` (see the module docstring). Returns True when it
+        improved the best EDP."""
         t = self.elapsed()
         self.n_eval += 1
         latency, energy, area = float(latency), float(energy), float(area)
@@ -84,12 +101,60 @@ class SearchBudget:
             self.best_edp = edp
             self.best_point = {"t": t, "latency": latency, "energy": energy, "area": area, "edp": edp, "info": info}
             self.improvements.append((t, edp))
+        artifact_id = ""
+        if feasible and artifact is not None and self.artifact_dir:
+            artifact_id = self._save_artifact((latency, energy, area), artifact)
         if self.trace_path:
             with open(self.trace_path, "a", newline="") as f:
                 csv.writer(f).writerow(
-                    (f"{t:.3f}", self.n_eval, latency, energy, area, edp, self.best_edp, int(feasible), info)
+                    (
+                        f"{t:.3f}",
+                        self.n_eval,
+                        latency,
+                        energy,
+                        area,
+                        edp,
+                        self.best_edp,
+                        int(feasible),
+                        info,
+                        artifact_id,
+                    )
                 )
         return improved
+
+    def is_dominated(self, latency: float, energy: float, area: float) -> bool:
+        """Whether a saved point is at least as good as this one on every objective, i.e. its artifact would not
+        be kept. Also usable on a copy of the budget in a worker process, to skip building an artifact."""
+        point = (float(latency), float(energy), float(area))
+        return any(all(s <= p for s, p in zip(saved, point, strict=True)) for saved, _ in self.saved_front)
+
+    def _save_artifact(self, point: tuple[float, float, float], artifact: Any) -> str:
+        """Write the artifact of a point joining the front and delete those it dominates; returns its id ("" when
+        nothing was saved). A failing artifact never stops the search."""
+        assert self.artifact_dir is not None
+        if self.is_dominated(*point):
+            return ""
+        try:
+            data = artifact() if callable(artifact) else artifact
+            if data is None:
+                return ""
+            path = os.path.join(self.artifact_dir, f"{self.n_eval}.json")
+            with open(path, "w") as f:
+                json.dump(data, f, allow_nan=False, separators=(",", ":"))
+        except Exception:
+            logger.warning(f"SearchBudget: could not save the artifact of evaluation {self.n_eval}.", exc_info=True)
+            return ""
+        kept = []
+        for saved, n_eval in self.saved_front:
+            if all(p <= s for p, s in zip(point, saved, strict=True)):
+                try:
+                    os.remove(os.path.join(self.artifact_dir, f"{n_eval}.json"))
+                except OSError:
+                    pass
+            else:
+                kept.append((saved, n_eval))
+        self.saved_front = [*kept, (point, self.n_eval)]
+        return str(self.n_eval)
 
     def converged(self) -> bool:
         """Whether the best EDP improved by less than `rel_tol` over the last `window_s` seconds. Never true

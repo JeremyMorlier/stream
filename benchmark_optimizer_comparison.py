@@ -21,8 +21,10 @@ Every run gets the same `SearchBudget`: it stops at `--max-time` or once the bes
 generation under way, and any search without generations, always finishes -- so runs can end past `--max-time`
 (`total_wall_time` in `summary.json` is the real duration). Each (workload, method) pair runs in its own
 subprocess (the CACTI monkeypatch and DEAP's `creator` are process-global) and writes `trace.csv` (every
-measured design) and `summary.json` to `<output-dir>/<workload>/<method>/`. `analyze_optimizer_comparison.py`
-turns those into convergence plots, Pareto fronts and a comparison table.
+measured design), `summary.json` and `designs/<n_eval>.json` (a design record -- hardware, core memory
+hierarchies and schedule -- of every point on the run's Pareto front) to `<output-dir>/<workload>/<method>/`.
+`analyze_optimizer_comparison.py` turns those into convergence plots, Pareto fronts, a comparison table and
+the interactive report.
 
 Run: python benchmark_optimizer_comparison.py --max-time 10800 --window 1800 --rel-tol 0.005 --workers 8
 """
@@ -144,7 +146,14 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
     workload_path = _export_workload(workload, os.path.join(run_dir, "workload.onnx"))
     layer_stacks = single_stack(workload_path)
     # Started after the export (identical for every method) and before any method-specific set-up.
-    budget = SearchBudget(args.max_time, args.window, args.rel_tol, os.path.join(run_dir, "trace.csv"))
+    # `designs/` keeps a design record (hardware, memory hierarchies, schedule) of every point on the run's front.
+    budget = SearchBudget(
+        args.max_time,
+        args.window,
+        args.rel_tol,
+        os.path.join(run_dir, "trace.csv"),
+        artifact_dir=os.path.join(run_dir, "designs"),
+    )
     error = None
     try:
         if method == "rolled":

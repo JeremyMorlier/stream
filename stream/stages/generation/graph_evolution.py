@@ -79,6 +79,7 @@ from stream.stages.generation.tiling_exploration import (
 )
 from stream.stages.generation.tiling_generation import TilingGenerationStage
 from stream.stages.stage import MainStage, Stage, StageCallable
+from stream.visualization.design_record import design_record
 from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
@@ -163,14 +164,17 @@ def _warm_up_worker(job: tuple[str, list[float]]) -> tuple[dict[tuple[int, str],
     return _WORKER_STAGE._warm_up_design(*job)
 
 
-def _measure_worker(genome: "GraphGenome") -> tuple[float, float]:
+def _measure_worker(genome: "GraphGenome") -> tuple[float, float, dict[str, Any] | None]:
+    """(latency, energy, design record) of one genome; the record only when the budget keeps artifacts and the
+    point may join the front (it is built here because the scme does not leave the worker)."""
     assert _WORKER_STAGE is not None
     try:
         scme = _WORKER_STAGE._measure_genome(genome)
-        return float(scme.latency), float(scme.energy)
     except Exception:
         logger.warning("GraphEvolutionStage: genome failed to schedule, penalizing it.", exc_info=True)
-        return math.inf, math.inf
+        return math.inf, math.inf, None
+    latency, energy = float(scme.latency), float(scme.energy)
+    return latency, energy, _WORKER_STAGE._artifact_of(genome, scme, latency, energy)
 
 
 class GraphEvolutionStage(Stage):
@@ -480,6 +484,20 @@ class GraphEvolutionStage(Stage):
         cost_lut = self.costs.assemble_cost_lut(workload, accelerator, design_key_of_core, context.shape_class_of_tile)
         return self.pipeline.measure(workload, accelerator, cost_lut)
 
+    def _artifact_of(self, genome: GraphGenome, scme: Any, latency: float, energy: float) -> dict[str, Any] | None:
+        """The design record the budget saves for a genome on the front. The worker's budget is a copy taken when
+        the batch started: a point it already dominates stays dominated, so skipping it is safe."""
+        budget = self.search_budget
+        if budget is None or not budget.artifact_dir or not math.isfinite(latency) or not math.isfinite(energy):
+            return None
+        if budget.is_dominated(latency, energy, self._area(genome)):
+            return None
+        try:
+            return design_record(scme, step=self.step, tiling=_candidate_key(genome.tiling))
+        except Exception:
+            logger.warning("GraphEvolutionStage: could not build the design record of a genome.", exc_info=True)
+            return None
+
     def _area(self, genome: GraphGenome) -> float:
         """Total compute-core area of a genome's graph (offchip excluded, as in the other searches)."""
         return sum(self.costs.area[self._key_of(values)] for values in genome.nodes.values())
@@ -546,10 +564,10 @@ class GraphEvolutionStage(Stage):
         keys = list(to_measure)
         budget = self.search_budget
 
-        def on_result(index: int, result: tuple[float, float]) -> None:
+        def on_result(index: int, result: tuple[float, float, dict[str, Any] | None]) -> None:
             genome = to_measure[keys[index]]
             area = self._area(genome)
-            latency, energy = result
+            latency, energy, artifact = result
             self.fitness_of_key[keys[index]] = (latency, energy, area) if math.isfinite(latency) else INF3
             self.evaluated.append(
                 {
@@ -563,11 +581,14 @@ class GraphEvolutionStage(Stage):
                 }
             )
             if budget is not None:
-                budget.record(latency, energy, area, info=f"{self.step} cores={genome.nb_cores}")
+                budget.record(latency, energy, area, info=f"{self.step} cores={genome.nb_cores}", artifact=artifact)
 
         if keys:
             self._parallel(
-                _measure_worker, [to_measure[key] for key in keys], fallback=(math.inf, math.inf), on_result=on_result
+                _measure_worker,
+                [to_measure[key] for key in keys],
+                fallback=(math.inf, math.inf, None),
+                on_result=on_result,
             )
         for genome in genomes:
             genome.fitness.values = self.fitness_of_key.get(self._canonical_key(genome), INF3)

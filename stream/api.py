@@ -1259,3 +1259,147 @@ def optimize_schedule_model(  # noqa: PLR0913
         f"{_time.perf_counter() - t_start:.1f}s; {stats.get(f'optimization_l{level}')}."
     )
     return best_scme, extra_info["pareto_schedules"], stats
+
+
+def optimize_model_tiling(  # noqa: PLR0913
+    hardware: str,
+    workload: str,
+    mapping: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    search_budget: SearchBudget,
+    level: Literal[1, 2, 3] = 2,
+    scheduling_order_source: Literal["generated", "model"] = "model",
+    tiling_fitness: Literal["sort_key", "hypervolume_contribution"] = "hypervolume_contribution",
+    hypervolume_patience: int | None = 2,
+    hypervolume_rel_tol: float = 0.005,
+    nb_tiling_ga_individuals: int = 4,
+    chunks_per_group: int = 8,
+    solve_time_limit_s: float = 20.0,
+    solver_workers: int = 8,
+    area_levels: int = 5,
+    energy_levels: int = 3,
+    temporal_mapping_type: str = "uneven",
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+    nb_core_ga_generations: int = 1000,
+    nb_core_ga_individuals: int = 16,
+    core_convergence_patience: int = 5,
+    core_rel_tol: float = 0.005,
+    core_max_workers: int | None = None,
+    core_pareto_points: int = 10,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
+) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
+    """The schedule-optimization model (`optimize_schedule_model`) under the tiling GA (`TilingExplorationStage`):
+    every tiling candidate gets its own per-tile core fronts, full cost matrix and model sweep at `level`, its
+    solutions measured in `scheduling_order_source` order, and returns its measured Pareto set.
+
+    With `tiling_fitness="hypervolume_contribution"` the GA selects candidates by their exclusive contribution to
+    the (log-space) hypervolume of everything measured so far; with `hypervolume_patience` it stops once that
+    hypervolume gained less than `hypervolume_rel_tol` over that many generations. `search_budget`'s time limit
+    also stops it -- give it an infinite EDP window to make time and hypervolume the only rules. Either way, the
+    generation in progress always finishes.
+
+    Returns:
+        The best candidate's schedule (by best EDP on its front) and every candidate's `(scme, extra_info)`, whose
+        extra info carries the candidate's `pareto_schedules`. Each candidate's model report goes to
+        `{output_path}/{experiment_id}/tiling_search/candidate_<key>/schedule_optimization_l<level>/`.
+    """
+    from stream.stages.generation.schedule_optimization import (  # noqa: PLC0415
+        ChunkScheduleOptimizationStage,
+        GroupScheduleOptimizationStage,
+        TileScheduleOptimizationStage,
+    )
+    from stream.stages.generation.scheduling_order_generation import ProvidedSchedulingOrderStage  # noqa: PLC0415
+
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+    logger = _logging.getLogger(__name__)
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+    optimization_stage = {
+        1: GroupScheduleOptimizationStage,
+        2: ChunkScheduleOptimizationStage,
+        3: TileScheduleOptimizationStage,
+    }[level]
+
+    outer_stage_classes = [
+        AcceleratorParserStage,
+        StreamONNXModelParserStage,
+        LayerStacksGenerationStage,
+        TilingExplorationStage,
+    ]
+    per_candidate_stage_classes = [
+        TilingGenerationStage,
+        TiledWorkloadGenerationStage,
+        *SCHEDULE_REPORT_STAGES,
+        CoreArchitectureExplorationStage,
+        ScheduleExplorationStage,
+        optimization_stage,
+        ScheduleSelectionStage,
+        SetFixedAllocationPerformanceStage,
+        ProvidedSchedulingOrderStage,
+        GeneticAlgorithmAllocationStage,
+    ]
+
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+
+    mainstage = MainStage(
+        outer_stage_classes + per_candidate_stage_classes,
+        accelerator=hardware,
+        workload_path=workload,
+        mapping_path=mapping,
+        loma_lpf_limit=6,
+        mode=mode,
+        layer_stacks=layer_stacks,
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],
+        # Outer tiling GA.
+        tiling_candidates_dir=f"{output_path}/{experiment_id}/tiling_search",
+        scme_path=f"{output_path}/{experiment_id}/scme.pickle",
+        sort_key="edp",
+        nb_tiling_ga_generations=10**9,  # the budget or the hypervolume rule stops it
+        nb_tiling_ga_individuals=nb_tiling_ga_individuals,
+        candidate_results_csv_path=f"{output_path}/{experiment_id}/tiling_search_all_candidates.csv",
+        evaluate_in_process=True,
+        search_budget=search_budget,
+        tiling_fitness=tiling_fitness,
+        hypervolume_patience=hypervolume_patience,
+        hypervolume_rel_tol=hypervolume_rel_tol,
+        # Per-candidate model search.
+        nb_ga_generations=nb_ga_generations,
+        nb_ga_individuals=nb_ga_individuals,
+        nb_core_ga_generations=nb_core_ga_generations,
+        nb_core_ga_individuals=nb_core_ga_individuals,
+        core_convergence_patience=core_convergence_patience,
+        core_rel_tol=core_rel_tol,
+        core_max_workers=core_max_workers,
+        core_pareto_points=core_pareto_points,
+        core_param_ranges=core_param_ranges,
+        reuse_pareto_fronts=False,
+        max_schedule_evaluations=1,
+        chunks_per_group=chunks_per_group,
+        solve_time_limit_s=solve_time_limit_s,
+        solver_workers=solver_workers,
+        area_levels=area_levels,
+        energy_levels=energy_levels,
+        scheduling_order_source=scheduling_order_source,
+    )
+    answers = [answer for answer in mainstage.run() if answer[0] is not None]
+    if not answers:
+        raise ValueError("No tiling candidate produced a schedule.")
+    best_scme, best_extra_info = min(answers, key=lambda answer: answer[1].get("fitness", math.inf))
+    logger.info(
+        f"optimize_model_tiling: best tiling candidate {best_extra_info['candidate_index']} of {len(answers)} "
+        f"(best EDP on its front={best_extra_info.get('fitness')})."
+    )
+    return best_scme, answers

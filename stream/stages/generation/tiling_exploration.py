@@ -11,6 +11,7 @@ import csv
 import functools
 import hashlib
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -26,7 +27,7 @@ from zigzag.datatypes import LayerDim
 from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
 
 from stream.hardware.architecture.accelerator import Accelerator
-from stream.opt.search_budget import map_recording
+from stream.opt.search_budget import hypervolume_3d, map_recording
 from stream.stages.stage import MainStage, Stage, StageCallable
 from stream.utils import accumulate_stage_timings, get_exclusive_stage_times, wrap_stages_with_timing_for_workers
 from stream.visualization.design_record import design_record, format_tiling
@@ -258,6 +259,46 @@ def _repair_tiling_constraints(individual: "array.array | list[int]", genes: lis
         _repair_tile_limit(individual, genes)
         _repair_divisible_minimum_intra_core_product(individual, genes)
     return individual
+
+
+def log_objectives(point: tuple[float, ...]) -> tuple[float, ...] | None:
+    """`(latency, energy, area)` in log10 space, where the tiling search measures its hypervolume: the objectives
+    span decades, and in linear space the extremes of the front would dominate the volume. None if any is not a
+    positive finite number."""
+    if not all(math.isfinite(v) and v > 0 for v in point):
+        return None
+    return tuple(math.log10(v) for v in point)
+
+
+def hypervolume_reference(points: list[tuple[float, ...]]) -> tuple[float, ...] | None:
+    """Reference point in log space, fixed from the first generation's measured points: per objective,
+    `log10(1.1 * max)`."""
+    logged = [p for p in (log_objectives(point) for point in points) if p is not None]
+    if not logged:
+        return None
+    return tuple(math.log10(1.1) + max(p[i] for p in logged) for i in range(len(logged[0])))
+
+
+def hypervolume_contributions(
+    points_by_candidate: dict[str, list[tuple[float, ...]]], reference: tuple[float, ...]
+) -> tuple[float, dict[str, float]]:
+    """Hypervolume (log space, against `reference`) of the union of every candidate's points, and each candidate's
+    *exclusive* contribution: the volume lost when its points are removed. A candidate whose points are all
+    dominated (or beyond the reference) contributes 0."""
+    logged = {
+        key: [p for p in (log_objectives(point) for point in points) if p is not None]
+        for key, points in points_by_candidate.items()
+    }
+    everything = [p for points in logged.values() for p in points]
+    total = hypervolume_3d(everything, reference)
+    contributions = {}
+    for key, points in logged.items():
+        if not points:
+            contributions[key] = 0.0
+            continue
+        others = [p for other, pts in logged.items() if other != key for p in pts]
+        contributions[key] = max(0.0, total - hypervolume_3d(others, reference))
+    return total, contributions
 
 
 def _load_cached_result(tiling_candidates_dir: str, key: str) -> tuple[Any, dict[str, Any]] | None:
@@ -496,6 +537,18 @@ class TilingExplorationStage(Stage):
         # machine and the live `search_budget` (forwarded through the kwargs), on which they record their
         # measurements themselves (see `optimize_rolled_tiling`).
         self.evaluate_in_process: bool = kwargs.get("evaluate_in_process", False)
+        # Selection fitness: the candidate's own `sort_key` (default), or its exclusive contribution to the
+        # hypervolume of the front of every candidate measured so far (`"hypervolume_contribution"`, budgeted search
+        # only; needs per-candidate Pareto sets, i.e. a schedule search inside each candidate).
+        self.tiling_fitness: str = kwargs.get("tiling_fitness", "sort_key")
+        if self.tiling_fitness not in ("sort_key", "hypervolume_contribution"):
+            raise ValueError(f"Unknown tiling_fitness {self.tiling_fitness!r}.")
+        # Budgeted search also stops once that global hypervolume gained less than `hypervolume_rel_tol` over
+        # `hypervolume_patience` generations (None: only the budget stops it).
+        self.hypervolume_patience: int | None = kwargs.get("hypervolume_patience")
+        self.hypervolume_rel_tol: float = kwargs.get("hypervolume_rel_tol", 0.005)
+        self.hypervolume_history: list[float] = []
+        self.hypervolume_reference: tuple[float, ...] | None = None
         # Populated as candidates are evaluated (see run()): summed [init_time, run_time] per per-candidate
         # stage, across every unique candidate evaluated by this GA run.
         self.candidate_stage_timings: dict[str, list[float]] = {}
@@ -783,17 +836,19 @@ class TilingExplorationStage(Stage):
             return len(invalid)
 
         nevals = _evaluate_invalid(population)
+        hypervolume = self._after_generation(0, population, candidate_records)
         hall_of_fame.update(population)
-        logbook.record(gen=0, nevals=nevals, **statistics.compile(population))
+        logbook.record(gen=0, nevals=nevals, hypervolume=hypervolume, **statistics.compile(population))
         generation, stale = 0, 0
         while not budget.should_stop():
             generation += 1
             seen_before = len(candidate_records)
             offspring = algorithms.varAnd(toolbox.select(population, len(population)), toolbox, 0.5, 0.3)
             nevals = _evaluate_invalid(offspring)
+            hypervolume = self._after_generation(generation, offspring, candidate_records)
             hall_of_fame.update(offspring)
             population[:] = offspring
-            logbook.record(gen=generation, nevals=nevals, **statistics.compile(population))
+            logbook.record(gen=generation, nevals=nevals, hypervolume=hypervolume, **statistics.compile(population))
             stale = stale + 1 if len(candidate_records) == seen_before else 0
             if stale >= self.max_stale_generations:
                 logger.info(f"TilingExplorationStage: no new candidate in {stale} generation(s); space exhausted.")
@@ -803,6 +858,52 @@ class TilingExplorationStage(Stage):
             f"({budget.stop_reason}, {len(candidate_records)} unique candidate(s))."
         )
         return population, logbook
+
+    def _candidate_points(self, keys: list[str]) -> dict[str, list[tuple[float, float, float]]]:
+        """Each candidate's measured Pareto points, read back from its cached result (failed candidates: none)."""
+        points: dict[str, list[tuple[float, float, float]]] = {}
+        for key in keys:
+            cached = _load_cached_result(self.tiling_candidates_dir, key)
+            records = (cached[1].get("pareto_schedules") or []) if cached is not None else []
+            points[key] = [(float(r["latency"]), float(r["energy"]), float(r["area"])) for r in records]
+        return points
+
+    def _after_generation(self, generation: int, individuals: list[Any], candidate_records: dict[str, Any]) -> float:
+        """After a generation is evaluated: the global hypervolume over every candidate measured so far, the
+        hypervolume-contribution fitness of `individuals` (re-scored every generation, since contributions shrink as
+        the front grows), and the hypervolume convergence check. Returns the hypervolume (nan when not tracked)."""
+        tracked = self.tiling_fitness == "hypervolume_contribution" or self.hypervolume_patience is not None
+        if not tracked:
+            return math.nan
+        points = self._candidate_points(list(candidate_records))
+        if self.hypervolume_reference is None:
+            # Fixed once, from the first generation, so successive volumes are comparable.
+            self.hypervolume_reference = hypervolume_reference([p for pts in points.values() for p in pts])
+            if self.hypervolume_reference is None:
+                logger.warning("TilingExplorationStage: no measured point yet; hypervolume tracking starts later.")
+                return math.nan
+        total, contributions = hypervolume_contributions(points, self.hypervolume_reference)
+        self.hypervolume_history.append(total)
+        if self.tiling_fitness == "hypervolume_contribution":
+            for individual in individuals:
+                # Minimized: the larger the contribution, the better.
+                individual.fitness.values = (-contributions.get(_candidate_key(individual), 0.0),)
+        logger.info(
+            f"TilingExplorationStage: generation {generation}: hypervolume {total:.6g} over {len(points)} "
+            f"candidate(s); contributions of this generation "
+            f"{[round(contributions.get(_candidate_key(ind), 0.0), 6) for ind in individuals]}."
+        )
+        patience = self.hypervolume_patience
+        if patience is not None and len(self.hypervolume_history) > patience:
+            previous = self.hypervolume_history[-1 - patience]
+            if previous > 0 and total / previous - 1 < self.hypervolume_rel_tol:
+                logger.info(
+                    f"TilingExplorationStage: hypervolume converged ({self.hypervolume_history}, < "
+                    f"{100 * self.hypervolume_rel_tol:g}% over {patience} generation(s))."
+                )
+                if self.search_budget is not None:
+                    self.search_budget.stop("converged")
+        return total
 
     def _save_search_summary(
         self,
@@ -823,6 +924,8 @@ class TilingExplorationStage(Stage):
             "candidate_records": candidate_records,
             "hall_of_fame": hall_of_fame_summary,
             "logbook": logbook_records,
+            "hypervolume_history": self.hypervolume_history,
+            "hypervolume_reference": self.hypervolume_reference,
         }
         pickle_save(summary, summary_path)  # type: ignore
         logger.info(f"TilingExplorationStage: saved search summary to {summary_path}.")

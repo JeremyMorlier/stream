@@ -11,6 +11,11 @@ For each workload, all methods run on one experiment directory, in this order:
 5. `level<n>_ordered`: the same level, but every solution is scheduled in the order the model planned its tiles
    (`scheduling_order_source="model"`, through `ProvidedSchedulingOrderStage`) instead of Stream's generic order.
    Its report goes to `schedule_optimization_l<n>_ordered/`.
+6. `level2_tiling`: `optimize_model_tiling(level=2)` -- level 2 (model order) inside the tiling GA, which selects
+   tilings by their hypervolume contribution and stops on hypervolume convergence (`--hv-patience` generations,
+   `--hv-rel-tol`) or `--tiling-max-time`, always finishing the generation in progress. Its own experiment
+   directory (`tiling_ga/`): every candidate has its own tiling, fronts and cost matrix, so its search time is
+   the whole wall time, preparation included. Its front is the union over every tiling explored.
 
 Levels 1 and 2 reuse the fronts and the cost matrix, so all three choose from exactly the same designs with
 exactly the same per-tile costs; only the search over accelerators and schedules differs. Each method runs in its
@@ -44,7 +49,17 @@ import sys
 import time
 
 WORKLOADS = ("resnet", "attention")
-METHODS = ("rolled", "level1", "level2", "level3", "level1_ordered", "level2_ordered", "level3_ordered")
+METHODS = (
+    "rolled",
+    "level1",
+    "level2",
+    "level3",
+    "level1_ordered",
+    "level2_ordered",
+    "level3_ordered",
+    "level2_tiling",
+)
+TILING_EXPERIMENT_ID = "tiling_ga"
 QUAD_CORE = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"
 MAPPINGS = {
     "resnet": "stream/inputs/examples/mapping/tpu_like_quad_core_ga.yaml",
@@ -57,6 +72,7 @@ COLORS = {"rolled": "#2a78d6", "level1": "#eb6834", "level2": "#1baf7a", "level3
 COLORS.update({f"level{n}_ordered": COLORS[f"level{n}"] for n in (1, 2, 3)})
 MARKERS = {"rolled": "o", "level1": "^", "level2": "s", "level3": "D"}
 MARKERS.update({f"level{n}_ordered": MARKERS[f"level{n}"] for n in (1, 2, 3)})
+COLORS["level2_tiling"], MARKERS["level2_tiling"] = COLORS["level2"], "P"
 EXPERIMENT_ID = "schedule_search"
 
 logger = logging.getLogger(__name__)
@@ -81,6 +97,80 @@ def _common_kwargs(workload_path: str, workload: str, out_root: str, args: argpa
         "cacti_precompute_workers": args.workers,
         "reuse_pareto_fronts": True,
     }
+
+
+def _tiling_rows(out_root: str) -> list[dict]:
+    """Every solution measured by any tiling candidate (prediction in `latency_bound` / `energy_bound`), the
+    candidate key appended to its id."""
+    search_dir = os.path.join(out_root, TILING_EXPERIMENT_ID, "tiling_search")
+    rows = []
+    for candidate in sorted(os.listdir(search_dir)) if os.path.isdir(search_dir) else []:
+        path = os.path.join(search_dir, candidate, "schedule_optimization_l2", "schedules.csv")
+        for row in _read_schedules_csv(path):
+            if row["id"].startswith("opt"):
+                rows.append({**row, "id": f"{row['id']}@{candidate.removeprefix('candidate_')}"})
+    return rows
+
+
+def _run_tiling(workload, method, workload_path, out_root, args, kwargs, t0) -> None:  # noqa: PLR0913
+    from stream.api import optimize_model_tiling
+    from stream.opt.search_budget import SearchBudget
+
+    experiment_dir = os.path.join(out_root, TILING_EXPERIMENT_ID)
+    os.makedirs(experiment_dir, exist_ok=True)
+    budget = SearchBudget(
+        max_time_s=args.tiling_max_time,
+        window_s=math.inf,  # only the time limit and the hypervolume rule stop it
+        rel_tol=args.hv_rel_tol,
+        trace_path=os.path.join(experiment_dir, "trace.csv"),
+    )
+    tiling_kwargs = {
+        key: value for key, value in kwargs.items() if key not in ("experiment_id", "sort_key", "reuse_pareto_fronts")
+    }
+    _best, answers = optimize_model_tiling(
+        **tiling_kwargs,
+        experiment_id=TILING_EXPERIMENT_ID,
+        search_budget=budget,
+        level=2,
+        scheduling_order_source="model",
+        tiling_fitness="hypervolume_contribution",
+        hypervolume_patience=args.hv_patience,
+        hypervolume_rel_tol=args.hv_rel_tol,
+        nb_tiling_ga_individuals=args.tiling_population,
+        chunks_per_group=args.chunks,
+        solve_time_limit_s=args.solve_time,
+        solver_workers=args.workers,
+        area_levels=args.area_levels,
+        energy_levels=args.energy_levels,
+    )
+    wall = time.perf_counter() - t0
+    budget.save_summary(os.path.join(experiment_dir, "summary.json"), total_wall_time=wall)
+    measured = _tiling_rows(out_root)
+    pareto = [
+        {
+            key: (float(row[key]) if key in ("latency", "energy", "area") else row[key])
+            for key in ("id", "kind", "nb_cores", "latency", "energy", "area")
+        }
+        for row in measured
+    ]
+    result = {
+        "workload": workload,
+        "method": method,
+        "wall_time_s": wall,
+        "prepare_time_s": None,
+        "search_time_s": wall,
+        "stats": {
+            "measured": len(measured),
+            "tilings": len(answers),
+            "stop_reason": budget.summary()["stop_reason"],
+            "budget": budget.summary(),
+        },
+        "pareto": pareto,
+        "measured": measured,
+    }
+    with open(os.path.join(out_root, f"result_{method}.json"), "w") as f:
+        json.dump(result, f, indent=1, default=str)
+    print(f"{workload}/{method}: {len(answers)} tiling(s), {len(measured)} measured, stop={budget.stop_reason}")
 
 
 def _level(method: str) -> int:
@@ -114,6 +204,9 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
     experiment_dir = os.path.join(out_root, EXPERIMENT_ID)
 
     t0 = time.perf_counter()
+    if method == "level2_tiling":
+        _run_tiling(workload, method, workload_path, out_root, args, kwargs, t0)
+        return
     if method == "rolled":
         from stream.api import optimize_rolled_schedules
 
@@ -217,6 +310,8 @@ def _prediction_errors(result: dict, rows: list[dict]) -> dict:
 
 def _level_rows(output_dir: str, workload: str, method: str) -> list[dict]:
     """Every solution a level measured, with the model's prediction in `latency_bound` / `energy_bound`."""
+    if method == "level2_tiling":
+        return _tiling_rows(os.path.join(output_dir, workload))
     path = os.path.join(output_dir, workload, EXPERIMENT_ID, _out_dir_name(method), "schedules.csv")
     return [row for row in _read_schedules_csv(path) if row["id"].startswith("opt")]
 
@@ -245,11 +340,12 @@ def compare(output_dir: str, workloads: list[str]) -> None:
             normalized = [tuple((p[i] - ideal[i]) / span[i] for i in range(3)) for p in front]
             best = min(front, key=lambda p: p[0] * p[1])
             stats = result["stats"]
-            measured_count = (
-                stats.get("measured", 0) + stats.get("rolled", {}).get("measured", 0)
-                if method == "rolled"
-                else stats[f"optimization_l{_level(method)}"].get("measured", 0)
-            )
+            if method == "rolled":
+                measured_count = stats.get("measured", 0) + stats.get("rolled", {}).get("measured", 0)
+            elif method == "level2_tiling":
+                measured_count = stats["measured"]
+            else:
+                measured_count = stats[f"optimization_l{_level(method)}"].get("measured", 0)
             rows.append(
                 {
                     "workload": workload,
@@ -264,6 +360,12 @@ def compare(output_dir: str, workloads: list[str]) -> None:
                     "min_energy": min(p[1] for p in front),
                     "min_area": min(p[2] for p in front),
                     "hypervolume": round(hypervolume_3d(normalized, (1.0, 1.0, 1.0)), 4),
+                    # The tiling GA: tilings explored and why it stopped (search time is its whole wall time).
+                    **(
+                        {"tilings": stats["tilings"], "stop_reason": stats["stop_reason"]}
+                        if method == "level2_tiling"
+                        else {}
+                    ),
                     **(
                         _prediction_errors(result, _level_rows(output_dir, workload, method))
                         if method != "rolled"
@@ -337,6 +439,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--level3-solve-time", type=float, default=60.0, help="CP-SAT time limit per level-3 solve, seconds."
     )
+    parser.add_argument("--tiling-max-time", type=float, default=10800.0, help="level2_tiling: time limit, seconds.")
+    parser.add_argument("--hv-patience", type=int, default=2, help="level2_tiling: hypervolume patience, generations.")
+    parser.add_argument("--hv-rel-tol", type=float, default=0.005, help="level2_tiling: hypervolume relative gain.")
+    parser.add_argument("--tiling-population", type=int, default=4, help="level2_tiling: tiling GA population.")
     parser.add_argument("--area-levels", type=int, default=5)
     parser.add_argument("--energy-levels", type=int, default=3)
     parser.add_argument("--workers", type=int, default=8)
@@ -364,6 +470,8 @@ def main() -> None:
                 command = [sys.executable, __file__, "--single", workload, method, "--chunks", str(args.chunks),
                            "--solve-time", str(args.solve_time), "--level3-solve-time", str(args.level3_solve_time),
                            "--area-levels", str(args.area_levels),
+                           "--tiling-max-time", str(args.tiling_max_time), "--hv-patience", str(args.hv_patience),
+                           "--hv-rel-tol", str(args.hv_rel_tol), "--tiling-population", str(args.tiling_population),
                            "--energy-levels", str(args.energy_levels), "--workers", str(args.workers),
                            "--output-dir", args.output_dir]  # fmt: skip
                 print(f"[{time.strftime('%H:%M:%S')}] {workload}/{method} -> {log_path}", flush=True)

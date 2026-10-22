@@ -142,6 +142,7 @@ def _run_tiling(workload, method, workload_path, out_root, args, kwargs, t0) -> 
         solver_workers=args.workers,
         area_levels=args.area_levels,
         energy_levels=args.energy_levels,
+        offchip_bus=args.bus,
     )
     wall = time.perf_counter() - t0
     budget.save_summary(os.path.join(experiment_dir, "summary.json"), total_wall_time=wall)
@@ -234,6 +235,7 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
             solver_workers=args.workers,
             area_levels=args.area_levels,
             energy_levels=args.energy_levels,
+            offchip_bus=args.bus,
         )
         search_time = stats[f"optimization_l{level}"]["total_time_s"]
         measured = [
@@ -448,6 +450,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--output-dir", default="outputs/schedule_optimization_comparison")
     parser.add_argument("--log-dir", default="logs/schedule_optimization_comparison")
+    parser.add_argument(
+        "--bus", choices=("none", "aggregate", "timed"), default="none", help="Levels: off-chip bus in the model."
+    )
     parser.add_argument("--compare-only", action="store_true", help="Only rebuild the comparison from results.")
     parser.add_argument("--single", nargs=2, metavar=("WORKLOAD", "METHOD"), help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -473,7 +478,8 @@ def main() -> None:
                            "--tiling-max-time", str(args.tiling_max_time), "--hv-patience", str(args.hv_patience),
                            "--hv-rel-tol", str(args.hv_rel_tol), "--tiling-population", str(args.tiling_population),
                            "--energy-levels", str(args.energy_levels), "--workers", str(args.workers),
-                           "--output-dir", args.output_dir]  # fmt: skip
+                           "--output-dir", args.output_dir,
+                           "--bus", args.bus]  # fmt: skip
                 print(f"[{time.strftime('%H:%M:%S')}] {workload}/{method} -> {log_path}", flush=True)
                 with open(log_path, "w") as log:
                     code = subprocess.call(command, stdout=log, stderr=subprocess.STDOUT)

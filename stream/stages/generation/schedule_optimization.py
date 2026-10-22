@@ -37,7 +37,15 @@ dependency graph. What it leaves out, and leaves to the re-measurement:
   energy is zero in the accelerator templates (`unit_energy_cost: 0`).
 - **off-chip traffic and memory capacity** (weight loads over the shared bus, eviction when a core hosting several
   layers runs out of memory). These are the extensions of section 5 of the note above; they are what most often
-  makes a measured point slower than predicted.
+  makes a measured point slower than predicted. The bus can be modelled (`offchip_bus`). Every tensor Stream loads
+  from off-chip (constant operands and graph inputs) crosses the shared bus once per core that uses it:
+  - `"aggregate"`: latency is at least their total size over the bus bandwidth. Accurate as a bound, but every
+    solution whose compute fits under it is then predicted at the bound, while Stream fetches loads on demand and
+    does not overlap them fully with compute. The measured latencies of those tied solutions spread widely (on the
+    ResNet bottleneck, 103k to 197k cycles for one predicted 102k), and the ties are broken on energy and area.
+  - `"timed"`: each task waits for its own loads, which take the bus one at a time and are fetched just in time,
+    as Stream does (`_add_timed_loads`); the aggregate bound is kept as a redundant constraint.
+  Bus contention with other transfers, and re-fetches after eviction, are not modelled.
 
 Area is exact (the sum of the chosen designs' areas, offchip excluded as everywhere else in the search), and so is
 compute energy up to the cost model.
@@ -123,6 +131,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         max_optimized_evaluations: int = 200,
         fold_allow_sibling_merge: bool = False,
         scheduling_order_source: Literal["generated", "model"] = "generated",
+        offchip_bus: Literal["none", "aggregate", "timed"] = "none",
         **kwargs: Any,
     ):
         """
@@ -144,6 +153,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
                 generic order (`SchedulingOrderGenerationStage`); `"model"` is the order the model scheduled the
                 tiles in, handed to the measurement as `provided_scheduling_order` -- which only takes effect when
                 the measurement stages include `ProvidedSchedulingOrderStage`.
+            offchip_bus: how the off-chip loads over the shared bus enter the model's latency: `"none"`,
+                `"aggregate"` (a lower bound) or `"timed"` (a load interval before each task); see the module
+                docstring.
         """
         super().__init__(list_of_callables, **kwargs)
         self.schedule_search = schedule_search
@@ -161,6 +173,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         if scheduling_order_source not in ("generated", "model"):
             raise ValueError(f"Unknown scheduling_order_source {scheduling_order_source!r}.")
         self.scheduling_order_source = scheduling_order_source
+        if offchip_bus not in ("none", "aggregate", "timed"):
+            raise ValueError(f"Unknown offchip_bus {offchip_bus!r}.")
+        self.offchip_bus = offchip_bus
         self.search_budget = kwargs.get("search_budget")
         self.solve_log: list[dict[str, Any]] = []
 
@@ -225,6 +240,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             }
             for group in self.groups
         }
+        self._build_offchip_traffic(tiles)
 
         # Chunk dependencies from the tile edges. Coarse chunks of two groups can depend on each other both ways
         # when their layers interleave (fusion); such mutually dependent chunks may run in any order relative to
@@ -265,6 +281,106 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             f"chunk sets)."
         )
 
+    def _build_offchip_traffic(self, tiles: list[ComputationNode]) -> None:
+        """The bits every core loads from off-chip, as `self.offchip_bits`: the tensors Stream places off-chip at
+        the start (`CoalaScheduler.initialize_offchip_tensors`: constant operands, and the inputs of graph sources),
+        each sent once to every core that uses it -- a core keeps a tensor it already holds, recognized by
+        `equality_hash` as Stream's memory manager does. Keyed by the groups using a tensor: a core loads the
+        tensor once if any of them sits on it."""
+        workload = self.space.reference_workload
+
+        def loaded_tensors(tile: ComputationNode) -> list[tuple[int, int]]:
+            """(equality hash, bits) of the tensors `tile` reads from off-chip."""
+            loaded_ops = tile.constant_operands + tile.partially_constant_operands
+            is_source = len(workload.in_edges(tile)) == 0
+            return [
+                (tensor.equality_hash, tensor.size)
+                for op, tensor in tile.operand_tensors.items()
+                if op != tile.output_operand and (op in loaded_ops or is_source)
+            ]
+
+        size_of: dict[int, int] = {}
+        groups_of: dict[int, set[int]] = {}
+        for tile in tiles:
+            group = self.space.unrolled_core_of_tile[tile_key(tile)]
+            for key, size in loaded_tensors(tile):
+                size_of[key] = size
+                groups_of.setdefault(key, set()).add(group)
+        self.offchip_bits: dict[frozenset[int], int] = {}
+        for key, users in groups_of.items():
+            users_key = frozenset(users)
+            self.offchip_bits[users_key] = self.offchip_bits.get(users_key, 0) + size_of[key]
+        self.bus_bandwidth = max(1, round(float(self.space.bus_connection["bandwidth"])))
+
+        # For the timed bus: each task loads the tensors its group has not loaded in an earlier task.
+        self.load_bits: list[int] = []
+        seen_of_group: dict[int, set[int]] = {}
+        for (group, _index), members in zip(self.chunks, self.chunk_tiles, strict=True):
+            seen = seen_of_group.setdefault(group, set())
+            bits = 0
+            for tile in members:
+                for key, size in loaded_tensors(tile):
+                    if key not in seen:
+                        seen.add(key)
+                        bits += size
+            self.load_bits.append(bits)
+
+    def _add_bus_bound(self, model: cp_model.CpModel) -> tuple[Any, int]:
+        """The bus time of the off-chip loads (`_build_offchip_traffic`), as a variable `ceil(bits / bandwidth)`,
+        and its upper bound.
+        A tensor whose users must sit on different cores (siblings of one layer, unless they may merge) is sent to
+        each of them, a constant; otherwise the cores it is sent to follow the placement."""
+        constant_bits, max_variable_bits = 0, 0
+        variable_bits = []
+        for users, bits in self.offchip_bits.items():
+            if len(users) == 1 or not self.fold_allow_sibling_merge:
+                constant_bits += bits * len(users)
+                continue
+            max_variable_bits += bits * len(users)
+            for p in range(len(self.groups)):
+                hosted = [self.x[group, p] for group in users if (group, p) in self.x]
+                if hosted:
+                    loaded = model.NewBoolVar(f"load_{len(variable_bits)}")
+                    model.AddMaxEquality(loaded, hosted)
+                    variable_bits.append(bits * loaded)
+        bandwidth = self.bus_bandwidth
+        max_bus_time = math.ceil((constant_bits + max_variable_bits) / bandwidth)
+        bus_time = model.NewIntVar(0, max_bus_time, "bus_time")
+        bits = constant_bits + sum(variable_bits)
+        model.Add(bus_time * bandwidth >= bits)
+        model.Add(bus_time * bandwidth <= bits + bandwidth - 1)
+        logger.info(
+            f"{type(self).__name__}: {constant_bits:.4g} bits of off-chip loads (+ up to {max_variable_bits:.4g} "
+            f"depending on placement) over a {bandwidth} bits/cycle bus: latency >= "
+            f"{math.ceil(constant_bits / bandwidth)} cycles."
+        )
+        return bus_time, max_bus_time
+
+    def _add_timed_loads(self, model: cp_model.CpModel, load_durations: list[int], horizon: int) -> None:
+        """One load interval per task that loads anything (`self.load_bits`), at the full bus bandwidth, all on one
+        `NoOverlap` for the shared bus. A task starts once its load has ended. As in Stream, which starts a node's
+        transfers at most their own duration before its core becomes free (`CoalaScheduler.run`, step 2), a load
+        cannot end before the previous task of its group has ended: loads are fetched on demand, not prefetched.
+        The first task of a group has no such limit, since which task precedes it on a core depends on the
+        placement. A tensor shared by sibling groups merged onto one core is loaded by each of them here."""
+        previous_of = {b: a for a, b in self.chains}
+        self.load_start: dict[int, Any] = {}
+        intervals = []
+        for c, duration in enumerate(load_durations):
+            if duration == 0:
+                continue
+            start = model.NewIntVar(0, horizon, f"ls_{c}")
+            end = model.NewIntVar(0, horizon, f"le_{c}")
+            intervals.append(model.NewIntervalVar(start, duration, end, f"load_{c}"))
+            model.Add(self.start[c] >= end)
+            if c in previous_of:
+                model.Add(end >= self.end[previous_of[c]])
+            self.load_start[c] = start
+        model.AddNoOverlap(intervals)
+        logger.info(
+            f"{type(self).__name__}: {len(intervals)} timed load(s) on the bus, {sum(load_durations)} cycles in all."
+        )
+
     # ----------------------------------------------------------------------------------------- model ---------
 
     def _build_model(self) -> None:  # noqa: PLR0912, PLR0915
@@ -275,6 +391,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         nb_slots = len(groups)
         slots = range(nb_slots)
         horizon = sum(max(self.duration[c].values()) for c in range(len(self.chunks)))
+        if self.offchip_bus == "timed":
+            load_durations = [math.ceil(bits / self.bus_bandwidth) for bits in self.load_bits]
+            horizon += sum(load_durations)
 
         self.y = {(p, key): model.NewBoolVar(f"y_{p}_{key}") for p in slots for key in keys}
         self.used = [model.NewBoolVar(f"u_{p}") for p in slots]
@@ -346,8 +465,17 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         for a, b in self.dependencies + self.chains:
             model.Add(self.start[b] >= self.end[a])
 
+        if self.offchip_bus == "timed":
+            self._add_timed_loads(model, load_durations, horizon)
+
+        finishes = list(self.end)
+        if self.offchip_bus != "none":
+            # Implied by the timed loads, but stated: CP-SAT's NoOverlap propagation would take long to prove it.
+            bus_time, max_bus_time = self._add_bus_bound(model)
+            finishes.append(bus_time)
+            horizon = max(horizon, max_bus_time)
         self.latency = model.NewIntVar(0, horizon, "latency")
-        model.AddMaxEquality(self.latency, self.end)
+        model.AddMaxEquality(self.latency, finishes)
         self.energy = sum(self.group_energy_var.values())
         self.scaled_area = {key: round(self.area_of[key] * AREA_SCALE) for key in keys}
         self.area = sum(self.scaled_area[key] * self.y[p, key] for p in slots for key in keys)
@@ -516,7 +644,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             "predicted_energy": solution.energy,
             "fold_tolerance": "",
             "fold_objective": f"cpsat-level{self.level}",
-            "fold_overlap": f"chunks={self.chunks_per_group} order={self.scheduling_order_source}",
+            "fold_overlap": (
+                f"chunks={self.chunks_per_group} order={self.scheduling_order_source} bus={self.offchip_bus}"
+            ),
             "merge_of_core": merge_of_core,
             "design_key_of_core": design_key_of_core,
             "core_dict_of_core": core_dict_of_core,

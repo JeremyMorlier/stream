@@ -10,6 +10,8 @@ front that is quietly wrong. The properties checked here are the ones that would
 - the epsilon bounds of one solve do not leak into the next,
 - solution keys ignore how slots are numbered,
 - a solution's tile order follows the model's start times and respects precedence,
+- the off-chip bus bound holds latency at the bus time, leaving the slack to energy and area, and a tensor shared by
+  groups that may merge is loaded once per core; timed loads make each task wait for its own load,
 - `ProvidedSchedulingOrderStage` emits Stream's generated order when given none, and otherwise a full permutation
   with the provided entries first, in the provided order.
 
@@ -33,9 +35,19 @@ from stream.stages.generation.scheduling_order_generation import (
 FAST, SLOW = "fast", "slow"
 
 
-def build_stage(groups=(0, 1, 2), layers=(0, 1, 2), chunks_per_group=1, dependencies=((0, 1),)):
+def build_stage(  # noqa: PLR0913
+    groups=(0, 1, 2),
+    layers=(0, 1, 2),
+    chunks_per_group=1,
+    dependencies=((0, 1),),
+    offchip_bits=None,
+    fold_allow_sibling_merge=False,
+    load_bits=None,
+):
     """Groups `g` with one chunk each (or several, chained), on layers `layers[g]`; `dependencies` between
-    groups become dependencies between their last and first chunks."""
+    groups become dependencies between their last and first chunks. `offchip_bits` (users -> bits, over a
+    10 bits/cycle bus) turns the aggregate bus bound on; `load_bits` (bits per task, totalling `offchip_bits`)
+    the timed loads."""
     stage = object.__new__(ScheduleOptimizationStage)
     stage.groups = list(groups)
     stage.layer_of_group = layer_of = dict(zip(groups, layers, strict=True))
@@ -54,7 +66,11 @@ def build_stage(groups=(0, 1, 2), layers=(0, 1, 2), chunks_per_group=1, dependen
         for index in range(len(stage.chunks) - 1)
         if stage.chunks[index][0] == stage.chunks[index + 1][0]
     ]
-    stage.fold_allow_sibling_merge = False
+    stage.fold_allow_sibling_merge = fold_allow_sibling_merge
+    stage.offchip_bus = "timed" if load_bits is not None else "aggregate" if offchip_bits is not None else "none"
+    stage.load_bits = list(load_bits or [])
+    stage.offchip_bits = {frozenset(users): bits for users, bits in (offchip_bits or {}).items()}
+    stage.bus_bandwidth = 10
     stage.solve_time_limit_s = 10.0
     stage.solver_workers = 4
     stage.area_levels = 3
@@ -106,6 +122,41 @@ def test_bounds_do_not_leak_between_solves() -> None:
     assert bounded.area <= 2 and bounded.latency == 90
     free = stage._solve("latency", {}, 10.0, "free")
     assert free.latency == 20, "the area bound of the previous solve must not constrain this one"
+
+
+def test_bus_bound_holds_latency_and_frees_energy() -> None:
+    # 500 bits over 10 bits/cycle: no solution beats 50 cycles, whatever the cores.
+    stage = build_stage(offchip_bits={(0,): 300, (2,): 200})
+    fastest = stage._lexicographic(("latency", "energy", "area"), {}, "t")
+    assert fastest.latency == 50
+    # Within 50 cycles the chain 0 -> 1 fits fast + slow (40) and group 2 slow (30): 100 + 50 + 50 pJ, where the
+    # compute-only model's fastest point is all fast (300 pJ, see test_anchors_are_the_model_optima).
+    assert fastest.energy == 200
+
+
+def test_bus_bound_loads_a_shared_tensor_once_per_core() -> None:
+    # Groups 0 and 1 are slices of layer 0 reading the same 1000-bit tensor: 100 cycles if they share a core,
+    # 200 if not. Without merging they cannot share, so the bound is 200.
+    shared = {(0, 1): 1000}
+    apart = build_stage(layers=(0, 0, 1), dependencies=(), offchip_bits=shared)
+    assert apart._lexicographic(("latency",), {}, "t").latency == 200
+    merged = build_stage(layers=(0, 0, 1), dependencies=(), offchip_bits=shared, fold_allow_sibling_merge=True)
+    fastest = merged._lexicographic(("latency",), {}, "t")
+    assert fastest.latency == 100 and fastest.slot_of_group[0] == fastest.slot_of_group[1]
+
+
+def test_timed_loads_delay_their_tasks() -> None:
+    # Group 0 loads 200 bits (20 cycles) before its task, and group 1 follows group 0. The aggregate bound alone
+    # predicts max(compute 20, bus 20) = 20; with the load in front of group 0, the chain takes 20 + 10 + 10.
+    aggregate = build_stage(offchip_bits={(0,): 200})
+    assert aggregate._lexicographic(("latency",), {}, "t").latency == 20
+    timed = build_stage(offchip_bits={(0,): 200}, load_bits=[200, 0, 0])
+    assert timed._lexicographic(("latency",), {}, "t").latency == 40
+    solver = cp_model.CpSolver()
+    timed.model.ClearAssumptions()
+    timed.model.Minimize(timed.latency)
+    assert solver.Solve(timed.model) == cp_model.OPTIMAL
+    assert solver.Value(timed.start[0]) >= solver.Value(timed.load_start[0]) + 20
 
 
 def test_solution_key_ignores_slot_numbering() -> None:
@@ -162,6 +213,9 @@ if __name__ == "__main__":
     test_siblings_never_share_a_core()
     test_precedence_between_chunks()
     test_bounds_do_not_leak_between_solves()
+    test_bus_bound_holds_latency_and_frees_energy()
+    test_bus_bound_loads_a_shared_tensor_once_per_core()
+    test_timed_loads_delay_their_tasks()
     test_solution_key_ignores_slot_numbering()
     test_scheduling_order_follows_the_model()
     test_merge_scheduling_orders()

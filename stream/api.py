@@ -1123,6 +1123,7 @@ def optimize_schedule_model(  # noqa: PLR0913
     co_time_limit: int = 600,
     optimization_search_dir: str | None = None,
     model_solutions_path: str | None = None,
+    offchip_bus: Literal["none", "aggregate", "timed"] = "none",
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]], dict[str, Any]]:
     """The rolled search's hardware/schedule decisions taken by one constraint model instead of branch and bound
     plus folding: `GroupScheduleOptimizationStage` (`level=1`, one task per layer group) or
@@ -1149,6 +1150,8 @@ def optimize_schedule_model(  # noqa: PLR0913
             `schedule_optimization_l<level>/`); give each measurement its own to keep both reports.
         model_solutions_path: save the model's solutions there, or load them if the file exists, so the same
             accelerators can be measured with both pipelines.
+        offchip_bus: how the model accounts for the off-chip loads over the shared bus: `"none"`, `"aggregate"`
+            (a lower bound on latency) or `"timed"` (a load interval before each task).
 
     Returns:
         The best schedule by `sort_key`, the combined Pareto set as plain records (the optimized ones carry
@@ -1241,6 +1244,7 @@ def optimize_schedule_model(  # noqa: PLR0913
         optimization_search_dir=optimization_search_dir,
         model_solutions_path=model_solutions_path,
         scheduling_order_source=scheduling_order_source,
+        offchip_bus=offchip_bus,
         co_time_limit=co_time_limit,
         co_measurement_dir=f"{output_path}/{experiment_id}/co_measurements",
         search_budget=search_budget,
@@ -1292,6 +1296,7 @@ def optimize_model_tiling(  # noqa: PLR0913
     core_pareto_points: int = 10,
     core_param_ranges: dict[str, Any] | None = None,
     cacti_precompute_workers: int | None = None,
+    offchip_bus: Literal["none", "aggregate", "timed"] = "none",
 ) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
     """The schedule-optimization model (`optimize_schedule_model`) under the tiling GA (`TilingExplorationStage`):
     every tiling candidate gets its own per-tile core fronts, full cost matrix and model sweep at `level`, its
@@ -1393,6 +1398,7 @@ def optimize_model_tiling(  # noqa: PLR0913
         area_levels=area_levels,
         energy_levels=energy_levels,
         scheduling_order_source=scheduling_order_source,
+        offchip_bus=offchip_bus,
     )
     answers = [answer for answer in mainstage.run() if answer[0] is not None]
     if not answers:

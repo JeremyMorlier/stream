@@ -46,6 +46,9 @@ def build_stage(seed: int, nb_classes: int = 3, nb_ranks: int = 4) -> ScheduleEx
     stage.pair_min_energy = [min(energies) for energies in stage.pair_energy]
     stage.class_area = [[rng.uniform(100, 5000) for _ in range(nb_ranks)] for _ in range(nb_classes)]
     stage.class_min_area = [min(areas) for areas in stage.class_area]
+    # No interconnect: the bounds are tested on the core areas alone.
+    stage.interconnect_routers = 0.0
+    stage.class_wire_area = [[0.0] * nb_ranks for _ in range(nb_classes)]
 
     # Two cores, each hosting some of the pairs, and a chain of tiles for the critical-path bound.
     space.counts_per_core = [

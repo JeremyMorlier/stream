@@ -15,20 +15,30 @@ stages need that does not depend on which designs are picked:
    combination's cost LUT is then assembled by copy from `costs`.
 
 On top of that it knows how to assemble and measure both families the searches produce: *unrolled* schedules
-(one design rank per decision class) and *rolled* ones (the unrolled cores folded onto fewer physical cores).
+(one design rank per decision class) and *rolled* ones (the unrolled cores folded onto fewer physical cores), and
+what either costs in area: its compute cores plus its interconnect (`area_of`), the one number every search
+stage compares.
 """
 
 import logging
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import networkx as nx
 from zigzag.utils import pickle_deepcopy
 
 from stream.hardware.architecture.core_generator import build_core_from_dict
+from stream.hardware.architecture.noc.interconnect_area import (
+    InterconnectArea,
+    InterconnectAreaModel,
+    InterconnectTerms,
+    fold_link_widths,
+    interconnect_terms,
+    unordered_link_widths,
+)
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
     ZigZagCoreMappingEstimationStage,
     lowest_memory_level_violations,
@@ -48,7 +58,10 @@ from stream.stages.generation.schedule_evaluation import (
     strip_unpicklable,
     tile_key,
 )
-from stream.stages.generation.tiled_workload_accelerator_generation import derive_group_dedicated_topology
+from stream.stages.generation.tiled_workload_accelerator_generation import (
+    derive_group_dedicated_topology,
+    renumber_merged_cores,
+)
 from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
@@ -82,6 +95,7 @@ class ScheduleSpace:
         estimation_kwargs: dict[str, Any],
         latency_attr: str = "latency_total2",
         max_workers: int | None = 1,
+        interconnect_model: InterconnectAreaModel | dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -96,6 +110,8 @@ class ScheduleSpace:
                 `ZigZagCoreMappingEstimationStage`.
             latency_attr: the `CostModelEvaluation` attribute read as a tile's runtime.
             max_workers: processes for the full-matrix warm-up (`1` keeps it serial).
+            interconnect_model: constants of the interconnect area (GF22/AXI by default). Unless it fixes
+                `traffic_window_cycles`, the warm-up sets it (`set_traffic_window`).
         """
         self.workload = workload
         self.original_workload = original_workload
@@ -106,6 +122,8 @@ class ScheduleSpace:
         self.max_workers = max_workers
         self.costs = CostCaches(latency_attr=latency_attr)
         self.full_matrix = False
+        self.interconnect_model = InterconnectAreaModel.from_config(interconnect_model)
+        self.unrolled_link_widths: dict[tuple[int, int], int] | None = None
         # One pinned workload copy drives both the plan and the warm-up: the pinning is design-independent, so it
         # only has to be derived once.
         self.reference_workload = pickle_deepcopy(workload)
@@ -125,6 +143,7 @@ class ScheduleSpace:
         self.offchip_core_id: int = topology.offchip_core_id
         self.bus_connection: dict[str, Any] = topology.bus_connection
         self.link_connections: list[dict[str, Any]] = topology.link_connections
+        self.unrolled_pair_bits: dict[tuple[int, int], int] = topology.core_pair_bits
         # `original_nodes` is already topologically sorted, so it doubles as the left-to-right column order.
         self.layer_names: dict[int, str] = {node.id: node.short_name for node in search.original_nodes}
         self.layer_order: list[int] = [node.id for node in search.original_nodes]
@@ -424,6 +443,82 @@ class ScheduleSpace:
             f"ScheduleSpace: cached {len(self.costs.cme)} (tile, design) cost model result(s) over "
             f"{len(self.costs.area)} distinct design(s)."
         )
+        self.set_traffic_window()
+
+    # ----------------------------------------------------------------------------------- interconnect area ---
+
+    def set_traffic_window(self) -> None:
+        """Fix the window the traffic-derived link widths are sized for, unless the model already has one: the
+        busiest unrolled core's tiles, each on the fastest design its class offers -- a lower bound on any
+        schedule's run time, and the same for every schedule of the run, so widths depend on the traffic only."""
+        model = self.interconnect_model
+        if model.traffic_window_cycles is None:
+            loads = []
+            for core_id in self.unrolled_core_ids:
+                design_class = self.design_class_of_core[core_id]
+                nb_ranks = len(self.designs_per_class[design_class])
+                keys = [self.design_key(design_class, rank) for rank in range(nb_ranks)]
+                loads.append(
+                    sum(
+                        count * min(self.costs.runtime[(shape, key)] for key in keys)
+                        for shape, count in self.shape_counts_of_core[core_id].items()
+                    )
+                )
+            window = max(loads, default=0.0)
+            if window > 0:
+                model = replace(model, traffic_window_cycles=window)
+                self.interconnect_model = model
+        self.unrolled_link_widths = unordered_link_widths(self.unrolled_pair_bits, model)
+        logger.info(
+            f"ScheduleSpace: interconnect widths sized for {model.traffic_window_cycles} cycle(s): "
+            f"{sorted(self.unrolled_link_widths.values())} bit(s) over {len(self.unrolled_link_widths)} link(s)."
+        )
+
+    def link_widths(self, rolled_of: dict[int, int] | None = None) -> dict[tuple[int, int], int] | None:
+        """Physical width of every link, unrolled or (with `rolled_of`, unrolled -> rolled core) folded. None
+        before the warm-up has sized them."""
+        if self.unrolled_link_widths is None:
+            return None
+        if rolled_of is None:
+            return dict(self.unrolled_link_widths)
+        return fold_link_widths(self.unrolled_link_widths, rolled_of)
+
+    def interconnect_terms(
+        self, rolled_of: dict[int, int] | None = None, widths: dict[tuple[int, int], int] | None = None
+    ) -> InterconnectTerms:
+        """The interconnect of the unrolled accelerator, or of the fold `rolled_of` describes, split into what
+        does and does not depend on the core designs (`InterconnectTerms`). `widths` overrides the
+        traffic-derived link widths (keyed like `link_widths`), for a search that chose them itself."""
+        if widths is None:
+            widths = self.link_widths(rolled_of)
+        if widths is None:
+            widths = unordered_link_widths(self.unrolled_pair_bits, self.interconnect_model)
+            widths = widths if rolled_of is None else fold_link_widths(widths, rolled_of)
+        cores = self.unrolled_core_ids if rolled_of is None else sorted(set(rolled_of.values()))
+        return interconnect_terms(widths, cores, self.interconnect_model)
+
+    def interconnect_of(
+        self,
+        design_key_of_core: dict[int, str],
+        rolled_of: dict[int, int] | None = None,
+        widths: dict[tuple[int, int], int] | None = None,
+    ) -> InterconnectArea:
+        """Interconnect area of the accelerator whose compute core `c` carries `design_key_of_core[c]`: the
+        unrolled one, or the fold `rolled_of` describes (cores then keyed by rolled id), its links `widths` wide
+        if given (see `interconnect_terms`)."""
+        core_area = {core: self.costs.area[key] for core, key in design_key_of_core.items()}
+        return self.interconnect_terms(rolled_of, widths).area(core_area)
+
+    def area_of(
+        self,
+        design_key_of_core: dict[int, str],
+        rolled_of: dict[int, int] | None = None,
+        widths: dict[tuple[int, int], int] | None = None,
+    ) -> float:
+        """Area of an accelerator as every search compares it: its compute cores (offchip excluded) plus its
+        interconnect (`interconnect_of`)."""
+        cores = sum(self.costs.area[key] for key in design_key_of_core.values())
+        return cores + self.interconnect_of(design_key_of_core, rolled_of, widths).total
 
     # ------------------------------------------------------------------------------- assemble and measure ----
 
@@ -439,6 +534,8 @@ class ScheduleSpace:
             self.accelerator,
             node_core_dicts,
             yaml_path=self._yaml_path(save_yaml),
+            link_widths=self.link_widths(),
+            timed_widths=self.interconnect_model.timed_widths,
         )
 
     def assemble_unrolled(self, ranks: tuple[int, ...], save_yaml: bool = False):
@@ -458,11 +555,15 @@ class ScheduleSpace:
         core_dict_of_core: dict[int, dict[str, Any]],
         design_key_of_core: dict[int, str],
         save_yaml: bool = False,
+        link_widths: dict[tuple[int, int], int] | None = None,
     ):
         """`(workload, accelerator, cost_lut, topology)` of the unrolled cores folded as `merge_of_core` says,
         each folded core on the design `core_dict_of_core` gives it (both keyed as `assemble_rolled_accelerator`
-        documents), with a cost LUT assembled from the full matrix."""
+        documents), with a cost LUT assembled from the full matrix. `link_widths` (unordered rolled core pair ->
+        bits) overrides the traffic-derived widths of the folded links."""
         workload = pickle_deepcopy(self.workload)
+        if link_widths is None:
+            link_widths = self.link_widths(renumber_merged_cores(merge_of_core))
         accelerator, topology = assemble_rolled_accelerator(
             workload,
             self.original_workload,
@@ -470,6 +571,8 @@ class ScheduleSpace:
             merge_of_core,
             core_dict_of_core,
             yaml_path=self._yaml_path(save_yaml),
+            link_widths=link_widths,
+            timed_widths=self.interconnect_model.timed_widths,
         )
         cost_lut = self.costs.assemble_cost_lut(workload, accelerator, design_key_of_core, self.shape_class_of_tile)
         return workload, accelerator, cost_lut, topology
@@ -478,7 +581,11 @@ class ScheduleSpace:
         """`(workload, accelerator, cost_lut)` of a measured record of either family."""
         if record.get("kind") == "rolled":
             workload, accelerator, cost_lut, _topology = self.assemble_rolled(
-                record["merge_of_core"], record["core_dict_of_core"], record["design_key_of_core"], save_yaml
+                record["merge_of_core"],
+                record["core_dict_of_core"],
+                record["design_key_of_core"],
+                save_yaml,
+                link_widths=record.get("link_widths"),
             )
             return workload, accelerator, cost_lut
         return self.assemble_unrolled(record["ranks"], save_yaml=save_yaml)

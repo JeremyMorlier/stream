@@ -13,7 +13,9 @@ front that is quietly wrong. The properties checked here are the ones that would
 - the off-chip bus bound holds latency at the bus time, leaving the slack to energy and area, and a tensor shared by
   groups that may merge is loaded once per core; timed loads make each task wait for its own load,
 - `ProvidedSchedulingOrderStage` emits Stream's generated order when given none, and otherwise a full permutation
-  with the provided entries first, in the provided order.
+  with the provided entries first, in the provided order,
+- with the interconnect area on, the model's area is the exact `interconnect_area` of the fold it chose (up to the
+  rounding of the wire pitch), and a link is only paid for when its groups sit apart.
 
 All synthetic: the stage is built with `object.__new__` and given its problem data directly, so no workload, cost
 model or scheduler is involved.
@@ -21,21 +23,33 @@ model or scheduler is involved.
 Run directly with `python tests/test_schedule_optimization.py`, or collect with pytest.
 """
 
+import math
 from types import SimpleNamespace
 
 from ortools.sat.python import cp_model
 
-from stream.stages.generation.schedule_optimization import AREA_SCALE, ModelSolution, ScheduleOptimizationStage
+from stream.hardware.architecture.noc.interconnect_area import (
+    InterconnectAreaModel,
+    fold_link_widths,
+    interconnect_area,
+)
+from stream.stages.generation.schedule_optimization import (
+    AREA_SCALE,
+    LinkTransfer,
+    ModelSolution,
+    ScheduleOptimizationStage,
+)
 from stream.stages.generation.scheduling_order_generation import (
     ProvidedSchedulingOrderStage,
     merge_scheduling_orders,
 )
+from stream.stages.generation.tiled_workload_accelerator_generation import renumber_merged_cores
 
 # Two designs: fast (10 cycles, 100 pJ, area 10) and slow (30 cycles, 50 pJ, area 2) per task.
 FAST, SLOW = "fast", "slow"
 
 
-def build_stage(  # noqa: PLR0913
+def build_stage(  # noqa: PLR0913, PLR0917
     groups=(0, 1, 2),
     layers=(0, 1, 2),
     chunks_per_group=1,
@@ -43,11 +57,14 @@ def build_stage(  # noqa: PLR0913
     offchip_bits=None,
     fold_allow_sibling_merge=False,
     load_bits=None,
+    group_link_widths=None,
+    transfers=None,
 ):
     """Groups `g` with one chunk each (or several, chained), on layers `layers[g]`; `dependencies` between
     groups become dependencies between their last and first chunks. `offchip_bits` (users -> bits, over a
     10 bits/cycle bus) turns the aggregate bus bound on; `load_bits` (bits per task, totalling `offchip_bits`)
-    the timed loads."""
+    the timed loads; `group_link_widths` (group pair -> bits) the interconnect area; `transfers` (`LinkTransfer`s,
+    whose group pairs must be in `group_link_widths`) the timed links, each pair's width then a decision."""
     stage = object.__new__(ScheduleOptimizationStage)
     stage.groups = list(groups)
     stage.layer_of_group = layer_of = dict(zip(groups, layers, strict=True))
@@ -76,8 +93,37 @@ def build_stage(  # noqa: PLR0913
     stage.area_levels = 3
     stage.energy_levels = 2
     stage.solve_log = []
+    stage.link_transfers = "timed" if transfers is not None else "none"
+    stage.transfers = list(transfers or [])
+    if group_link_widths is not None:
+        stage.interconnect_model = InterconnectAreaModel()
+        stage.group_link_widths = dict(group_link_widths)
     stage._build_model()
     return stage
+
+
+def exact_area(stage, solution, group_link_widths=None) -> float:
+    """Cores plus `interconnect_area` of the fold a solution describes, as `ScheduleSpace.area_of` measures it."""
+    rolled_of = renumber_merged_cores(solution.slot_of_group)
+    slot_of_rolled = {rolled_of[group]: slot for group, slot in solution.slot_of_group.items()}
+    core_area = {core: stage.area_of[solution.design_of_slot[slot]] for core, slot in slot_of_rolled.items()}
+    widths = fold_link_widths(group_link_widths or stage.group_link_widths, rolled_of)
+    return sum(core_area.values()) + interconnect_area(widths, core_area, stage.interconnect_model).total
+
+
+def test_interconnect_area_matches_the_exact_model() -> None:
+    widths = {(0, 1): 128, (1, 2): 64}
+    stage = build_stage(group_link_widths=widths)
+    for order in (("latency", "energy", "area"), ("area", "latency", "energy"), ("energy", "latency", "area")):
+        solution = stage._lexicographic(order, {}, "t")
+        assert math.isclose(solution.area, exact_area(stage, solution), rel_tol=1e-3), order
+    # The latency optimum keeps the 0 -> 1 chain on one core and group 2 apart: only the 64-bit link 1-2 is paid.
+    fastest = stage._lexicographic(("latency", "energy", "area"), {}, "t")
+    assert fastest.slot_of_group[0] == fastest.slot_of_group[1] != fastest.slot_of_group[2]
+    assert fold_link_widths(widths, renumber_merged_cores(fastest.slot_of_group)) == {(0, 1): 64}
+    # Interconnect only adds area: the area optimum is still one slow core, now with a router and bus wires.
+    smallest = stage._lexicographic(("area", "latency", "energy"), {}, "a")
+    assert len(set(smallest.slot_of_group.values())) == 1 and smallest.area > 2
 
 
 def test_anchors_are_the_model_optima() -> None:
@@ -159,6 +205,54 @@ def test_timed_loads_delay_their_tasks() -> None:
     assert solver.Value(timed.start[0]) >= solver.Value(timed.load_start[0]) + 20
 
 
+def sibling_fan_in(bits: int = 5120, splits: int = 1):
+    """Groups 0 and 1 are slices of layer 0 (never on one core), both feeding group 2 with `bits` each: group 2 can
+    share a core with at most one of them, so one transfer always crosses a link."""
+    transfers = [LinkTransfer(producer=g, consumer=2, source=g, target=2, bits=bits, splits=splits) for g in (0, 1)]
+    return build_stage(
+        layers=(0, 0, 1),
+        dependencies=((0, 2), (1, 2)),
+        group_link_widths={(0, 2): 32, (1, 2): 32},
+        transfers=transfers,
+    )
+
+
+def test_transfer_delays_its_consumer_at_the_chosen_width() -> None:
+    stage = sibling_fan_in()
+    # Fastest: 10 (slices in parallel) + 5120 / 512 = 10 (the one crossing transfer, widest link) + 10.
+    fastest = stage._lexicographic(("latency", "energy", "area"), {}, "t")
+    assert fastest.latency == 30
+    assert list(fastest.rolled_link_widths.values()) == [512]
+    # The smallest accelerator keeps the link at its narrowest: 10 + 5120 / 32 = 160 + 30 (slow consumer).
+    smallest = stage._lexicographic(("area", "latency", "energy"), {}, "a")
+    assert list(smallest.rolled_link_widths.values()) == [32]
+    assert smallest.latency == 30 + 160 + 30
+    # Under a 60-cycle budget the smallest accelerator is a fast core for one slice and a slow core shared by the
+    # other slice and the consumer (30 + 30): the crossing transfer must be in by 30, after the fast slice's 10, so
+    # 5120 bits in 20 cycles -- 256 bits, the narrowest width that does it.
+    budget = stage._lexicographic(("area", "latency", "energy"), {"latency": 60}, "b")
+    assert budget.latency == 60 and sorted(budget.design_of_slot.values()) == [FAST, SLOW]
+    assert list(budget.rolled_link_widths.values()) == [256]
+    assert math.isclose(budget.area, exact_area(stage, budget, budget.group_link_widths), rel_tol=1e-3)
+
+
+def test_transfer_between_groups_on_one_core_is_free() -> None:
+    # A chain 0 -> 1 with a transfer too long to ever pay: the fastest point merges the two groups, and the
+    # transfer then takes no time (10 + 10).
+    stage = build_stage(
+        group_link_widths={(0, 1): 32},
+        transfers=[LinkTransfer(producer=0, consumer=1, source=0, target=1, bits=10**6, splits=1)],
+    )
+    fastest = stage._lexicographic(("latency", "energy", "area"), {}, "t")
+    assert fastest.latency == 20 and fastest.slot_of_group[0] == fastest.slot_of_group[1]
+
+
+def test_transfers_overlap_compute_and_share_the_link_by_splits() -> None:
+    # Two slices each send 5120 bits to group 2 at 1/2 of the link: 5120 / 256 = 20 cycles at 512 bits.
+    stage = sibling_fan_in(splits=2)
+    assert stage._lexicographic(("latency",), {}, "t").latency == 10 + 20 + 10
+
+
 def test_solution_key_ignores_slot_numbering() -> None:
     a = ModelSolution(slot_of_group={0: 0, 1: 0, 2: 1}, design_of_slot={0: FAST, 1: SLOW}, latency=1, energy=1, area=1)
     b = ModelSolution(slot_of_group={0: 3, 1: 3, 2: 5}, design_of_slot={3: FAST, 5: SLOW}, latency=1, energy=1, area=1)
@@ -220,4 +314,8 @@ if __name__ == "__main__":
     test_scheduling_order_follows_the_model()
     test_merge_scheduling_orders()
     test_provided_order_stage()
+    test_interconnect_area_matches_the_exact_model()
+    test_transfer_delays_its_consumer_at_the_chosen_width()
+    test_transfer_between_groups_on_one_core_is_free()
+    test_transfers_overlap_compute_and_share_the_link_by_splits()
     print("All schedule optimization tests passed.")

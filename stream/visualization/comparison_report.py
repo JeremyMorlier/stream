@@ -223,7 +223,7 @@ _TEMPLATE = r"""<!doctype html>
 const DATA = JSON.parse(document.getElementById("comparison-data").textContent);
 const SVGNS = "http://www.w3.org/2000/svg";
 const OBJ = ["latency", "energy", "area"];
-const UNITS = { latency: "cycles", energy: "pJ", area: "a.u.", edp: "cycles x pJ" };
+const UNITS = { latency: "cycles", energy: "pJ", area: "mm²", edp: "cycles x pJ" };
 const PROJECTIONS = [["latency", "energy"], ["latency", "area"], ["energy", "area"]];
 const ENERGY_LABELS = {
   cn_onchip: "compute, on-chip", cn_offchip_link: "compute, off-chip links", cn_offchip_memory: "compute, off-chip memory",
@@ -639,6 +639,14 @@ function drawMetrics(det, cdet) {
       const share = (v, tot) => v ? { html: fmt(v) + ' <span class="sec">(' + (100 * v / tot).toFixed(1) + "%)</span>" } : "–";
       rows.push([ENERGY_LABELS[k], share(a, d.energy), c && share(b, c.energy)]);
     });
+  }
+  const ic = (det || {}).interconnect, cic = (cdet || {}).interconnect;
+  if (ic || cic) {
+    group("Area breakdown [" + UNITS.area + "]");
+    const part = (v, tot) => v !== null && v !== undefined ? { html: fmt(v) + ' <span class="sec">(' + (100 * v / tot).toFixed(1) + "%)</span>" } : "–";
+    rows.push(["compute cores", part(ic && d.area - ic.total, d.area), c && part(cic && c.area - cic.total, c.area)]);
+    [["routers", "routers"], ["link wires", "links"], ["bus wires", "bus"]].forEach(([name, k]) =>
+      rows.push([name, part(ic && ic[k], d.area), c && part(cic && cic[k], c.area)]));
   }
   const extra = (det || {}).extra || {};
   if (extra.step) rows.push(["graph GA step", extra.step, c && ((cdet || {}).extra || {}).step]);

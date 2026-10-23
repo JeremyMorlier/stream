@@ -22,6 +22,7 @@ Run directly with `python tests/test_schedule_rolling.py`, or collect with pytes
 import random
 from types import SimpleNamespace
 
+from stream.hardware.architecture.noc.interconnect_area import InterconnectAreaModel
 from stream.stages.generation.schedule_evaluation import (
     CoreOccupancy,
     CostCaches,
@@ -90,6 +91,10 @@ def build_space(seed: int = 0, nb_cores: int = NB_CORES) -> ScheduleSpace:
     )
     space.full_matrix = True
     space.distinct_designs = lambda _d=design_dicts: dict(_d)
+    # Interconnect: traffic between layer 0's slices and the later layers, widths not sized yet (all 512 bits).
+    space.interconnect_model = InterconnectAreaModel()
+    space.unrolled_pair_bits = {(0, 2): 1000, (1, 2): 800, (2, 3): 500}
+    space.unrolled_link_widths = None
     return space
 
 
@@ -261,25 +266,26 @@ def test_rolled_area_never_exceeds_unrolled():
     stage = build_stage()
     record = source_record(occupancy=occupancy)
     space = stage.space
-    unrolled_area = sum(
-        space.costs.area[key] for key in space.design_key_of_core(space.node_core_dicts(record["ranks"])).values()
-    )
+    unrolled_area = space.area_of(space.design_key_of_core(space.node_core_dicts(record["ranks"])))
     for plan in stage._fold_plans(record):
         assert stage._fold_area(plan) <= unrolled_area + 1e-9
 
 
 def test_identity_fold_reproduces_the_unrolled_area():
     """The sharpest guard on area comparability: folding nothing must give exactly the unrolled number, i.e.
-    compute cores only, never `Accelerator.area`, which also counts the offchip core."""
+    compute cores and interconnect only, never `Accelerator.area`, which also counts the offchip core."""
     stage = build_stage()
     space = stage.space
     record = source_record()
     design_of_core = space.design_key_of_core(space.node_core_dicts(record["ranks"]))
-    unrolled_area = sum(space.costs.area[key] for key in design_of_core.values())
+    unrolled_area = space.area_of(design_of_core)
+    assert unrolled_area > sum(space.costs.area[key] for key in design_of_core.values())
 
     colour_of = {core: core for core in space.unrolled_core_ids}  # every core its own class
     rolled_of, design_key_of_core, _dicts = stage._choose_designs(record, colour_of, "area")
-    plan = SimpleNamespace(design_key_of_core=design_key_of_core, nb_cores=len(design_key_of_core))
+    plan = SimpleNamespace(
+        design_key_of_core=design_key_of_core, nb_cores=len(design_key_of_core), rolled_of=rolled_of
+    )
     assert abs(stage._fold_area(plan) - unrolled_area) < 1e-9
     assert all(rolled_of[core] == core for core in space.unrolled_core_ids)
 

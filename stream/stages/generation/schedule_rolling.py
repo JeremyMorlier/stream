@@ -446,11 +446,11 @@ class ScheduleRollingStage(ScheduleSearchStage):
         return latency, energy, area
 
     def _fold_area(self, plan: FoldPlan) -> float:
-        """Exact area of a folded accelerator: the sum over its *compute* cores.
+        """Exact area of a folded accelerator: the sum over its *compute* cores, plus its interconnect.
 
         Offchip is excluded, exactly as the unrolled bounds exclude it -- the two numbers share one Pareto
-        archive, so they have to be measured the same way."""
-        return sum(self.space.costs.area[plan.design_key_of_core[core_id]] for core_id in range(plan.nb_cores))
+        archive, so they have to be measured the same way (`ScheduleSpace.area_of`)."""
+        return self.space.area_of(plan.design_key_of_core, plan.rolled_of)
 
     def _measure_fold(self, plan: FoldPlan):
         """Build a fold's accelerator, hand the measurement stages a cost LUT assembled from the full matrix, and
@@ -549,6 +549,7 @@ class ScheduleRollingStage(ScheduleSearchStage):
             "latency": point[0],
             "energy": point[1],
             "area": point[2],
+            "interconnect_area": self.space.interconnect_of(plan.design_key_of_core, plan.rolled_of).total,
             "latency_bound": bounds[0],
             "energy_bound": bounds[1],
             "fold_tolerance": plan.tolerance,

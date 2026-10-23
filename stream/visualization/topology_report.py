@@ -334,9 +334,8 @@ def write_topology_report(
     """Write the interactive page (and, optionally, the same data as a standalone JSON for scripting)."""
     payload = {
         "schema": 1,
-        # `Core.get_area()` mixes the operational array's unit area with CACTI mm^2, so it carries no single
-        # physical unit -- the same caveat the trade-off figure's axis label makes.
-        "objectives": {"latency": "cycles", "energy": "pJ", "area": "a.u."},
+        # Compute cores plus interconnect, in mm^2 -- see the trade-off figure's axis label for the caveat.
+        "objectives": {"latency": "cycles", "energy": "pJ", "area": "mm²"},
         "designs": designs,
         "measured": [
             {

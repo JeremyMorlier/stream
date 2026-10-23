@@ -22,10 +22,11 @@ The search runs in two steps:
    counting toward area); NSGA2 evolves the tiling and the allocation on them -- and which frozen graph a
    mapping runs on -- until the budget stops.
 
-Fitness is `(latency, energy, area)`, measured with the real scheduler. Each tiling is generated once
-(`TilingGenerationStage` + `TiledWorkloadGenerationStage`) and cached; a design's cost on a tiling's shapes is
-learned once with a uniform accelerator, as the rolled schedule search fills its cost matrix, and shared
-across tilings through global tile-shape ids. A design must map every shape of the genome's tiling (the cheap
+Fitness is `(latency, energy, area)`, measured with the real scheduler; area is the nodes' plus the
+interconnect's (`interconnect_area`), every link `LINK_BANDWIDTH` wide since that is a physical width here.
+Each tiling is generated once (`TilingGenerationStage` + `TiledWorkloadGenerationStage`) and cached; a design's
+cost on a tiling's shapes is learned once with a uniform accelerator, as the rolled schedule search fills its cost
+matrix, and shared across tilings through global tile-shape ids. A design must map every shape of the genome's tiling (the cheap
 `lowest_memory_level_violations` pre-check), so any node can host any group.
 """
 
@@ -46,6 +47,7 @@ from deap import base, creator, tools
 from zigzag.utils import pickle_deepcopy
 
 from stream.hardware.architecture.core_generator import build_core_from_dict
+from stream.hardware.architecture.noc.interconnect_area import InterconnectAreaModel, interconnect_area
 from stream.opt.search_budget import SearchBudget, map_recording
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
@@ -225,6 +227,7 @@ class GraphEvolutionStage(Stage):
         self.step1_patience = step1_patience
         self.nb_frozen_graphs = nb_frozen_graphs
         self.search_budget: SearchBudget | None = kwargs.get("search_budget")
+        self.interconnect_model = InterconnectAreaModel.from_config(kwargs.get("interconnect_area_model"))
 
     # ------------------------------------------------------------------------------------------ set-up -------
 
@@ -499,8 +502,11 @@ class GraphEvolutionStage(Stage):
             return None
 
     def _area(self, genome: GraphGenome) -> float:
-        """Total compute-core area of a genome's graph (offchip excluded, as in the other searches)."""
-        return sum(self.costs.area[self._key_of(values)] for values in genome.nodes.values())
+        """Total compute-core area of a genome's graph (offchip excluded, as in the other searches), plus its
+        interconnect."""
+        core_area = {label: self.costs.area[self._key_of(values)] for label, values in genome.nodes.items()}
+        widths = {tuple(sorted(pair)): LINK_BANDWIDTH for pair in genome.links if pair <= core_area.keys()}
+        return sum(core_area.values()) + interconnect_area(widths, core_area, self.interconnect_model).total
 
     def _is_feasible(self, genome: GraphGenome) -> bool:
         context = self._context(genome.tiling)

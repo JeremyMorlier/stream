@@ -17,13 +17,14 @@ def get_bidirectional_edges(
     unit_energy_cost: float,
     link_type: Literal["bus"] | Literal["link"],
     bus_instance: "CommunicationLink | None" = None,
+    width: float | None = None,
 ) -> list[tuple["Core", "Core", dict[str, "CommunicationLink"]]]:
     """Create a list with two edges: from A to B and B to A."""
 
     match link_type:
         case "link":
-            link_a_to_b = CommunicationLink(core_a, core_b, bandwidth, unit_energy_cost)
-            link_b_to_a = CommunicationLink(core_b, core_a, bandwidth, unit_energy_cost)
+            link_a_to_b = CommunicationLink(core_a, core_b, bandwidth, unit_energy_cost, width=width)
+            link_b_to_a = CommunicationLink(core_b, core_a, bandwidth, unit_energy_cost, width=width)
             return [
                 #  A -> B
                 (
@@ -69,6 +70,7 @@ class CommunicationLink:
         unit_energy_cost: float,
         bidirectional: bool = False,
         bus_id: int = -1,
+        width: float | None = None,
     ) -> None:
         self.sender = sender
         self.receiver = receiver
@@ -76,6 +78,9 @@ class CommunicationLink:
         self.unit_energy_cost = unit_energy_cost
         self.bidirectional = bidirectional
         self.bus_id = bus_id  # Distinguishes links representing disconnected busses
+        # Physical width in bits, for the interconnect area only; None when `bandwidth` already is one (see
+        # `interconnect_area`).
+        self.width = width
 
         self.events: list[CommunicationLinkEvent] = []
         self.active_periods = [(0, float("inf"), 0)]

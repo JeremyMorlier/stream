@@ -27,6 +27,7 @@ from zigzag.datatypes import LayerDim
 from zigzag.utils import pickle_deepcopy, pickle_load, pickle_save
 
 from stream.hardware.architecture.accelerator import Accelerator
+from stream.hardware.architecture.noc.interconnect_area import InterconnectAreaModel
 from stream.opt.search_budget import hypervolume_3d, map_recording
 from stream.stages.stage import MainStage, Stage, StageCallable
 from stream.utils import accumulate_stage_timings, get_exclusive_stage_times, wrap_stages_with_timing_for_workers
@@ -525,9 +526,13 @@ class TilingExplorationStage(Stage):
         # Optional `SearchBudget` (see stream.opt.search_budget): when present the GA runs generations until the
         # budget says stop instead of for `nb_tiling_ga_generations`, and every new candidate is recorded on it.
         self.search_budget = kwargs.get("search_budget")
-        # The hardware is fixed in this search, so every candidate shares the same area.
+        # The hardware is fixed in this search, so every candidate shares the same area: its compute cores and
+        # its interconnect.
         self.accelerator_area = (
             sum(core.get_area() for core in accelerator.core_list if core.id != accelerator.offchip_core_id)
+            + accelerator.interconnect_area(
+                InterconnectAreaModel.from_config(kwargs.get("interconnect_area_model"))
+            ).total
             if self.search_budget is not None
             else 0.0
         )

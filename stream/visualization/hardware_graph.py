@@ -450,10 +450,11 @@ def plot_hardware_graph(
 ) -> None:
     """Save the topology figure.
 
-    Bandwidths are drawn as edge width and, while there are few enough edges to stay readable, as labels. Note
-    a link's bandwidth here is derived from the *volume* the workload sends over it
-    (`derive_group_dedicated_topology` sums the tile-edge bits), not from a physical wire width -- the same
-    caveat as the "a.u." area axis in `schedule_tradeoff`."""
+    Bandwidths are drawn as edge width and, while there are few enough edges to stay readable, as labels. A
+    derived link's bandwidth is its physical width once the search has sized it and times links at it
+    (`with_link_widths`, `link_timing="width"`); otherwise it is the *volume* the workload sends over it
+    (`derive_group_dedicated_topology` sums the tile-edge bits), and the width the interconnect area uses is the
+    link's `width` (`interconnect_area`)."""
     if not topology.nodes:
         logger.warning("plot_hardware_graph: topology has no cores, skipping the plot.")
         return

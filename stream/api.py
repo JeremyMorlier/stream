@@ -689,6 +689,7 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     core_convergence_patience: int | None = None,
     core_rel_tol: float = 0.005,
     stats_out: dict[str, Any] | None = None,
+    link_timing: Literal["width", "traffic"] = "width",
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
     """Search schedules as `optimize_schedules` does, then *roll* them: reuse cores that are idle later in the
     schedule so the accelerator needs fewer of them, and return one Pareto front over both families.
@@ -820,6 +821,7 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         search_budget=search_budget,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
+        interconnect_area_model={"link_timing": link_timing},
     )
 
     t_start = _time.perf_counter()
@@ -1124,6 +1126,8 @@ def optimize_schedule_model(  # noqa: PLR0913
     optimization_search_dir: str | None = None,
     model_solutions_path: str | None = None,
     offchip_bus: Literal["none", "aggregate", "timed"] = "none",
+    link_transfers: Literal["none", "timed"] = "timed",
+    link_timing: Literal["width", "traffic"] = "width",
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]], dict[str, Any]]:
     """The rolled search's hardware/schedule decisions taken by one constraint model instead of branch and bound
     plus folding: `GroupScheduleOptimizationStage` (`level=1`, one task per layer group) or
@@ -1152,6 +1156,11 @@ def optimize_schedule_model(  # noqa: PLR0913
             accelerators can be measured with both pipelines.
         offchip_bus: how the model accounts for the off-chip loads over the shared bus: `"none"`, `"aggregate"`
             (a lower bound on latency) or `"timed"` (a load interval before each task).
+        link_transfers: how the model accounts for core-to-core transfers: `"none"` (free, links as wide as the
+            traffic-derived width) or `"timed"` (each link's width chosen by the model, every transfer an interval
+            on its link that overlaps compute).
+        link_timing: what the measurement times a link's transfers with: its physical width (`"width"`) or its
+            core pair's whole traffic (`"traffic"`, about one cycle per transfer -- the earlier convention).
 
     Returns:
         The best schedule by `sort_key`, the combined Pareto set as plain records (the optimized ones carry
@@ -1245,6 +1254,8 @@ def optimize_schedule_model(  # noqa: PLR0913
         model_solutions_path=model_solutions_path,
         scheduling_order_source=scheduling_order_source,
         offchip_bus=offchip_bus,
+        link_transfers=link_transfers,
+        interconnect_area_model={"link_timing": link_timing},
         co_time_limit=co_time_limit,
         co_measurement_dir=f"{output_path}/{experiment_id}/co_measurements",
         search_budget=search_budget,
@@ -1297,6 +1308,8 @@ def optimize_model_tiling(  # noqa: PLR0913
     core_param_ranges: dict[str, Any] | None = None,
     cacti_precompute_workers: int | None = None,
     offchip_bus: Literal["none", "aggregate", "timed"] = "none",
+    link_transfers: Literal["none", "timed"] = "timed",
+    link_timing: Literal["width", "traffic"] = "width",
 ) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
     """The schedule-optimization model (`optimize_schedule_model`) under the tiling GA (`TilingExplorationStage`):
     every tiling candidate gets its own per-tile core fronts, full cost matrix and model sweep at `level`, its
@@ -1399,6 +1412,8 @@ def optimize_model_tiling(  # noqa: PLR0913
         energy_levels=energy_levels,
         scheduling_order_source=scheduling_order_source,
         offchip_bus=offchip_bus,
+        link_transfers=link_transfers,
+        interconnect_area_model={"link_timing": link_timing},
     )
     answers = [answer for answer in mainstage.run() if answer[0] is not None]
     if not answers:

@@ -38,7 +38,7 @@ warm-up (`RolledScheduleExplorationStage._warm_up_cme_cache`).
 | $\ell_{s,d},\ e_{s,d}$ | latency (`latency_total2`) and energy (`energy_total`) of one tile of shape $s$ on design $d$ | `runtime_cache`, `energy_cache` |
 | $a_d$ | area of design $d$ | `area_cache` |
 | $M_d^{o}$ | capacity of design $d$'s top memory serving operand $o$ | the design's core dict |
-| $B^{\text{link}},\ B^{\text{bus}}$ | point-to-point link and shared-bus bandwidths (bits/cycle) | accelerator template (32 and 128 in `tpu_like_quad_core`) |
+| $w_{gh},\ B^{\text{bus}}$ | width of the link a communicating group pair uses, which is also its bandwidth (bits/cycle), and the shared-bus bandwidth | $w_{gh}$ chosen by the model among the powers of two in $[32, 512]$ (`InterconnectAreaModel.width_levels`, §5.1); $B^{\text{bus}} = 128$ (`OFFCHIP_BUS_BANDWIDTH`) |
 | $\epsilon^{\text{link}},\ \epsilon^{\text{bus}},\ \epsilon^{\text{dram}}$ | transfer energy per bit | communication link / off-chip core models |
 
 Derived per-group quantities, since every tile of a group runs on the same design:
@@ -85,11 +85,35 @@ $$
 - slots are filled in group order: group $g$ (in a fixed order) may only use slots $p \le g$. This is the standard
   bin-packing symmetry break.
 
-**Area.** This is exact, since area depends only on the chosen designs:
+**Area.** The chosen designs' areas plus the interconnect's (`stream/hardware/architecture/noc/interconnect_area.py`,
+after the NoC cost model of Iff et al., *Sparse Hamming Graph*, arXiv 2211.13980, with its GF22/AXI constants):
 
 $$
-A = \sum_{p}\sum_{d} a_d\, y_{p,d}.
+A = \sum_{p}\sum_{d} a_d\, y_{p,d} + A^{\text{ic}}.
 $$
+
+A link joins slots $p<q$ when two groups that exchange data sit on them, as wide as the widest such pair; a
+pair's width $w_{gh}$ is the power of two that moves its traffic within the run's traffic window (the busiest
+group's tiles on their fastest designs), clamped to $[32, 512]$ bits:
+
+$$
+\kappa_{pq} \ \ge\ x_{g,p} + x_{h,q} - 1, \qquad
+\omega_{pq} \ \ge\ w_{gh}\,(x_{g,p} + x_{h,q} - 1) \qquad \forall (g,h):\ \text{bits}_{gh} > 0,\ p\ne q .
+$$
+
+With $k_p = \sum_q \kappa_{pq}$ links and $W_p = \sum_q \omega_{pq}$ bits on slot $p$, and $s_p = \sum_d
+\sqrt{a_d}\, y_{p,d}$ its side length, the router (its links plus the bus and core ports, $2 \times 128$ bits)
+and the wires are
+
+$$
+A^{\text{ic}} = \sum_p \Big[ g\big(34632\,k_p + 22\,k_p W_p + 50\,W_p + 70800\,u_p\big)
+ + \pi\, s_p\,(W_p + 64\,k_p) + 384\,\pi\, s_p \Big],
+$$
+
+$g$ the area of a gate equivalent and $\pi$ the wire pitch: an AXI link $w$ bits wide is $2w+128$ wires, running
+half along each end's side; the bus, 128 bits, runs along every core. The two products per slot
+($k_p W_p$, $s_p(W_p+64k_p)$) are CP-SAT multiplication constraints. The model rounds the pitch to whole area
+units; the measured area is exact.
 
 **Compute energy.** This is exact up to the cost model, since a tile's energy depends only on its design:
 
@@ -115,12 +139,13 @@ The three levels below differ only in **how time is modelled**, i.e. in what a s
 ends, plus a transfer delay when the two groups sit on different cores:
 
 $$
-S_h \ \ge\ C_g + \frac{\text{bits}_{gh}}{B^{\text{link}}}\, \delta_{gh},
+S_h \ \ge\ C_g + \frac{\text{bits}_{gh}}{w_{gh}}\, \delta_{gh},
 \qquad
 \delta_{gh} \ge x_{g,p} - x_{h,p}\ \ \forall p.
 $$
 
-Here $\delta_{gh} = 1$ iff $g$ and $h$ are on different cores.
+Here $\delta_{gh} = 1$ iff $g$ and $h$ are on different cores. The code writes the delay as a transfer interval
+between the two tasks (§5.2), with `link_transfers="timed"`.
 
 **No overlap on a core.** Two groups sharing a core cannot run at the same time. With order variables
 $o_{gh}\in\{0,1\}$ and a big constant $H$ (an upper bound on the makespan), for every pair $g, h$ and slot $p$:
@@ -162,7 +187,7 @@ $$
   $c$:
 
 $$
-S_{c'} \ \ge\ C_{c} + \frac{\text{bits}_{cc'}}{B^{\text{link}}}\,\delta_{gh}
+S_{c'} \ \ge\ C_{c} + \frac{\text{bits}_{cc'}}{w_{gh}}\,\delta_{gh}
 \quad \forall (c,c') \text{ with } \text{bits}_{cc'} = \sum_{t\in c,\,u\in c'} b_{tu} > 0 .
 $$
 
@@ -247,8 +272,16 @@ $$
 
 - **Without** a link, transfers would go over the bus. Make the delay term conditional: use
   $\text{bits}/B^{\text{link}}$ when the link exists, and $\text{bits}/B^{\text{bus}}$ otherwise.
-- **If links cost area** (a per-link area $a^{\text{link}}$), add $a^{\text{link}}\sum_{p<q}\kappa_{pq}$ to $A$. The
-  model can then trade bandwidth for area, which the current rolled search cannot.
+- **Links cost area** already ($A^{\text{ic}}$ in section 2), so the model trades links for area.
+- **Link widths are decisions.** Each communicating group pair picks one width $w_{gh}$ among the powers of two in
+  $[32, 512]$ (one-hot $\zeta_{gh,w}$). The link between slots $p$ and $q$ is as wide as the widest pair it
+  carries, $w_{pq} \ge w_{gh} - W^{\max}(2 - x_{g,p} - x_{h,q})$, which prices routers and wires. The pair's
+  transfers take $\lceil \text{bits} / \lceil w_{gh} / k \rceil \rceil$ cycles, with $k$ the consumer layer's
+  inter-core splits, which is Stream's bandwidth fraction. A wider link costs area and saves transfer time.
+  The measurement times each link at the same width (`InterconnectAreaModel.link_timing="width"`).
+  Before, the derived topologies set a link's bandwidth to the total traffic of its pair. Any transfer then took
+  about one cycle while the area was priced at 32 to 128 bits. `link_timing="traffic"` keeps that convention for
+  comparison.
 
 Communication energy:
 
@@ -276,6 +309,20 @@ Transfers can share a link, and every core shares the bus, so transfers must not
 
 This adds one interval per communicating chunk pair. It is the first refinement worth making at level 2, because
 in the profiles the link-window search is the second-largest cost in Stream's own scheduler. Contention matters.
+
+**Implemented** (`link_transfers="timed"`, `_add_link_transfers`) in this form:
+
+- one transfer per (producer group, consumer task), carrying the bits of every kept dependency between them;
+- it starts after the producer group's last task feeding the consumer, and the consumer starts after it ends;
+- it lasts zero cycles when both groups share a core;
+- like the timed bus loads (§5.4), it is fetched just in time: it cannot end before the previous task of the
+  consumer's group has ended, which mirrors Stream's head start (`CoalaScheduler.run`, step 2);
+- transfers sit on no core's `NoOverlap`, so they overlap compute on both ends, as Stream's DMA-like links do;
+- the transfers of one directed group pair share a `Cumulative` of capacity $k$ (each takes $1/k$ of the link).
+
+Contention between *different* group pairs folded onto one physical link is not modelled, because the routing
+would have to follow the $\kappa$ variables. The bus is not used as a fallback either, since every communicating
+pair gets a link. Both are left to the re-measurement.
 
 ### 5.3 Core memory capacity, eviction and spill
 

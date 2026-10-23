@@ -53,6 +53,7 @@ from stream.stages.generation.tiled_workload_accelerator_generation import (
     get_original_nodes,
     get_tiles_by_original_node,
     load_offchip_core_data,
+    with_link_widths,
 )
 from stream.stages.generation.tiling_exploration import _candidate_key
 from stream.stages.stage import Stage, StageCallable
@@ -316,9 +317,12 @@ def assemble_custom_accelerator(
     accelerator: Accelerator,
     node_core_dicts: dict[int, dict[str, Any]],
     yaml_path: str | None = None,
+    link_widths: dict[tuple[int, int], int] | None = None,
+    timed_widths: bool = False,
 ) -> Accelerator:
     """Assemble the group-dedicated accelerator that gives each original node's cores its own design, optionally
-    dumping the assembled description to `yaml_path`.
+    dumping the assembled description to `yaml_path`. `link_widths` (unordered core pair -> bits) are the links'
+    physical widths, for the interconnect area and, with `timed_widths`, for timing too (see `with_link_widths`).
 
     A plain function rather than only a stage method because callers that build *many* accelerators without
     running a sub-pipeline (see `ScheduleExplorationStage`) have no list of callables to hand a stage. Note it
@@ -339,7 +343,10 @@ def assemble_custom_accelerator(
         "offchip_core_id": offchip_core_id,
         "unit_energy_cost": 0,
         "core_memory_sharing": [],
-        "core_connectivity": [topology.bus_connection, *topology.link_connections],
+        "core_connectivity": [
+            topology.bus_connection,
+            *with_link_widths(topology.link_connections, link_widths, timed_widths),
+        ],
     }
     if yaml_path:
         with open(yaml_path, "w") as f:
@@ -355,6 +362,8 @@ def assemble_rolled_accelerator(
     merge_of_core: dict[int, Any],
     core_dict_of_core: dict[int, dict[str, Any]],
     yaml_path: str | None = None,
+    link_widths: dict[tuple[int, int], int] | None = None,
+    timed_widths: bool = False,
 ) -> tuple[Accelerator, "RolledTopology"]:
     """Assemble a *rolled* accelerator: the group-dedicated topology folded onto fewer physical cores by
     `derive_rolled_topology`, each rolled core getting the design named in `core_dict_of_core` (keyed by rolled
@@ -365,8 +374,12 @@ def assemble_rolled_accelerator(
 
     Note this must be used *instead of* `assemble_custom_accelerator` on the rolled path: that one re-derives
     the unrolled topology and would silently re-pin every tile back to an unrolled core id.
+
+    `link_widths` are the *rolled* links' physical widths, timed at with `timed_widths` (see `with_link_widths`);
+    the returned topology's `link_connections` carry them.
     """
     topology = derive_rolled_topology(workload, original_workload, merge_of_core)
+    topology.link_connections = with_link_widths(topology.link_connections, link_widths, timed_widths)
     offchip_core_id = topology.offchip_core_id
 
     # Insertion order matters: `AcceleratorFactory.create` walks this dict and `create_core_graph` asserts that
@@ -455,6 +468,233 @@ def _evaluate_cross_job(
     )
 
 
+def _evaluate_design_on_tiles(
+    values: "array.array | tuple[float, ...]",
+    gene_layout: CoreGeneLayout,
+    tiles_and_counts: list[tuple[ComputationNode, int]],
+    name: str,
+    loma_lpf_limit: int,
+    temporal_mapping_type: TemporalMappingType,
+) -> tuple[float, float, float]:
+    """Fitness of one design that must run *several* tile shapes, as a folded core does: `(sum of count x
+    latency, sum of count x energy, area)` -- the same weighting `ScheduleRollingStage._merged_design_key`
+    picks merged designs with. A design that cannot run one of the shapes is infeasible for all of them."""
+    total_latency = total_energy = 0.0
+    area = float("inf")
+    for tile_index, (tile, count) in enumerate(tiles_and_counts):
+        latency, energy, area = _evaluate_design_on_tile(
+            values, gene_layout, tile, f"{name}_tile_{tile_index}", loma_lpf_limit, temporal_mapping_type
+        )
+        if not math.isfinite(latency):
+            return (float("inf"), float("inf"), float("inf"))
+        total_latency += count * latency
+        total_energy += count * energy
+    return (total_latency, total_energy, area)
+
+
+def _make_core_toolbox(gene_layout: CoreGeneLayout) -> base.Toolbox:
+    """The NSGA2 operators over a core gene vector, without `evaluate` or `map` (both depend on the search)."""
+    low_bounds, up_bounds = gene_layout.low, gene_layout.high
+    if not hasattr(creator, "CoreTileFitness"):
+        creator.create("CoreTileFitness", base.Fitness, weights=(-1.0, -1.0, -1.0))
+    if not hasattr(creator, "CoreTileIndividual"):
+        creator.create("CoreTileIndividual", array.array, typecode="d", fitness=creator.CoreTileFitness)
+
+    def _random_individual():
+        return creator.CoreTileIndividual(random.uniform(lo, hi) for lo, hi in zip(low_bounds, up_bounds, strict=True))
+
+    toolbox = base.Toolbox()
+    toolbox.register("individual", _random_individual)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    toolbox.register("mate", tools.cxSimulatedBinaryBounded, eta=20.0, low=low_bounds, up=up_bounds)
+    toolbox.register(
+        "mutate", tools.mutPolynomialBounded, eta=20.0, low=low_bounds, up=up_bounds, indpb=1 / len(low_bounds)
+    )
+    toolbox.register("select", tools.selNSGA2)
+    return toolbox
+
+
+def _register_dedup_map(toolbox: base.Toolbox, executor: ProcessPoolExecutor) -> None:
+    """Evaluate a batch on `executor`, submitting each distinct gene vector once: two individuals with identical
+    values landing in the same batch would otherwise re-run CACTI/ZigZag for nothing (same rationale as
+    `tiling_exploration._dedup_map`)."""
+
+    def _dedup_map(func, individuals):
+        individuals = list(individuals)
+        keys = [_candidate_key(ind) for ind in individuals]
+        first_index_for_key: dict[str, int] = {}
+        unique_individuals = []
+        for ind, key in zip(individuals, keys, strict=True):
+            if key not in first_index_for_key:
+                first_index_for_key[key] = len(unique_individuals)
+                unique_individuals.append(ind)
+        logger.debug(
+            f"CoreArchitectureExplorationStage: batch of {len(individuals)} individual(s), "
+            f"{len(unique_individuals)} unique after dedup."
+        )
+        unique_results = list(executor.map(func, unique_individuals))
+        return [unique_results[first_index_for_key[key]] for key in keys]
+
+    toolbox.register("map", _dedup_map)
+
+
+def _round_population(mu: int) -> int:
+    """DEAP's selTournamentDCD requires its population to be a multiple of 4; round up rather than erroring out
+    on an otherwise-reasonable population size."""
+    if mu % 4 == 0:
+        return mu
+    rounded_mu = ((mu // 4) + 1) * 4
+    logger.warning(
+        f"CoreArchitectureExplorationStage: nb_core_ga_individuals={mu} is not a multiple of 4 "
+        f"(required by NSGA2's crowded-tournament selection); rounding up to {rounded_mu}."
+    )
+    return rounded_mu
+
+
+def _run_nsga2(  # noqa: PLR0913
+    toolbox: base.Toolbox,
+    mu: int,
+    *,
+    label: str,
+    history_index: int,
+    nb_generations: int,
+    nb_points: int,
+    search_budget: SearchBudget | None = None,
+    convergence_patience: int | None = None,
+    rel_tol: float = 0.005,
+    initial: list[list[float]] | None = None,
+) -> tuple[list[Any], list[tuple[Any, ...]]]:
+    """One NSGA2 search over core gene vectors with the toolbox's `evaluate`.
+
+    `initial` seeds the first individuals of the population (the rest stay random). Returns up to `nb_points`
+    representative individuals from the Pareto front (each with `.fitness.values` set), plus the history of
+    every individual evaluated, for `all_evaluated_cores.csv`."""
+    history: list[tuple[Any, ...]] = []
+    population = toolbox.population(n=mu)
+    for slot, values in enumerate((initial or [])[:mu]):
+        population[slot] = creator.CoreTileIndividual(values)
+    fitnesses = toolbox.map(toolbox.evaluate, population)
+    for ind, fit in zip(population, fitnesses, strict=True):
+        ind.fitness.values = fit
+    _record_evaluated_designs(history, history_index, 0, population)
+    # Canonical DEAP NSGA2 pattern (see deap/examples/ga/nsga2.py): this initial select assigns
+    # crowding-distance info onto `population`, which `selTournamentDCD` needs for the mating pool below.
+    population = toolbox.select(population, mu)
+
+    pareto_front = tools.ParetoFront()
+    pareto_front.update(population)
+
+    # Convergence (when `convergence_patience` is set): stop once the front's (latency, energy, area)
+    # hypervolume has grown by less than `rel_tol` over the last `convergence_patience` generations.
+    # The reference point is fixed from the initial population so successive volumes are comparable.
+    finite = [ind.fitness.values for ind in population if all(math.isfinite(v) for v in ind.fitness.values)]
+    reference = [1.1 * max(values[i] for values in finite) for i in range(3)] if finite else None
+    hv_history: list[float] = []
+
+    for generation in range(nb_generations):
+        # The budget only keeps a new generation from starting; the one under way always completes.
+        if search_budget is not None and search_budget.should_stop():
+            logger.info(f"CoreArchitectureExplorationStage: {label} stopped by the search budget.")
+            break
+        if convergence_patience is not None and reference is not None:
+            hv_history.append(hypervolume_3d([ind.fitness.values for ind in pareto_front], reference))
+            if len(hv_history) > convergence_patience:
+                previous = hv_history[-1 - convergence_patience]
+                if previous > 0 and hv_history[-1] / previous - 1 < rel_tol:
+                    logger.info(
+                        f"CoreArchitectureExplorationStage: {label} front converged after "
+                        f"{generation} generation(s) (hypervolume {hv_history[-1]:.4g})."
+                    )
+                    break
+        offspring = tools.selTournamentDCD(population, mu)
+        offspring = [toolbox.clone(ind) for ind in offspring]
+        for ind1, ind2 in zip(offspring[::2], offspring[1::2], strict=False):
+            if random.random() <= 0.9:
+                toolbox.mate(ind1, ind2)
+            toolbox.mutate(ind1)
+            toolbox.mutate(ind2)
+            del ind1.fitness.values
+            del ind2.fitness.values
+
+        invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+        fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+        for ind, fit in zip(invalid_ind, fitnesses, strict=True):
+            ind.fitness.values = fit
+        _record_evaluated_designs(history, history_index, generation + 1, invalid_ind)
+
+        population = toolbox.select(population + offspring, mu)
+        pareto_front.update(population)
+        best_per_objective = [min(ind.fitness.values[i] for ind in pareto_front) for i in range(3)]
+        logger.info(
+            f"CoreArchitectureExplorationStage: {label} generation {generation}/{nb_generations} (mu={mu}): "
+            f"front={len(pareto_front)} pareto point(s), best (latency, energy, area)={tuple(best_per_objective)}."
+        )
+
+    logger.info(f"CoreArchitectureExplorationStage: {label} search done ({len(pareto_front)} pareto point(s)).")
+    n_points = min(nb_points, len(pareto_front))
+    return (tools.selNSGA2(list(pareto_front), n_points) if n_points else []), history
+
+
+def search_shared_core_front(  # noqa: PLR0913
+    tiles_and_counts: list[tuple[ComputationNode, int]],
+    *,
+    loma_lpf_limit: int,
+    temporal_mapping_type: TemporalMappingType,
+    nb_generations: int,
+    nb_individuals: int,
+    nb_points: int,
+    core_param_ranges: dict[str, Any] | None = None,
+    max_workers: int | None = None,
+    initial: list[list[float]] | None = None,
+    search_budget: SearchBudget | None = None,
+    convergence_patience: int | None = None,
+    rel_tol: float = 0.005,
+) -> tuple[list[dict[str, Any]], list[tuple[Any, ...]]]:
+    """Search one Pareto front of core designs for a core that runs *all* of `tiles_and_counts` -- a generalist
+    for a folded core, rather than the specialist each per-tile front holds.
+
+    Same gene space and NSGA2 as the per-tile search, but scored with `_evaluate_design_on_tiles`. Returns the
+    decoded designs (`{"core_dict", "fitness", "genes"}`) and the history of every evaluated individual. The
+    CACTI design space must already be precomputed and patched in, as `stream.api` does before its searches."""
+    gene_layout = CoreGeneLayout(CoreParamRanges(**(core_param_ranges or {})))
+    toolbox = _make_core_toolbox(gene_layout)
+    toolbox.register(
+        "evaluate",
+        functools.partial(
+            _evaluate_design_on_tiles,
+            gene_layout=gene_layout,
+            tiles_and_counts=tiles_and_counts,
+            name="shared",
+            loma_lpf_limit=loma_lpf_limit,
+            temporal_mapping_type=temporal_mapping_type,
+        ),
+    )
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=multiprocessing.get_context("fork")) as executor:
+        _register_dedup_map(toolbox, executor)
+        top_designs, history = _run_nsga2(
+            toolbox,
+            _round_population(nb_individuals),
+            label="shared core",
+            history_index=-1,
+            nb_generations=nb_generations,
+            nb_points=nb_points,
+            search_budget=search_budget,
+            convergence_patience=convergence_patience,
+            rel_tol=rel_tol,
+            initial=initial,
+        )
+    designs = [
+        {
+            "core_dict": gene_layout.decode_node(design, name=f"core_shared_rank_{rank}"),
+            "fitness": tuple(design.fitness.values),
+            "genes": list(design),
+        }
+        for rank, design in enumerate(top_designs)
+        if all(math.isfinite(v) for v in design.fitness.values)
+    ]
+    return designs, history
+
+
 def _record_evaluated_designs(
     rows: list[tuple[Any, ...]],
     tile_index: int,
@@ -499,7 +739,10 @@ class CoreArchitectureExplorationStage(Stage):
     -- with a genuine multi-objective (NSGA2) genetic algorithm over `(latency, energy, area)`. `area` comes
     from `Core.get_area()` (inherited from ZigZag's own `Accelerator.get_area()`, summing operational-array
     area and each memory level's CACTI-derived area); `latency`/`energy` come straight from the
-    `CostModelEvaluation` ZigZag returns for that tile on that candidate core.
+    `CostModelEvaluation` ZigZag returns for that tile on that candidate core. The interconnect area the schedule
+    searches add (`interconnect_area`) is left out here: a core's router and links depend on the topology, not
+    on its design, except through the wire length along its side, so it would not change which designs a front
+    keeps by much.
 
     Each unique tile gets its own independent NSGA2 run, evaluated directly via
     `stream.stages.estimation.zigzag_core_mapping_estimation.evaluate_node_on_core` -- no accelerator assembly,
@@ -646,71 +889,17 @@ class CoreArchitectureExplorationStage(Stage):
             ),
         )
 
-        history: list[tuple[Any, ...]] = []
-        population = toolbox.population(n=mu)
-        fitnesses = toolbox.map(toolbox.evaluate, population)
-        for ind, fit in zip(population, fitnesses, strict=True):
-            ind.fitness.values = fit
-        _record_evaluated_designs(history, tile_index, 0, population)
-        # Canonical DEAP NSGA2 pattern (see deap/examples/ga/nsga2.py): this initial select assigns
-        # crowding-distance info onto `population`, which `selTournamentDCD` needs for the mating pool below.
-        population = toolbox.select(population, mu)
-
-        pareto_front = tools.ParetoFront()
-        pareto_front.update(population)
-
-        # Convergence (when `core_convergence_patience` is set): stop once the front's (latency, energy, area)
-        # hypervolume has grown by less than `core_rel_tol` over the last `core_convergence_patience` generations.
-        # The reference point is fixed from the initial population so successive volumes are comparable.
-        finite = [ind.fitness.values for ind in population if all(math.isfinite(v) for v in ind.fitness.values)]
-        reference = [1.1 * max(values[i] for values in finite) for i in range(3)] if finite else None
-        hv_history: list[float] = []
-
-        for generation in range(self.nb_core_ga_generations):
-            # The budget only keeps a new generation from starting; the one under way always completes.
-            if self.search_budget is not None and self.search_budget.should_stop():
-                logger.info(f"CoreArchitectureExplorationStage: tile {tile_index} stopped by the search budget.")
-                break
-            if self.core_convergence_patience is not None and reference is not None:
-                hv_history.append(hypervolume_3d([ind.fitness.values for ind in pareto_front], reference))
-                if len(hv_history) > self.core_convergence_patience:
-                    previous = hv_history[-1 - self.core_convergence_patience]
-                    if previous > 0 and hv_history[-1] / previous - 1 < self.core_rel_tol:
-                        logger.info(
-                            f"CoreArchitectureExplorationStage: tile {tile_index} front converged after "
-                            f"{generation} generation(s) (hypervolume {hv_history[-1]:.4g})."
-                        )
-                        break
-            offspring = tools.selTournamentDCD(population, mu)
-            offspring = [toolbox.clone(ind) for ind in offspring]
-            for ind1, ind2 in zip(offspring[::2], offspring[1::2], strict=False):
-                if random.random() <= 0.9:
-                    toolbox.mate(ind1, ind2)
-                toolbox.mutate(ind1)
-                toolbox.mutate(ind2)
-                del ind1.fitness.values
-                del ind2.fitness.values
-
-            invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
-            fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
-            for ind, fit in zip(invalid_ind, fitnesses, strict=True):
-                ind.fitness.values = fit
-            _record_evaluated_designs(history, tile_index, generation + 1, invalid_ind)
-
-            population = toolbox.select(population + offspring, mu)
-            pareto_front.update(population)
-            best_per_objective = [min(ind.fitness.values[i] for ind in pareto_front) for i in range(3)]
-            logger.info(
-                f"CoreArchitectureExplorationStage: tile {tile_index} generation {generation}/"
-                f"{self.nb_core_ga_generations} (mu={mu}): front={len(pareto_front)} pareto point(s), "
-                f"best (latency, energy, area)={tuple(best_per_objective)}."
-            )
-
-        logger.info(
-            f"CoreArchitectureExplorationStage: tile {tile_index} search done ({len(pareto_front)} pareto point(s))."
+        return _run_nsga2(
+            toolbox,
+            mu,
+            label=f"tile {tile_index}",
+            history_index=tile_index,
+            nb_generations=self.nb_core_ga_generations,
+            nb_points=self.core_pareto_points,
+            search_budget=self.search_budget,
+            convergence_patience=self.core_convergence_patience,
+            rel_tol=self.core_rel_tol,
         )
-        n_points = min(self.core_pareto_points, len(pareto_front))
-        return (tools.selNSGA2(list(pareto_front), n_points) if n_points else []), history
 
     def search_pareto_fronts(self) -> ParetoCoreSearchResult:  # noqa: PLR0915
         """Search every unique tile's Pareto front of core designs, saving them to
@@ -723,42 +912,14 @@ class CoreArchitectureExplorationStage(Stage):
         tiles_by_original = get_tiles_by_original_node(self.workload, original_nodes)
         gene_layout = CoreGeneLayout(self.gene_ranges)
         n_genes = gene_layout.n_genes_per_node
-        low_bounds, up_bounds = gene_layout.low, gene_layout.high
 
         logger.info(
             f"CoreArchitectureExplorationStage: searching {len(unique_tiles)} unique tile design(s) "
             f"({n_genes} genes each)."
         )
 
-        if not hasattr(creator, "CoreTileFitness"):
-            creator.create("CoreTileFitness", base.Fitness, weights=(-1.0, -1.0, -1.0))
-        if not hasattr(creator, "CoreTileIndividual"):
-            creator.create("CoreTileIndividual", array.array, typecode="d", fitness=creator.CoreTileFitness)
-
-        def _random_individual():
-            return creator.CoreTileIndividual(
-                random.uniform(lo, hi) for lo, hi in zip(low_bounds, up_bounds, strict=True)
-            )
-
-        toolbox = base.Toolbox()
-        toolbox.register("individual", _random_individual)
-        toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-        toolbox.register("mate", tools.cxSimulatedBinaryBounded, eta=20.0, low=low_bounds, up=up_bounds)
-        toolbox.register(
-            "mutate", tools.mutPolynomialBounded, eta=20.0, low=low_bounds, up=up_bounds, indpb=1 / n_genes
-        )
-        toolbox.register("select", tools.selNSGA2)
-
-        # DEAP's selTournamentDCD requires its population to be a multiple of 4; round up rather than erroring
-        # out on an otherwise-reasonable population size.
-        mu = self.nb_core_ga_individuals
-        if mu % 4 != 0:
-            rounded_mu = ((mu // 4) + 1) * 4
-            logger.warning(
-                f"CoreArchitectureExplorationStage: nb_core_ga_individuals={mu} is not a multiple of 4 "
-                f"(required by NSGA2's crowded-tournament selection); rounding up to {rounded_mu}."
-            )
-            mu = rounded_mu
+        toolbox = _make_core_toolbox(gene_layout)
+        mu = _round_population(self.nb_core_ga_individuals)
 
         # Force "fork" (not the platform default) for the same reason as TilingExplorationStage: it clones this
         # already-running process instead of re-importing __main__.
@@ -766,27 +927,7 @@ class CoreArchitectureExplorationStage(Stage):
         csv_rows: list[tuple[int, int, int, float, float, float]] = []
 
         with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=mp_context) as executor:
-
-            def _dedup_map(func, individuals):
-                """Same dedup-by-content-key rationale as `tiling_exploration._dedup_map`: two individuals with
-                identical gene values landing in the same batch would otherwise be submitted (and CACTI/ZigZag
-                re-run) twice for no reason."""
-                individuals = list(individuals)
-                keys = [_candidate_key(ind) for ind in individuals]
-                first_index_for_key: dict[str, int] = {}
-                unique_individuals = []
-                for ind, key in zip(individuals, keys, strict=True):
-                    if key not in first_index_for_key:
-                        first_index_for_key[key] = len(unique_individuals)
-                        unique_individuals.append(ind)
-                logger.debug(
-                    f"CoreArchitectureExplorationStage: batch of {len(individuals)} individual(s), "
-                    f"{len(unique_individuals)} unique after dedup."
-                )
-                unique_results = list(executor.map(func, unique_individuals))
-                return [unique_results[first_index_for_key[key]] for key in keys]
-
-            toolbox.register("map", _dedup_map)
+            _register_dedup_map(toolbox, executor)
 
             # Run every tile's NSGA2 search concurrently rather than one-at-a-time: each tile's search is
             # otherwise independent, and driving them from separate threads lets their individual evaluation

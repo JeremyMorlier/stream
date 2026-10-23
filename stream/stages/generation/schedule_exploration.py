@@ -14,7 +14,9 @@ design) costs that can be learned once and reused -- are what `ScheduleSpace` ca
 stage adds:
 
 3. **Two objectives are exact without scheduling, the third is boundable.**
-   - `area` is a plain sum over cores of each design's area -- exact.
+   - `area` is a plain sum over cores of each design's area, plus the interconnect's -- exact. The interconnect
+     is a constant (its routers) plus a term per core linear in the side length of its design
+     (`InterconnectTerms`), so it splits over classes like the core area does.
    - schedule `energy` is the sum of per-tile CME energies *plus* non-negative transfer/eviction energy, so that
      sum is a lower bound.
    - schedule `latency` is bounded below by both the busiest core's serial load (a core runs its tiles one at a
@@ -151,13 +153,25 @@ class ScheduleExplorationStage(ScheduleSearchStage):
         self.pair_min_runtime = [min(runtimes) for runtimes in self.pair_runtime]
         self.pair_min_energy = [min(energies) for energies in self.pair_energy]
 
-        self.class_area: list[list[float]] = [
-            [
-                space.cores_per_class[class_index] * space.costs.area[space.design_key(class_index, rank)]
-                for rank in range(len(space.designs_per_class[class_index]))
-            ]
-            for class_index in space.decision_classes
-        ]
+        # Each class's share of the area: its cores, and the interconnect wires along them. The routers do not
+        # depend on the designs, so they are one constant on top (`interconnect_routers`).
+        terms = space.interconnect_terms()
+        self.interconnect_routers = terms.routers
+        wire_coefficient_of_class = dict.fromkeys(space.decision_classes, 0.0)
+        for core_id in space.unrolled_core_ids:
+            wire_coefficient_of_class[space.design_class_of_core[core_id]] += (
+                terms.link_coefficient.get(core_id, 0.0) + terms.bus_coefficient
+            )
+        self.class_area: list[list[float]] = []
+        self.class_wire_area: list[list[float]] = []
+        for class_index in space.decision_classes:
+            areas, wire_areas = [], []
+            for rank in range(len(space.designs_per_class[class_index])):
+                area = space.costs.area[space.design_key(class_index, rank)]
+                wire_areas.append(wire_coefficient_of_class[class_index] * math.sqrt(max(0.0, area)))
+                areas.append(space.cores_per_class[class_index] * area + wire_areas[-1])
+            self.class_area.append(areas)
+            self.class_wire_area.append(wire_areas)
         self.class_min_area = [min(areas) for areas in self.class_area]
 
     def _bounds(self, ranks: tuple[int, ...], depth: int | None = None) -> tuple[float, float, float]:
@@ -173,7 +187,7 @@ class ScheduleExplorationStage(ScheduleSearchStage):
             self.pair_energy[index][ranks[pair_depth]] if pair_depth < depth else self.pair_min_energy[index]
             for index, pair_depth in enumerate(space.pair_depth)
         ]
-        area = sum(
+        area = self.interconnect_routers + sum(
             self.class_area[depth_][ranks[depth_]] if depth_ < depth else self.class_min_area[depth_]
             for depth_ in range(len(space.decision_classes))
         )
@@ -269,6 +283,8 @@ class ScheduleExplorationStage(ScheduleSearchStage):
                 "latency": point[0],
                 "energy": point[1],
                 "area": point[2],
+                "interconnect_area": self.interconnect_routers
+                + sum(self.class_wire_area[depth][rank] for depth, rank in enumerate(ranks)),
                 "latency_bound": bounds[0],
                 "energy_bound": bounds[1],
             }
@@ -337,6 +353,7 @@ class ScheduleExplorationStage(ScheduleSearchStage):
             },
             latency_attr=self.kwargs.get("latency_attr", "latency_total2"),
             max_workers=self.max_workers,
+            interconnect_model=self.kwargs.get("interconnect_area_model"),
         )
         self.space.drop_infeasible_designs(all_shapes=self.full_matrix)
         self.space.warm_up(self.cme_cache_dir, full_matrix=self.full_matrix, max_cells=self.max_cme_matrix_cells)

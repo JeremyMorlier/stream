@@ -57,6 +57,30 @@ class GroupDedicatedTopology:
     bus_connection: dict[str, Any]
     link_connections: list[dict[str, Any]]
     original_nodes: list[ComputationNode]
+    # Bits each directed core pair exchanges, what the links' bandwidths and the interconnect widths come from.
+    core_pair_bits: dict[tuple[int, int], int]
+
+
+def with_link_widths(
+    link_connections: list[dict[str, Any]],
+    link_widths: dict[tuple[int, int], int] | None,
+    timed: bool = False,
+) -> list[dict[str, Any]]:
+    """`link_connections` with each link's physical width (`link_width`, for the interconnect area) taken from
+    `link_widths` (unordered core pair -> bits). With `timed`, the link's timing `bandwidth` becomes that width too,
+    and the traffic it replaces is kept as `traffic_bits` (informative). Unchanged when there are none: the area
+    then falls back to the bandwidth, as for a hand-written accelerator."""
+    if link_widths is None:
+        return link_connections
+    connections = []
+    for connection in link_connections:
+        width = link_widths[(min(connection["cores"]), max(connection["cores"]))]
+        sized = {**connection, "link_width": width}
+        if timed:
+            sized["traffic_bits"] = connection["bandwidth"]
+            sized["bandwidth"] = width
+        connections.append(sized)
+    return connections
 
 
 def derive_group_dedicated_topology(
@@ -123,6 +147,7 @@ def derive_group_dedicated_topology(
         bus_connection=bus_connection,
         link_connections=link_connections,
         original_nodes=original_nodes,
+        core_pair_bits=dict(core_pair_bits),
     )
 
 

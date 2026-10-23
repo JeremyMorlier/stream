@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 AXES = {
     "latency": "Latency [cycles]",
     "energy": "Energy [pJ]",
-    # `Core.get_area()` adds the operational array's area (from the hardware description's unit area) to the
-    # memories' CACTI area, so the sum carries no single physical unit -- don't label it mm^2.
-    "area": "Area [a.u.]",
+    # Generated cores give their MAC units an area in mm^2 (`core_generator.MAC_UNIT_AREA_MM2`), matching CACTI's
+    # memory areas and the interconnect area (`interconnect_area`). A hand-written core's `unit_area` may not be.
+    "area": "Area [mm$^2$]",
 }
 PROJECTIONS = (("latency", "energy", "area"), ("latency", "area", "energy"), ("energy", "area", "latency"))
 

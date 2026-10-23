@@ -126,6 +126,7 @@ class AcceleratorFactory:
                     bandwidth=bw,
                     unit_energy_cost=uec,
                     link_type=connection_type,
+                    width=connection.get("link_width"),
                 )
             elif connection_type == "bus":
                 # Connect cores to bus, edge by edge

@@ -161,3 +161,4 @@ benchmark*.txt
 result.csv
 *.zip
 *.ipynb
+figures/

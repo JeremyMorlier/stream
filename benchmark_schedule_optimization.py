@@ -143,6 +143,8 @@ def _run_tiling(workload, method, workload_path, out_root, args, kwargs, t0) -> 
         area_levels=args.area_levels,
         energy_levels=args.energy_levels,
         offchip_bus=args.bus,
+        link_transfers=args.links,
+        link_timing=args.link_timing,
     )
     wall = time.perf_counter() - t0
     budget.save_summary(os.path.join(experiment_dir, "summary.json"), total_wall_time=wall)
@@ -218,6 +220,7 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
             fold_tolerances=(0.0, 0.25, 1.0),
             fold_overlap="exact",
             stats_out=stats,
+            link_timing=args.link_timing,
         )
         search_time = stats.get("search_time_s", 0.0) + stats.get("rolled", {}).get("time_s", 0.0)
         measured = _read_schedules_csv(os.path.join(experiment_dir, "rolled_search", "schedules.csv"))
@@ -236,6 +239,8 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
             area_levels=args.area_levels,
             energy_levels=args.energy_levels,
             offchip_bus=args.bus,
+            link_transfers=args.links,
+            link_timing=args.link_timing,
         )
         search_time = stats[f"optimization_l{level}"]["total_time_s"]
         measured = [
@@ -453,6 +458,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bus", choices=("none", "aggregate", "timed"), default="none", help="Levels: off-chip bus in the model."
     )
+    parser.add_argument(
+        "--links", choices=("none", "timed"), default="timed", help="Levels: core-to-core transfers in the model."
+    )
+    parser.add_argument(
+        "--link-timing",
+        choices=("width", "traffic"),
+        default="width",
+        help="Measurement: links timed at their physical width, or at their pair's whole traffic (1-cycle transfers).",
+    )
     parser.add_argument("--compare-only", action="store_true", help="Only rebuild the comparison from results.")
     parser.add_argument("--single", nargs=2, metavar=("WORKLOAD", "METHOD"), help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -479,7 +493,7 @@ def main() -> None:
                            "--hv-rel-tol", str(args.hv_rel_tol), "--tiling-population", str(args.tiling_population),
                            "--energy-levels", str(args.energy_levels), "--workers", str(args.workers),
                            "--output-dir", args.output_dir,
-                           "--bus", args.bus]  # fmt: skip
+                           "--bus", args.bus, "--links", args.links, "--link-timing", args.link_timing]  # fmt: skip
                 print(f"[{time.strftime('%H:%M:%S')}] {workload}/{method} -> {log_path}", flush=True)
                 with open(log_path, "w") as log:
                     code = subprocess.call(command, stdout=log, stderr=subprocess.STDOUT)

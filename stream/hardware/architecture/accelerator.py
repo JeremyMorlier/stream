@@ -13,6 +13,12 @@ from stream.cost_model.communication_manager import CommunicationManager
 from stream.cost_model.memory_manager import MemoryManager
 from stream.hardware.architecture.core import Core
 from stream.hardware.architecture.noc.communication_link import CommunicationLink
+from stream.hardware.architecture.noc.interconnect_area import (
+    InterconnectArea,
+    InterconnectAreaModel,
+    interconnect_area,
+    physical_link_widths,
+)
 from stream.workload.computation.computation_node import ComputationNode
 from stream.workload.tensor import Tensor
 
@@ -399,7 +405,8 @@ class Accelerator:
     @property
     def area(self) -> float:
         """Total area of every core, the off-chip one included (cores whose area cannot be computed count as
-        0). The schedule searches compare compute-core area only, so they do not use this."""
+        0), plus the interconnect's. The schedule searches compare compute-core and interconnect area only, so
+        they do not use this."""
         total_area = 0.0
         for core in self.core_list:
             try:
@@ -409,7 +416,27 @@ class Accelerator:
                 continue
             if area is not None:
                 total_area += area
-        return total_area
+        return total_area + self.interconnect_area().total
+
+    def interconnect_area(self, model: InterconnectAreaModel | None = None) -> InterconnectArea:
+        """Area of the routers, links and bus joining the compute cores (see `interconnect_area`). A link is as
+        wide as its `width` says, else as its bandwidth; the off-chip core is reached over the bus, so links to it
+        count as bus ports. Compute cores whose area cannot be computed count as 0."""
+        model = model or InterconnectAreaModel()
+        core_area: dict[int, float] = {}
+        for core in self.core_list:
+            if core.id == self.offchip_core_id:
+                continue
+            try:
+                core_area[core.id] = float(core.get_area() or 0.0)
+            except Exception:
+                core_area[core.id] = 0.0
+        links = [
+            (a.id, b.id, link.width if link.width is not None else link.bandwidth)
+            for a, b, link in ((a, b, data["cl"]) for a, b, data in self.cores.edges(data=True))
+            if link.bus_id < 0 and a.id in core_area and b.id in core_area
+        ]
+        return interconnect_area(physical_link_widths(links, model), core_area, model)
 
     @property
     def core_list(self) -> list[Core]:

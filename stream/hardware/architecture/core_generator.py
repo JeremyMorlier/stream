@@ -25,6 +25,10 @@ from stream.hardware.architecture.core import Core
 from stream.parser.core_validator import CoreValidator
 
 OPERANDS = ("I1", "I2", "O")
+# Area of one MAC unit in mm^2, so the operational array adds up with the CACTI memory areas (mm^2, 22 nm) and the
+# interconnect area (`interconnect_area`): about 350 GE for an 8-bit MAC with its pipeline register, at GF22's
+# 2e-7 mm^2/GE. A calibration point, not a synthesis result.
+MAC_UNIT_AREA_MM2 = 350 * 2e-7
 
 
 def _direction_allocations(operand: str) -> tuple[list[str], list[str]]:
@@ -188,7 +192,7 @@ def core_dict_from_params(
         "memories": memories,
         "operational_array": {
             "unit_energy": unit_energy,
-            "unit_area": 1,
+            "unit_area": MAC_UNIT_AREA_MM2,
             "dimensions": list(oa_dims),
             "sizes": oa_sizes,
         },

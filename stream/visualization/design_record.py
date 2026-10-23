@@ -265,6 +265,16 @@ def energy_breakdown(scme: Any) -> dict[str, Any]:
     return {key: _number(getattr(scme, attribute, None)) for key, attribute in ENERGY_FIELDS}
 
 
+def interconnect_record(accelerator: Any) -> dict[str, Any] | None:
+    """The interconnect area by part (`Accelerator.interconnect_area`), None if it cannot be computed."""
+    try:
+        # Rounded finer than `_number`: interconnect parts are hundredths of a mm^2.
+        return {key: round(value, 6) for key, value in accelerator.interconnect_area().as_dict().items()}
+    except Exception:
+        logger.warning("design_record: no interconnect area.", exc_info=True)
+        return None
+
+
 def design_record(scme: Any, **extra: Any) -> dict[str, Any]:
     """Everything the report shows about a measured design, from its `StreamCostModelEvaluation`. `extra` (e.g.
     a tiling configuration) is kept, with anything JSON cannot hold turned into strings."""
@@ -297,6 +307,7 @@ def design_record(scme: Any, **extra: Any) -> dict[str, Any]:
         "core_design": core_design,
         "schedule": schedule_record(scme),
         "energy": energy_breakdown(scme),
+        "interconnect": interconnect_record(accelerator),
         **({"extra": json.loads(json.dumps(extra, default=str))} if extra else {}),
     }
 

@@ -32,9 +32,16 @@ What the model takes from the schedule space (all computed by the full-matrix wa
 per-tile latency (`latency_attr`) and energy for every (tile shape, design) pair, design areas, and the tile
 dependency graph. What it leaves out, and leaves to the re-measurement:
 
-- **transfers between cores.** The derived topologies give every link a bandwidth equal to the total traffic of
-  its core pair, so any on-chip transfer takes about one cycle in Stream's model; it is neglected here. Transfer
-  energy is zero in the accelerator templates (`unit_energy_cost: 0`).
+- **transfers between cores**, with `link_transfers="none"`: every link is as wide as the schedule space's
+  traffic-derived width, and transfers take no time. With `"timed"` (the default), the width of each link is a
+  decision among the interconnect model's `width_levels` -- wider costs router and wire area -- and every
+  transfer between two groups on different cores is an interval of `ceil(bits / ceil(width / splits))` cycles
+  that starts after its producer task and ends before its consumer starts, fetched just in time as Stream does,
+  and overlapping compute on both cores, since a link moves data as a DMA does (`_add_link_transfers`). The
+  measurement times links at the chosen widths (`InterconnectAreaModel.link_timing="width"`; with `"traffic"`
+  every link is as wide as its core pair's whole traffic, and transfers take about a cycle). Contention between
+  group pairs that end up on one physical link is left to the measurement. Transfer energy is zero in the
+  accelerator templates (`unit_energy_cost: 0`).
 - **off-chip traffic and memory capacity** (weight loads over the shared bus, eviction when a core hosting several
   layers runs out of memory). These are the extensions of section 5 of the note above; they are what most often
   makes a measured point slower than predicted. The bus can be modelled (`offchip_bus`). Every tensor Stream loads
@@ -47,8 +54,12 @@ dependency graph. What it leaves out, and leaves to the re-measurement:
     as Stream does (`_add_timed_loads`); the aggregate bound is kept as a redundant constraint.
   Bus contention with other transfers, and re-fetches after eviction, are not modelled.
 
-Area is exact (the sum of the chosen designs' areas, offchip excluded as everywhere else in the search), and so is
-compute energy up to the cost model.
+Area is the sum of the chosen designs' areas (offchip excluded as everywhere else in the search) plus the
+interconnect's (`ScheduleSpace.area_of`, see `interconnect_area`), and compute energy is exact up to the cost model.
+The interconnect follows the placement: a link joins two slots as soon as two groups that exchange data sit on them,
+as wide as the widest such pair (`_add_interconnect_area`), each pair's width fixed or chosen (`link_transfers`).
+Its routers and wires are exact up to the integer rounding of the wire pitch; the measured area is recomputed
+exactly.
 """
 
 import csv
@@ -63,6 +74,14 @@ from typing import Any, Literal
 import networkx as nx
 from ortools.sat.python import cp_model
 
+from stream.hardware.architecture.noc.interconnect_area import (
+    ROUTER_EXTRA_PORTS,
+    ROUTER_GE_PER_BIT,
+    ROUTER_GE_PER_PORT,
+    ROUTER_GE_PER_PORT_BIT,
+    InterconnectAreaModel,
+    fold_link_widths,
+)
 from stream.stages.generation.schedule_evaluation import ScheduleSearchStage, tile_key
 from stream.stages.generation.schedule_space import ScheduleSearchState, ScheduleSpace
 from stream.stages.generation.tiled_workload_accelerator_generation import renumber_merged_cores
@@ -71,13 +90,32 @@ from stream.workload.computation.computation_node import ComputationNode
 
 logger = logging.getLogger(__name__)
 
-# Integer scaling of the objectives for CP-SAT: latency is in whole cycles already; energy (pJ) and area (a.u.)
-# are rounded at these resolutions, fine against values of 1e8+ pJ and 1e2+ a.u.
+# Integer scaling of the objectives for CP-SAT: latency is in whole cycles already; energy (pJ) and area (mm^2) are
+# rounded at these resolutions, fine against values of 1e8+ pJ and 1e-1+ mm^2. One area unit is 1e-9 mm^2, so a
+# gate equivalent (2e-7 mm^2 in GF22) is a whole number of units.
 ENERGY_SCALE = 1.0
-AREA_SCALE = 100.0
+AREA_SCALE = 1e9
+# Core side lengths in the interconnect wire terms, in units per mm (micrometres).
+SIDE_SCALE = 1e3
 OBJECTIVES = ("latency", "energy", "area")
 # An epsilon grid needs at least its two end points.
 MIN_GRID_LEVELS = 2
+
+
+@dataclass(frozen=True)
+class LinkTransfer:
+    """The data a consumer task receives from one other group, over the link between the two groups' cores."""
+
+    producer: int  # producer group
+    consumer: int  # consumer group
+    source: int  # the producer group's last task feeding `target`
+    target: int  # consumer task
+    bits: int
+    splits: int  # inter-core splits of the consumer layer: the link's bandwidth is shared this many ways
+
+    def duration(self, width: int) -> int:
+        """Cycles it takes over a link `width` bits wide, at Stream's `ceil(width / splits)` bits per cycle."""
+        return math.ceil(self.bits / math.ceil(width / self.splits))
 
 
 @dataclass
@@ -93,6 +131,17 @@ class ModelSolution:
     # Every tile `(layer id, sub id)` by the model's start time (ties: sub id, then layer id). Used as the measurement's
     # scheduling order with `scheduling_order_source="model"`.
     scheduling_order: tuple[tuple[int, int], ...] = ()
+    # Width the model chose for each communicating group pair (unordered), with `link_transfers="timed"`; None when
+    # the widths are the traffic-derived ones of the schedule space.
+    group_link_widths: dict[tuple[int, int], int] | None = None
+
+    @property
+    def rolled_link_widths(self) -> dict[tuple[int, int], int] | None:
+        """The chosen widths of the rolled accelerator's links (unordered rolled core pair -> bits): each as wide as
+        the widest group pair it carries, as the model's area has it."""
+        if self.group_link_widths is None:
+            return None
+        return fold_link_widths(self.group_link_widths, renumber_merged_cores(self.slot_of_group))
 
     @property
     def key(self) -> tuple:
@@ -100,9 +149,11 @@ class ModelSolution:
         two solutions with the same accelerator, the first found (the anchors come first) keeps its order."""
         rolled_of = renumber_merged_cores(self.slot_of_group)
         slot_of_rolled = {rolled_of[group]: slot for group, slot in self.slot_of_group.items()}
+        widths = self.rolled_link_widths
         return (
             tuple(sorted(rolled_of.items())),
             tuple(self.design_of_slot[slot_of_rolled[core]] for core in range(len(slot_of_rolled))),
+            tuple(sorted(widths.items())) if widths is not None else (),
         )
 
 
@@ -132,6 +183,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         fold_allow_sibling_merge: bool = False,
         scheduling_order_source: Literal["generated", "model"] = "generated",
         offchip_bus: Literal["none", "aggregate", "timed"] = "none",
+        link_transfers: Literal["none", "timed"] = "timed",
         **kwargs: Any,
     ):
         """
@@ -156,6 +208,11 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             offchip_bus: how the off-chip loads over the shared bus enter the model's latency: `"none"`,
                 `"aggregate"` (a lower bound) or `"timed"` (a load interval before each task); see the module
                 docstring.
+            link_transfers: how core-to-core transfers enter the model: `"none"` (free, every link as wide as the
+                schedule space's traffic-derived width) or `"timed"` (each link's width is a decision, and every
+                transfer an interval on its link that overlaps compute); see the module docstring. `"timed"` only
+                matches the measurement when the interconnect model times links at their width
+                (`link_timing="width"`, the default).
         """
         super().__init__(list_of_callables, **kwargs)
         self.schedule_search = schedule_search
@@ -176,12 +233,15 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         if offchip_bus not in ("none", "aggregate", "timed"):
             raise ValueError(f"Unknown offchip_bus {offchip_bus!r}.")
         self.offchip_bus = offchip_bus
+        if link_transfers not in ("none", "timed"):
+            raise ValueError(f"Unknown link_transfers {link_transfers!r}.")
+        self.link_transfers = link_transfers
         self.search_budget = kwargs.get("search_budget")
         self.solve_log: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------------------------- problem data ------
 
-    def _build_problem(self) -> None:
+    def _build_problem(self) -> None:  # noqa: PLR0915
         """Everything the model needs, from the schedule space: groups, chunks, per-design durations and energies,
         design areas and the chunk dependency graph."""
         space = self.space
@@ -199,6 +259,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             raise ValueError(f"{type(self).__name__}: no design is cost-modelled on every tile shape.")
         self.design_keys: list[str] = sorted(self.designs)
         self.area_of: dict[str, float] = {key: space.costs.area[key] for key in self.design_keys}
+        self.interconnect_model: InterconnectAreaModel = space.interconnect_model
+        # Unordered group pair -> width of the link it needs when its groups sit on different cores.
+        self.group_link_widths: dict[tuple[int, int], int] = space.link_widths() or {}
 
         # Each group's tiles in tile order, split into contiguous chunks.
         tiles = [tile for tile in space.reference_workload.node_list if isinstance(tile, ComputationNode)]
@@ -261,14 +324,16 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         }
         dependencies = [(a, b) for a, b in graph.edges() if component_of[a] != component_of[b]]
         self.dropped_dependencies = graph.number_of_edges() - len(dependencies)
+        self._build_link_traffic(dependencies)
         self.chains = [
             (index, index + 1)
             for index in range(len(self.chunks) - 1)
             if self.chunks[index][0] == self.chunks[index + 1][0]
         ]
-        # Transitive reduction: transfers take no time in the model and every task lasts at least a cycle, so an
-        # edge implied by a path of others constrains nothing. Exact, and what keeps the tile level tractable
-        # (attention: ~100k tile edges, most of them implied).
+        # Transitive reduction: every task lasts at least a cycle, so an edge implied by a path of others constrains
+        # nothing. Exact, and what keeps the tile level tractable (attention: ~100k tile edges, most of them
+        # implied). The timed transfers are built from the unreduced edges (`_build_link_traffic`), so they keep
+        # every delay the reduction would hide.
         dag = nx.DiGraph()
         dag.add_nodes_from(range(len(self.chunks)))
         dag.add_edges_from(dependencies + self.chains)
@@ -280,6 +345,54 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             f"reduction of {len(dependencies)} ({self.dropped_dependencies} dropped inside mutually dependent "
             f"chunk sets)."
         )
+
+    def _build_link_traffic(self, dependencies: list[tuple[int, int]]) -> None:
+        """The core-to-core transfers of the timed link model, as `self.transfers`: one per (producer group,
+        consumer task) pair the kept chunk dependencies `dependencies` join across two groups, carrying the bits of
+        every tile edge between them. It can leave once the producer group's last task feeding the consumer has
+        ended (`source`; a group's tasks run in chain order). Dependencies dropped inside mutually dependent chunk
+        sets get no transfer, as they get no precedence; nor do pairs without a link in the topology (traffic inside
+        one layer)."""
+        space = self.space
+        dependency_set = set(dependencies)
+        bits_of_edge: dict[tuple[int, int], int] = {}
+        for producer, consumer, data in space.reference_workload.edges(data=True):
+            if not (isinstance(producer, ComputationNode) and isinstance(consumer, ComputationNode)):
+                continue
+            edge = (self.chunk_of_tile[tile_key(producer)], self.chunk_of_tile[tile_key(consumer)])
+            bits = data.get("bits", 0)
+            if bits > 0 and edge in dependency_set:
+                bits_of_edge[edge] = bits_of_edge.get(edge, 0) + bits
+
+        merged: dict[tuple[int, int], list[int]] = {}  # (producer group, consumer task) -> [source, bits]
+        unlinked_bits = 0
+        for (a, b), bits in bits_of_edge.items():
+            g, h = self.chunks[a][0], self.chunks[b][0]
+            if g == h:
+                continue
+            if (min(g, h), max(g, h)) not in self.group_link_widths:
+                unlinked_bits += bits
+                continue
+            entry = merged.setdefault((g, b), [a, 0])
+            entry[0] = max(entry[0], a)
+            entry[1] += bits
+        # Stream gives each of a node's transfers `1 / inter-core splits` of a link's bandwidth
+        # (`CoalaScheduler.get_transfer_bandwidth_fraction`), so that many share a link at once.
+        self.transfers: list[LinkTransfer] = [
+            LinkTransfer(
+                producer=g,
+                consumer=self.chunks[b][0],
+                source=source,
+                target=b,
+                bits=bits,
+                splits=max(1, self.chunk_tiles[b][0].get_total_inter_core_splits()),
+            )
+            for (g, b), (source, bits) in sorted(merged.items())
+        ]
+        if unlinked_bits:
+            logger.warning(
+                f"{type(self).__name__}: {unlinked_bits:.4g} bits between groups without a link are not timed."
+            )
 
     def _build_offchip_traffic(self, tiles: list[ComputationNode]) -> None:
         """The bits every core loads from off-chip, as `self.offchip_bits`: the tensors Stream places off-chip at
@@ -381,6 +494,95 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             f"{type(self).__name__}: {len(intervals)} timed load(s) on the bus, {sum(load_durations)} cycles in all."
         )
 
+    def _add_link_widths(self, model: cp_model.CpModel) -> None:
+        """One width per communicating group pair, among the interconnect model's `width_levels` (`width_choice`,
+        one-hot, and `group_width`). The link between two slots is as wide as the widest pair it carries
+        (`_add_interconnect_area`), and the pair's transfers take its width (`_add_link_transfers`): a wider link
+        costs router and wire area and saves transfer time. Hinted at the schedule space's traffic-derived
+        width."""
+        levels = self.interconnect_model.width_levels
+        for (g, h), heuristic in self.group_link_widths.items():
+            choice = {width: model.NewBoolVar(f"z_{g}_{h}_{width}") for width in levels}
+            model.AddExactlyOne(choice.values())
+            width_var = model.NewIntVar(min(levels), max(levels), f"gw_{g}_{h}")
+            model.Add(width_var == sum(width * literal for width, literal in choice.items()))
+            hint = min((width for width in levels if width >= heuristic), default=max(levels))
+            for width, literal in choice.items():
+                model.AddHint(literal, width == hint)
+            self.width_choice[g, h] = choice
+            self.group_width[g, h] = width_var
+
+    def _same_slot(self, model: cp_model.CpModel, g: int, h: int) -> Any | None:
+        """A literal that may only be true when groups `g` and `h` sit on one slot (None if they never can). Only
+        bounded from above: it frees their transfers, so the solver sets it whenever it can."""
+        together = []
+        for p in range(len(self.groups)):
+            if (g, p) in self.x and (h, p) in self.x:
+                literal = model.NewBoolVar(f"t_{g}_{h}_{p}")
+                model.AddImplication(literal, self.x[g, p])
+                model.AddImplication(literal, self.x[h, p])
+                together.append(literal)
+        if not together:
+            return None
+        same = model.NewBoolVar(f"same_{g}_{h}")
+        model.Add(same <= sum(together))
+        return same
+
+    def _add_link_transfers(self, model: cp_model.CpModel, horizon: int) -> None:
+        """One interval per transfer (`self.transfers`), off the cores: a link moves data the way a DMA does, so a
+        transfer overlaps whatever both cores compute meanwhile. It starts once its source task has ended, its
+        consumer task starts once it has ended, and it lasts `ceil(bits / ceil(width / splits))` cycles at its group
+        pair's chosen width -- none when both groups share a core. As in Stream, which starts a node's transfers
+        at most their own duration before its core becomes free (`CoalaScheduler.run`, step 2), it cannot end
+        before the previous task of its consumer's group has ended. The transfers of a directed group pair share
+        that link, `splits` at a time (Stream's bandwidth fraction).
+
+        Not modelled: contention between different group pairs that end up on the same physical link once their
+        groups are merged onto shared cores; the re-measurement accounts for it."""
+        previous_of = {b: a for a, b in self.chains}
+        levels = self.interconnect_model.width_levels
+        same_of: dict[tuple[int, int], Any] = {}
+        intervals_of_pair: dict[tuple[int, int], list[Any]] = {}
+        capacity_of_pair: dict[tuple[int, int], int] = {}
+        for index, transfer in enumerate(self.transfers):
+            g, h = transfer.producer, transfer.consumer
+            pair = (min(g, h), max(g, h))
+            if pair not in same_of:
+                same_of[pair] = self._same_slot(model, *pair)
+            same = same_of[pair]
+            durations = {width: transfer.duration(width) for width in levels}
+            duration = model.NewIntVar(0, max(durations.values()), f"td_{index}")
+            separated = sum(durations[width] * literal for width, literal in self.width_choice[pair].items())
+            if same is None:
+                model.Add(duration == separated)
+            else:
+                model.Add(duration == separated).OnlyEnforceIf(same.Not())
+                model.Add(duration == 0).OnlyEnforceIf(same)
+            start = model.NewIntVar(0, horizon, f"ts_{index}")
+            end = model.NewIntVar(0, horizon, f"te_{index}")
+            interval = model.NewIntervalVar(start, duration, end, f"transfer_{index}")
+            model.Add(start >= self.end[transfer.source])
+            model.Add(self.start[transfer.target] >= end)
+            if transfer.target in previous_of:
+                model.Add(end >= self.end[previous_of[transfer.target]])
+            intervals_of_pair.setdefault((g, h), []).append(interval)
+            capacity_of_pair[g, h] = max(capacity_of_pair.get((g, h), 1), transfer.splits)
+        for pair, intervals in intervals_of_pair.items():
+            if capacity_of_pair[pair] == 1:
+                model.AddNoOverlap(intervals)
+            else:
+                model.AddCumulative(intervals, [1] * len(intervals), capacity_of_pair[pair])
+        total_bits = sum(transfer.bits for transfer in self.transfers)
+        logger.info(
+            f"{type(self).__name__}: {len(self.transfers)} timed link transfer(s), {total_bits:.4g} bits over "
+            f"{len(intervals_of_pair)} directed group pair(s), widths among {levels}."
+        )
+        if self.level >= 3 and len(self.transfers) > 10_000:  # noqa: PLR2004
+            logger.warning(
+                f"{type(self).__name__}: {len(self.transfers)} transfer intervals at the tile level; the solver may "
+                f"need a much longer `solve_time_limit_s` (or `link_transfers='none'`)."
+            )
+
     # ----------------------------------------------------------------------------------------- model ---------
 
     def _build_model(self) -> None:  # noqa: PLR0912, PLR0915
@@ -394,6 +596,10 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         if self.offchip_bus == "timed":
             load_durations = [math.ceil(bits / self.bus_bandwidth) for bits in self.load_bits]
             horizon += sum(load_durations)
+        timed_links = self.link_transfers == "timed"
+        if timed_links:
+            narrowest = min(self.interconnect_model.width_levels)
+            horizon += sum(transfer.duration(narrowest) for transfer in self.transfers)
 
         self.y = {(p, key): model.NewBoolVar(f"y_{p}_{key}") for p in slots for key in keys}
         self.used = [model.NewBoolVar(f"u_{p}") for p in slots]
@@ -467,6 +673,11 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
 
         if self.offchip_bus == "timed":
             self._add_timed_loads(model, load_durations, horizon)
+        self.width_choice: dict[tuple[int, int], dict[int, Any]] = {}
+        self.group_width: dict[tuple[int, int], Any] = {}
+        if timed_links:
+            self._add_link_widths(model)
+            self._add_link_transfers(model, horizon)
 
         finishes = list(self.end)
         if self.offchip_bus != "none":
@@ -479,8 +690,91 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         self.energy = sum(self.group_energy_var.values())
         self.scaled_area = {key: round(self.area_of[key] * AREA_SCALE) for key in keys}
         self.area = sum(self.scaled_area[key] * self.y[p, key] for p in slots for key in keys)
+        model_of_interconnect = getattr(self, "interconnect_model", None)
+        if model_of_interconnect is not None and model_of_interconnect.enabled:
+            self.area = self.area + self._add_interconnect_area(model, model_of_interconnect)
         self.model = model
         self.objective_expr = {"latency": self.latency, "energy": self.energy, "area": self.area}
+
+    def _add_interconnect_area(self, model: cp_model.CpModel, ic: InterconnectAreaModel) -> Any:  # noqa: PLR0915
+        """The interconnect area (`interconnect_area`) in AREA_SCALE units, as a function of the placement.
+
+        A link joins slots `p < q` (`link[p, q]`) as soon as two groups that exchange data sit on them, and is as
+        wide as the widest such pair (`width[p, q]`, the `max` of `fold_link_widths`). Both are only bounded from
+        below: area is minimized or bounded above, so neither is ever larger than it has to be at an optimum.
+        Per used slot, with `k` its links and `W` their total width, the router of `router_ge` (its links plus
+        the bus and core ports) expands to a constant, `k`, `W` and the product `k W`; the link wires are
+        `pitch * side * (W + 64 k)` (each link runs half along each end) and the bus wires `pitch * wires(bus) *
+        side`, `side` the square root of the slot's design area."""
+        slots = range(len(self.groups))
+        pairs: dict[tuple[int, int], tuple[Any, Any]] = {}
+        max_width = ic.link_width_max
+        for (g, h), width in self.group_link_widths.items():
+            for p in slots:
+                if (g, p) not in self.x:
+                    continue
+                for q in slots:
+                    if q == p or (h, q) not in self.x:
+                        continue
+                    a, b = min(p, q), max(p, q)
+                    if (a, b) not in pairs:
+                        link = model.NewBoolVar(f"l_{a}_{b}")
+                        link_width = model.NewIntVar(0, max_width, f"w_{a}_{b}")
+                        model.Add(link_width <= max_width * link)
+                        pairs[a, b] = (link, link_width)
+                    link, link_width = pairs[a, b]
+                    both = self.x[g, p] + self.x[h, q] - 1
+                    model.Add(link >= both)
+                    if (g, h) in self.group_width:
+                        # The pair's chosen width, when both groups sit on these slots.
+                        model.Add(link_width >= self.group_width[g, h] - max_width + max_width * both)
+                    else:
+                        model.Add(link_width >= width * both)
+        self.link_vars = pairs
+
+        ge = round(ic.mm2_per_ge * AREA_SCALE)
+        wire = round(ic.mm_per_wire * AREA_SCALE / SIDE_SCALE)
+        side_of = {key: round(math.sqrt(max(0.0, self.area_of[key])) * SIDE_SCALE) for key in self.design_keys}
+        max_side = max(side_of.values(), default=0)
+        extra_width = ROUTER_EXTRA_PORTS * ic.bus_width
+        # router_ge(k + extra, W + extra_width), with k = W = 0 on an unused slot.
+        per_port = ROUTER_GE_PER_PORT + ROUTER_GE_PER_PORT_BIT * extra_width
+        per_bit = ROUTER_GE_PER_PORT_BIT * ROUTER_EXTRA_PORTS + ROUTER_GE_PER_BIT
+        per_used = (
+            ROUTER_GE_PER_PORT * ROUTER_EXTRA_PORTS
+            + ROUTER_GE_PER_PORT_BIT * ROUTER_EXTRA_PORTS * extra_width
+            + ROUTER_GE_PER_BIT * extra_width
+        )
+        half_fixed_wires = round(ic.wires(0) / 2)
+        terms = []
+        for p in slots:
+            incident = [pair for pair in pairs if p in pair]
+            side = sum(side_of[key] * self.y[p, key] for key in self.design_keys)
+            terms.append(ge * per_used * self.used[p] + wire * round(ic.wires(ic.bus_width)) * side)
+            if not incident:
+                continue
+            nb = len(incident)
+            ports = model.NewIntVar(0, nb, f"k_{p}")
+            model.Add(ports == sum(pairs[pair][0] for pair in incident))
+            width = model.NewIntVar(0, nb * max_width, f"W_{p}")
+            model.Add(width == sum(pairs[pair][1] for pair in incident))
+            port_width = model.NewIntVar(0, nb * nb * max_width, f"kW_{p}")
+            model.AddMultiplicationEquality(port_width, [ports, width])
+            # Each link runs half along each end: wires(w) / 2 = w + 64 of them along this slot's side.
+            half_wires = model.NewIntVar(0, nb * (max_width + half_fixed_wires), f"hw_{p}")
+            model.Add(half_wires == width + half_fixed_wires * ports)
+            wire_length = model.NewIntVar(0, max_side * nb * (max_width + half_fixed_wires), f"wl_{p}")
+            side_var = model.NewIntVar(0, max_side, f"side_{p}")
+            model.Add(side_var == side)
+            model.AddMultiplicationEquality(wire_length, [side_var, half_wires])
+            terms.append(
+                ge * (per_port * ports + ROUTER_GE_PER_PORT_BIT * port_width + per_bit * width) + wire * wire_length
+            )
+        logger.info(
+            f"{type(self).__name__}: interconnect area over {len(pairs)} possible link(s) between "
+            f"{len(self.group_link_widths)} communicating group pair(s)."
+        )
+        return sum(terms)
 
     # ----------------------------------------------------------------------------------------- solving -------
 
@@ -523,6 +817,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             model.AddHint(var, solver.Value(var))
         for var in self.y.values():
             model.AddHint(var, solver.Value(var))
+        for choice in self.width_choice.values():
+            for var in choice.values():
+                model.AddHint(var, solver.Value(var))
         return solution
 
     def _extract(self, solver: cp_model.CpSolver) -> ModelSolution:
@@ -541,6 +838,14 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             energy=solver.Value(self.energy) * ENERGY_SCALE,
             area=solver.Value(self.area) / AREA_SCALE,
             scheduling_order=tuple((layer, sub_id) for _start, sub_id, layer in sorted(timed)),
+            group_link_widths=(
+                {
+                    pair: next(width for width, var in choice.items() if solver.Value(var))
+                    for pair, choice in self.width_choice.items()
+                }
+                if self.width_choice
+                else None
+            ),
         )
 
     def _scaled(self, solution: ModelSolution, name: str) -> int:
@@ -607,11 +912,12 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         nb_cores = len(slot_of_rolled)
         design_key_of_core = {core: solution.design_of_slot[slot_of_rolled[core]] for core in range(nb_cores)}
         core_dict_of_core = {core: self.designs[key] for core, key in design_key_of_core.items()}
-        area = sum(space.costs.area[key] for key in design_key_of_core.values())
+        link_widths = solution.rolled_link_widths
+        area = space.area_of(design_key_of_core, rolled_of, link_widths)
         record_id = f"opt{self.level}-c{nb_cores}-{len(records)}"
         try:
             workload, accelerator, cost_lut, topology = space.assemble_rolled(
-                merge_of_core, core_dict_of_core, design_key_of_core
+                merge_of_core, core_dict_of_core, design_key_of_core, link_widths=link_widths
             )
             extra = (
                 {"provided_scheduling_order": list(solution.scheduling_order)}
@@ -637,6 +943,9 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             "latency": point[0],
             "energy": point[1],
             "area": point[2],
+            "interconnect_area": space.interconnect_of(design_key_of_core, rolled_of, link_widths).total,
+            "link_widths": link_widths,
+            "predicted_area": solution.area,
             # The schedule search's CSV calls the analytic estimate a bound; here it is the model's prediction.
             "latency_bound": solution.latency,
             "energy_bound": solution.energy,
@@ -645,7 +954,8 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             "fold_tolerance": "",
             "fold_objective": f"cpsat-level{self.level}",
             "fold_overlap": (
-                f"chunks={self.chunks_per_group} order={self.scheduling_order_source} bus={self.offchip_bus}"
+                f"chunks={self.chunks_per_group} order={self.scheduling_order_source} bus={self.offchip_bus} "
+                f"links={self.link_transfers}"
             ),
             "merge_of_core": merge_of_core,
             "design_key_of_core": design_key_of_core,
@@ -663,7 +973,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
         logger.info(
             f"{type(self).__name__}: measured {record_id}: {nb_cores} core(s), latency={point[0]:.6g} "
             f"(predicted {solution.latency:.6g}), energy={point[1]:.6g} (predicted {solution.energy:.6g}), "
-            f"area={area:.6g} (front: {len(archive.entries)})."
+            f"area={area:.6g} (predicted {solution.area:.6g}) (front: {len(archive.entries)})."
         )
         return "measured"
 
@@ -686,6 +996,11 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
                 f"{type(self).__name__}: needs the full shape x design cost matrix; raise `max_cme_matrix_cells`."
             )
         os.makedirs(self.out_dir, exist_ok=True)
+        if self.link_transfers == "timed" and not self.space.interconnect_model.timed_widths:
+            logger.warning(
+                f"{type(self).__name__}: links are timed in the model but measured at their traffic "
+                f"(`link_timing='traffic'`), where transfers take about a cycle: predictions will be pessimistic."
+            )
         t0 = time.perf_counter()
         self._build_problem()
         self._build_model()
@@ -705,6 +1020,7 @@ class ScheduleOptimizationStage(ScheduleSearchStage):
             "designs": len(self.design_keys),
             "dependencies": len(self.dependencies),
             "dropped_dependencies": self.dropped_dependencies,
+            "link_transfers": len(self.transfers) if self.link_transfers == "timed" else 0,
             "solves": len(self.solve_log),
             "solutions": len(solutions),
             **statuses,

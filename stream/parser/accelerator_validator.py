@@ -72,6 +72,10 @@ class AcceleratorValidator:
                     "bandwidth": {"type": "float", "min": 0, "required": True},
                     # Optional override of the global unit energy cost
                     "unit_energy_cost": {"type": "float", "min": 0, "required": False},
+                    # Optional physical width in bits, for the interconnect area (default: the bandwidth)
+                    "link_width": {"type": "float", "min": 0, "required": False},
+                    # Optional total traffic of the link's core pair in bits, informative only
+                    "traffic_bits": {"type": "float", "min": 0, "required": False},
                 },
             },
         },

@@ -16,6 +16,11 @@ For each workload, all methods run on one experiment directory, in this order:
    `--hv-rel-tol`) or `--tiling-max-time`, always finishing the generation in progress. Its own experiment
    directory (`tiling_ga/`): every candidate has its own tiling, fronts and cost matrix, so its search time is
    the whole wall time, preparation included. Its front is the union over every tiling explored.
+7. `placement_cpsat`, `placement_gurobi`: the placement optimization
+   (`stream.stages.generation.placement_optimization`) at `--placement-level` (tasks per group as for the levels),
+   solved with CP-SAT or as a Gurobi MILP -- the same model, the same epsilon grid and time limit, so the two
+   compare solvers only. At most `--max-cores` cores, a design usable on several, groups of one layer allowed to
+   share a core. Reports go to `placement_<solver>/` (`solves.csv` holds each solve's status, time and gap).
 
 Levels 1 and 2 reuse the fronts and the cost matrix, so all three choose from exactly the same designs with
 exactly the same per-tile costs; only the search over accelerators and schedules differs. Each method runs in its
@@ -58,6 +63,8 @@ METHODS = (
     "level2_ordered",
     "level3_ordered",
     "level2_tiling",
+    "placement_cpsat",
+    "placement_gurobi",
 )
 TILING_EXPERIMENT_ID = "tiling_ga"
 QUAD_CORE = "stream/inputs/examples/hardware/tpu_like_quad_core.yaml"
@@ -73,6 +80,9 @@ COLORS.update({f"level{n}_ordered": COLORS[f"level{n}"] for n in (1, 2, 3)})
 MARKERS = {"rolled": "o", "level1": "^", "level2": "s", "level3": "D"}
 MARKERS.update({f"level{n}_ordered": MARKERS[f"level{n}"] for n in (1, 2, 3)})
 COLORS["level2_tiling"], MARKERS["level2_tiling"] = COLORS["level2"], "P"
+# The two placement solvers share a hue and marker; Gurobi is drawn hollow.
+COLORS["placement_cpsat"] = COLORS["placement_gurobi"] = "#8a4fbf"
+MARKERS["placement_cpsat"] = MARKERS["placement_gurobi"] = "X"
 EXPERIMENT_ID = "schedule_search"
 
 logger = logging.getLogger(__name__)
@@ -181,8 +191,20 @@ def _level(method: str) -> int:
     return int(method.removesuffix("_ordered")[-1])
 
 
+def _placement_solver(method: str) -> str | None:
+    """`placement_gurobi` -> `gurobi`; None for the other methods."""
+    return method.removeprefix("placement_") if method.startswith("placement_") else None
+
+
+def _stats_key(method: str) -> str:
+    solver = _placement_solver(method)
+    return f"placement_{solver}" if solver else f"optimization_l{_level(method)}"
+
+
 def _out_dir_name(method: str) -> str:
-    """Report directory of a level method, next to the tiled workload."""
+    """Report directory of a level or placement method, next to the tiled workload."""
+    if _placement_solver(method):
+        return method
     suffix = "_ordered" if method.endswith("_ordered") else ""
     return f"schedule_optimization_l{_level(method)}{suffix}"
 
@@ -224,6 +246,31 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
         )
         search_time = stats.get("search_time_s", 0.0) + stats.get("rolled", {}).get("time_s", 0.0)
         measured = _read_schedules_csv(os.path.join(experiment_dir, "rolled_search", "schedules.csv"))
+    elif _placement_solver(method):
+        from stream.api import optimize_schedule_model
+
+        _best, pareto, stats = optimize_schedule_model(
+            **kwargs,
+            level=args.placement_level,
+            chunks_per_group=args.chunks,
+            placement_solver=_placement_solver(method),
+            max_cores=args.max_cores,
+            mip_gap=args.mip_gap,
+            solve_time_limit_s=args.solve_time,
+            optimization_search_dir=os.path.join(experiment_dir, _out_dir_name(method)),
+            solver_workers=args.workers,
+            area_levels=args.area_levels,
+            energy_levels=args.energy_levels,
+            offchip_bus=args.bus,
+            link_transfers=args.links,
+            link_timing=args.link_timing,
+        )
+        search_time = stats[_stats_key(method)]["total_time_s"]
+        measured = [
+            row
+            for row in _read_schedules_csv(os.path.join(experiment_dir, _out_dir_name(method), "schedules.csv"))
+            if row["id"].startswith("opt")
+        ]
     else:
         from stream.api import optimize_schedule_model
 
@@ -352,7 +399,7 @@ def compare(output_dir: str, workloads: list[str]) -> None:
             elif method == "level2_tiling":
                 measured_count = stats["measured"]
             else:
-                measured_count = stats[f"optimization_l{_level(method)}"].get("measured", 0)
+                measured_count = stats[_stats_key(method)].get("measured", 0)
             rows.append(
                 {
                     "workload": workload,
@@ -417,7 +464,7 @@ def _plot(workload: str, fronts: dict[str, list], path: str) -> None:
         for method, front in fronts.items():
             if not front:
                 continue
-            hollow = method.endswith("_ordered")
+            hollow = method.endswith("_ordered") or method == "placement_gurobi"
             ax.scatter([p[x] for p in front], [p[y] for p in front], label=f"{method} ({len(front)})",
                        marker=MARKERS[method], s=36, alpha=0.85,
                        facecolors="none" if hollow else COLORS[method],
@@ -450,6 +497,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hv-patience", type=int, default=2, help="level2_tiling: hypervolume patience, generations.")
     parser.add_argument("--hv-rel-tol", type=float, default=0.005, help="level2_tiling: hypervolume relative gain.")
     parser.add_argument("--tiling-population", type=int, default=4, help="level2_tiling: tiling GA population.")
+    parser.add_argument("--placement-level", type=int, default=2, choices=(1, 2, 3), help="placement_*: task level.")
+    parser.add_argument("--max-cores", type=int, default=None, help="placement_*: at most this many cores.")
+    parser.add_argument("--mip-gap", type=float, default=0.0, help="placement_gurobi: relative MIP gap.")
     parser.add_argument("--area-levels", type=int, default=5)
     parser.add_argument("--energy-levels", type=int, default=3)
     parser.add_argument("--workers", type=int, default=8)
@@ -493,7 +543,9 @@ def main() -> None:
                            "--hv-rel-tol", str(args.hv_rel_tol), "--tiling-population", str(args.tiling_population),
                            "--energy-levels", str(args.energy_levels), "--workers", str(args.workers),
                            "--output-dir", args.output_dir,
-                           "--bus", args.bus, "--links", args.links, "--link-timing", args.link_timing]  # fmt: skip
+                           "--bus", args.bus, "--links", args.links, "--link-timing", args.link_timing,
+                           "--placement-level", str(args.placement_level), "--mip-gap", str(args.mip_gap),
+                           *(["--max-cores", str(args.max_cores)] if args.max_cores else [])]  # fmt: skip
                 print(f"[{time.strftime('%H:%M:%S')}] {workload}/{method} -> {log_path}", flush=True)
                 with open(log_path, "w") as log:
                     code = subprocess.call(command, stdout=log, stderr=subprocess.STDOUT)

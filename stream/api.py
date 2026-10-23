@@ -1128,6 +1128,10 @@ def optimize_schedule_model(  # noqa: PLR0913
     offchip_bus: Literal["none", "aggregate", "timed"] = "none",
     link_transfers: Literal["none", "timed"] = "timed",
     link_timing: Literal["width", "traffic"] = "width",
+    placement_solver: Literal["cpsat", "gurobi"] | None = None,
+    max_cores: int | None = None,
+    placement_allow_sibling_merge: bool = True,
+    mip_gap: float = 0.0,
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]], dict[str, Any]]:
     """The rolled search's hardware/schedule decisions taken by one constraint model instead of branch and bound
     plus folding: `GroupScheduleOptimizationStage` (`level=1`, one task per layer group) or
@@ -1161,6 +1165,13 @@ def optimize_schedule_model(  # noqa: PLR0913
             on its link that overlaps compute).
         link_timing: what the measurement times a link's transfers with: its physical width (`"width"`) or its
             core pair's whole traffic (`"traffic"`, about one cycle per transfer -- the earlier convention).
+        placement_solver: `"cpsat"` or `"gurobi"` replaces the level's stage with the placement optimization
+            (`stream.stages.generation.placement_optimization`) solved by that solver: at most `max_cores` cores,
+            a design usable on several of them, groups of one layer allowed to share a core
+            (`placement_allow_sibling_merge`). `level` then only sets the tasks per group (1: one, 2:
+            `chunks_per_group`, 3: one per tile), `fold_allow_sibling_merge` is ignored, and the report goes to
+            `placement_<solver>/` (stats under `placement_<solver>`).
+        mip_gap: Gurobi's relative MIP gap with `placement_solver="gurobi"`.
 
     Returns:
         The best schedule by `sort_key`, the combined Pareto set as plain records (the optimized ones carry
@@ -1201,6 +1212,20 @@ def optimize_schedule_model(  # noqa: PLR0913
         2: ChunkScheduleOptimizationStage,
         3: TileScheduleOptimizationStage,
     }[level]
+    stats_key = f"optimization_l{level}"
+    if placement_solver is not None:
+        from stream.stages.generation.placement_optimization import (  # noqa: PLC0415
+            CpSatPlacementOptimizationStage,
+            GurobiPlacementOptimizationStage,
+        )
+
+        if placement_solver == "gurobi":
+            _sanity_check_gurobi_license()
+        optimization_stage = {
+            "cpsat": CpSatPlacementOptimizationStage,
+            "gurobi": GurobiPlacementOptimizationStage,
+        }[placement_solver]
+        stats_key = f"placement_{placement_solver}"
 
     stage_classes = [
         AcceleratorParserStage,
@@ -1261,6 +1286,10 @@ def optimize_schedule_model(  # noqa: PLR0913
         search_budget=search_budget,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
+        tasks_per_group={1: 1, 2: chunks_per_group, 3: None}[level],
+        max_cores=max_cores,
+        allow_sibling_merge=placement_allow_sibling_merge,
+        mip_gap=mip_gap,
     )
     t_start = _time.perf_counter()
     answers = [answer for answer in mainstage.run() if answer[0] is not None]
@@ -1271,7 +1300,7 @@ def optimize_schedule_model(  # noqa: PLR0913
     stats = extra_info["search_stats"]
     logger.info(
         f"optimize_schedule_model (level {level}): {len(extra_info['pareto_schedules'])} pareto schedule(s) in "
-        f"{_time.perf_counter() - t_start:.1f}s; {stats.get(f'optimization_l{level}')}."
+        f"{_time.perf_counter() - t_start:.1f}s; {stats.get(stats_key)}."
     )
     return best_scme, extra_info["pareto_schedules"], stats
 

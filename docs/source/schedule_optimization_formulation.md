@@ -121,6 +121,22 @@ Every design found is added to $\mathcal{C}$, and Step 2 cross-evaluates it like
 any design on any slot, so extra candidates can only improve the front. Their cost is a larger
 $D = |\mathcal{C}|$ in the $y$ and $z$ variable families.
 
+**Implementation.** `CoreOptimizationStage` (`stream/stages/generation/core_optimization.py`) builds this pool. It
+runs the per-tile search of case 1, then one weighted NSGA2 per target of cases 2 to 4. Each search is seeded with
+the case 1 designs of the classes the target covers. The designs it finds are added to the front of every one of
+those classes. Targets that cover a single class, or the same classes and counts as an earlier target, are dropped.
+For case 3, the classes are clustered with Ward's linkage on the $\log_2$ of their loop sizes
+($K$, $C$, $OX \cdot OY$, $FX \cdot FY$, $G$) and of their MAC count. The stage is enabled by passing
+`core_optimization={...}` to the schedule APIs; without it, `CoreArchitectureExplorationStage` runs case 1 alone.
+Its knobs are:
+
+- `core_operator_targets` (default on), for case 2;
+- `nb_shared_clusters` (default $\lceil\sqrt{|\Sigma|}\rceil$, 0 to disable), for case 3;
+- `max_fused_stack_length` (default 1, which disables case 4);
+- `shared_core_pareto_points`, the designs kept per target.
+
+The targets and their counts are written to `core_search/specialization_targets.csv`.
+
 **Case 4 depends on memory capacity.** The system model already sees the benefit of fusion: a transfer costs
 nothing when both groups share a core. It does not see the cost of fusion, a larger memory, because on-chip
 capacity is out of scope (section 9). Without capacity in the model, Step 3 will put a fused pair on a small

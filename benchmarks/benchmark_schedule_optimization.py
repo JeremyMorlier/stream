@@ -106,6 +106,7 @@ def _common_kwargs(workload_path: str, workload: str, out_root: str, args: argpa
         "core_max_workers": args.workers,
         "cacti_precompute_workers": args.workers,
         "reuse_pareto_fronts": True,
+        **({"core_optimization": {"nb_shared_clusters": args.shared_clusters}} if args.core_optimization else {}),
     }
 
 
@@ -517,6 +518,15 @@ def _parse_args() -> argparse.Namespace:
         default="width",
         help="Measurement: links timed at their physical width, or at their pair's whole traffic (1-cycle transfers).",
     )
+    parser.add_argument(
+        "--core-optimization",
+        action="store_true",
+        help="Build the core pool with CoreOptimizationStage (cases 1-3) instead of the per-tile fronts alone. "
+        "Results overwrite those of a run without it, so give it its own --output-dir.",
+    )
+    parser.add_argument(
+        "--shared-clusters", type=int, default=None, help="--core-optimization: clusters of shape classes (case 3)."
+    )
     parser.add_argument("--compare-only", action="store_true", help="Only rebuild the comparison from results.")
     parser.add_argument("--single", nargs=2, metavar=("WORKLOAD", "METHOD"), help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -545,7 +555,10 @@ def main() -> None:
                            "--output-dir", args.output_dir,
                            "--bus", args.bus, "--links", args.links, "--link-timing", args.link_timing,
                            "--placement-level", str(args.placement_level), "--mip-gap", str(args.mip_gap),
-                           *(["--max-cores", str(args.max_cores)] if args.max_cores else [])]  # fmt: skip
+                           *(["--max-cores", str(args.max_cores)] if args.max_cores else []),
+                           *(["--core-optimization"] if args.core_optimization else []),
+                           *(["--shared-clusters", str(args.shared_clusters)]
+                             if args.shared_clusters is not None else [])]  # fmt: skip
                 print(f"[{time.strftime('%H:%M:%S')}] {workload}/{method} -> {log_path}", flush=True)
                 with open(log_path, "w") as log:
                     code = subprocess.call(command, stdout=log, stderr=subprocess.STDOUT)

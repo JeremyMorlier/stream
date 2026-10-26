@@ -36,6 +36,7 @@ from stream.stages.generation.core_architecture_exploration import (
     CoreParamRanges,
     CustomCoreAcceleratorGenerationStage,
 )
+from stream.stages.generation.core_optimization import CoreOptimizationStage
 from stream.stages.generation.graph_evolution import GraphEvolutionStage
 from stream.stages.generation.layer_stacks_generation import LayerStacksGenerationStage
 from stream.stages.generation.schedule_exploration import ScheduleExplorationStage
@@ -69,6 +70,12 @@ MEASUREMENT_STAGES = [
 # Draw a schedule search's results. They sit before the search stages so they see what the search yields; the
 # innermost one (results writer) runs first.
 SCHEDULE_REPORT_STAGES = [TopologyReportStage, ScheduleTradeoffPlotStage, ScheduleResultsWriterStage]
+
+
+def _core_search_stage(core_optimization: dict[str, Any] | None) -> type[CoreArchitectureExplorationStage]:
+    """The stage building the core pool: the per-tile search alone, or `CoreOptimizationStage` when its
+    arguments are given."""
+    return CoreArchitectureExplorationStage if core_optimization is None else CoreOptimizationStage
 
 
 def _sanity_check_inputs(
@@ -691,6 +698,7 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     search_budget: SearchBudget | None = None,
     core_convergence_patience: int | None = None,
     core_rel_tol: float = 0.005,
+    core_optimization: dict[str, Any] | None = None,
     stats_out: dict[str, Any] | None = None,
     link_timing: Literal["width", "traffic"] = "width",
 ) -> tuple[StreamCostModelEvaluation, list[dict[str, Any]]]:
@@ -709,6 +717,9 @@ def optimize_rolled_schedules(  # noqa: PLR0913
     carry `nb_cores`; rolled ones also carry their full fold, enough to rebuild the accelerator.
 
     Args:
+        core_optimization: when given, `CoreOptimizationStage` replaces `CoreArchitectureExplorationStage` and
+            these are its keyword arguments (`core_operator_targets`, `nb_shared_clusters`,
+            `max_fused_stack_length`, `shared_core_pareto_points`); `{}` runs it with its defaults.
         fold_overlap: "hull" merges only cores whose whole busy spans are disjoint (optimal colouring);
             "exact" compares the true busy sets and can fold further when layers interleave.
         fold_tolerances: the aggressiveness ladder -- a pair conflicts when it is busy at once for more than
@@ -765,7 +776,7 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
         *SCHEDULE_REPORT_STAGES,
-        CoreArchitectureExplorationStage,
+        _core_search_stage(core_optimization),
         ScheduleExplorationStage,
         ScheduleRollingStage,
         ScheduleSelectionStage,
@@ -824,6 +835,7 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         search_budget=search_budget,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
+        **(core_optimization or {}),
         interconnect_area_model={"link_timing": link_timing},
     )
 
@@ -979,6 +991,7 @@ def optimize_rolled_tiling(  # noqa: PLR0913
     nb_core_ga_individuals: int = 16,
     core_convergence_patience: int = 5,
     core_rel_tol: float = 0.005,
+    core_optimization: dict[str, Any] | None = None,
     core_max_workers: int | None = None,
     core_pareto_points: int = 10,
     core_param_ranges: dict[str, Any] | None = None,
@@ -1028,7 +1041,7 @@ def optimize_rolled_tiling(  # noqa: PLR0913
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
         *SCHEDULE_REPORT_STAGES,
-        CoreArchitectureExplorationStage,
+        _core_search_stage(core_optimization),
         ScheduleExplorationStage,
         ScheduleRollingStage,
         ScheduleSelectionStage,
@@ -1072,6 +1085,7 @@ def optimize_rolled_tiling(  # noqa: PLR0913
         nb_core_ga_individuals=nb_core_ga_individuals,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
+        **(core_optimization or {}),
         core_max_workers=core_max_workers,
         core_pareto_points=core_pareto_points,
         core_param_ranges=core_param_ranges,
@@ -1123,6 +1137,7 @@ def optimize_schedule_model(  # noqa: PLR0913
     search_budget: SearchBudget | None = None,
     core_convergence_patience: int | None = None,
     core_rel_tol: float = 0.005,
+    core_optimization: dict[str, Any] | None = None,
     measurement: Literal["ga", "co"] = "ga",
     scheduling_order_source: Literal["generated", "model"] = "generated",
     co_time_limit: int = 600,
@@ -1148,6 +1163,9 @@ def optimize_schedule_model(  # noqa: PLR0913
     experiment as `optimize_rolled_schedules` starts from exactly the same per-tile fronts and costs.
 
     Args:
+        core_optimization: when given, `CoreOptimizationStage` replaces `CoreArchitectureExplorationStage` and
+            these are its keyword arguments (`core_operator_targets`, `nb_shared_clusters`,
+            `max_fused_stack_length`, `shared_core_pareto_points`); `{}` runs it with its defaults.
         measurement: how every accelerator is scheduled once built. `"ga"` is the usual measurement chain
             (fixed allocation, Stream's scheduling order, `GeneticAlgorithmAllocationStage`). `"co"` is
             `ConstraintOptimizationAllocationStage` (Gurobi): it allocates one steady-state iteration of each fused
@@ -1237,7 +1255,7 @@ def optimize_schedule_model(  # noqa: PLR0913
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
         *SCHEDULE_REPORT_STAGES,
-        CoreArchitectureExplorationStage,
+        _core_search_stage(core_optimization),
         ScheduleExplorationStage,
         optimization_stage,
         ScheduleSelectionStage,
@@ -1289,6 +1307,7 @@ def optimize_schedule_model(  # noqa: PLR0913
         search_budget=search_budget,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
+        **(core_optimization or {}),
         tasks_per_group={1: 1, 2: chunks_per_group, 3: None}[level],
         max_cores=max_cores,
         allow_sibling_merge=placement_allow_sibling_merge,
@@ -1335,6 +1354,7 @@ def optimize_model_tiling(  # noqa: PLR0913
     nb_core_ga_individuals: int = 16,
     core_convergence_patience: int = 5,
     core_rel_tol: float = 0.005,
+    core_optimization: dict[str, Any] | None = None,
     core_max_workers: int | None = None,
     core_pareto_points: int = 10,
     core_param_ranges: dict[str, Any] | None = None,
@@ -1390,7 +1410,7 @@ def optimize_model_tiling(  # noqa: PLR0913
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
         *SCHEDULE_REPORT_STAGES,
-        CoreArchitectureExplorationStage,
+        _core_search_stage(core_optimization),
         ScheduleExplorationStage,
         optimization_stage,
         ScheduleSelectionStage,
@@ -1432,6 +1452,7 @@ def optimize_model_tiling(  # noqa: PLR0913
         nb_core_ga_individuals=nb_core_ga_individuals,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
+        **(core_optimization or {}),
         core_max_workers=core_max_workers,
         core_pareto_points=core_pareto_points,
         core_param_ranges=core_param_ranges,
@@ -1490,6 +1511,7 @@ def optimize_placement_tiling(  # noqa: PLR0913
     nb_core_ga_individuals: int = 16,
     core_convergence_patience: int = 5,
     core_rel_tol: float = 0.005,
+    core_optimization: dict[str, Any] | None = None,
     core_max_workers: int | None = None,
     core_pareto_points: int = 10,
     core_param_ranges: dict[str, Any] | None = None,
@@ -1543,7 +1565,7 @@ def optimize_placement_tiling(  # noqa: PLR0913
         TilingGenerationStage,
         TiledWorkloadGenerationStage,
         *SCHEDULE_REPORT_STAGES,
-        CoreArchitectureExplorationStage,
+        _core_search_stage(core_optimization),
         ScheduleExplorationStage,
         placement_stage,
         ScheduleSelectionStage,
@@ -1585,6 +1607,7 @@ def optimize_placement_tiling(  # noqa: PLR0913
         nb_core_ga_individuals=nb_core_ga_individuals,
         core_convergence_patience=core_convergence_patience,
         core_rel_tol=core_rel_tol,
+        **(core_optimization or {}),
         core_max_workers=core_max_workers,
         core_pareto_points=core_pareto_points,
         core_param_ranges=core_param_ranges,

@@ -259,7 +259,7 @@ class ParetoCoreSearchResult:
     Handed down the chain as `core_pareto_fronts`: `CoreDesignSelectionStage` keeps one design per tile,
     `ScheduleExplorationStage` searches combinations of all of them."""
 
-    designs_per_tile: list[list[dict[str, Any]]]  # per unique tile: [{"core_dict": ..., "fitness": (l, e, a)}]
+    designs_per_tile: list[list[dict[str, Any]]]  # per unique tile: [{"core_dict", "fitness": (l, e, a), "genes"}]
     unique_tiles: list[ComputationNode]
     tile_to_unique_index: dict[int, int]  # id(tile) -> index into `unique_tiles`
     original_nodes: list[ComputationNode]
@@ -683,16 +683,25 @@ def search_shared_core_front(  # noqa: PLR0913
             rel_tol=rel_tol,
             initial=initial,
         )
-    designs = [
+    designs = decode_designs(
+        [design for design in top_designs if all(math.isfinite(v) for v in design.fitness.values)],
+        gene_layout,
+        "core_shared",
+    )
+    return designs, history
+
+
+def decode_designs(top_designs: list[Any], gene_layout: CoreGeneLayout, name_prefix: str) -> list[dict[str, Any]]:
+    """Decode NSGA2 individuals into front entries `{"core_dict", "fitness", "genes"}`. The genes are kept so a
+    later search can be seeded with the design."""
+    return [
         {
-            "core_dict": gene_layout.decode_node(design, name=f"core_shared_rank_{rank}"),
+            "core_dict": gene_layout.decode_node(design, name=f"{name_prefix}_rank_{rank}"),
             "fitness": tuple(design.fitness.values),
             "genes": list(design),
         }
         for rank, design in enumerate(top_designs)
-        if all(math.isfinite(v) for v in design.fitness.values)
     ]
-    return designs, history
 
 
 def _record_evaluated_designs(
@@ -1018,15 +1027,7 @@ class CoreArchitectureExplorationStage(Stage):
         for tile_index, top_designs in enumerate(top_designs_per_tile):
             if not top_designs:
                 raise ValueError(f"CoreArchitectureExplorationStage: tile {tile_index} produced no valid core design.")
-            decoded_designs_per_tile.append(
-                [
-                    {
-                        "core_dict": gene_layout.decode_node(design, name=f"core_tile_{tile_index}_rank_{rank}"),
-                        "fitness": tuple(design.fitness.values),
-                    }
-                    for rank, design in enumerate(top_designs)
-                ]
-            )
+            decoded_designs_per_tile.append(decode_designs(top_designs, gene_layout, f"core_tile_{tile_index}"))
 
         os.makedirs(self.core_search_dir, exist_ok=True)
         pareto_fronts_path = os.path.join(self.core_search_dir, "pareto_fronts.pickle")

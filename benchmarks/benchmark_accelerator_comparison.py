@@ -5,7 +5,9 @@ Methods:
   tilings; each tiling candidate gets per-tile core fronts from a core NSGA2 (stopping on front hypervolume
   convergence), then the placement optimization at level 2 (`--chunks` tasks per layer group) picks the
   accelerator and schedule, solved with CP-SAT or as a Gurobi MILP -- the same model, epsilon grid and solve time,
-  so the two differ by solver only. The tiling GA selects candidates by hypervolume contribution.
+  so the two differ by solver only. The model times the off-chip loads over the shared bus (`--bus`, default
+  `timed`). The tiling GA starts from the mapping's tiling plus random ones and selects candidates by hypervolume
+  contribution.
 - `tiling_coreopt_cpsat` / `tiling_coreopt_gurobi`: the same, with the core pool of `CoreOptimizationStage`
   instead of the per-tile fronts alone: per-tile fronts plus designs specialized for operators with several tile
   shapes and for clusters of similar shapes (`--shared-clusters`).
@@ -23,6 +25,10 @@ the same `SearchBudget` (`--max-time`, or the best EDP improving by less than `-
 the generation under way always finishes) and writes `trace.csv`, `summary.json` and `designs/` to
 `<output-dir>/<workload>/<method>/`. Analyze them with
 `python benchmarks/analyze_optimizer_comparison.py --results-dir <output-dir>`.
+
+One tiling candidate of the placement runs takes about as long as the default `--window`, so under that window the
+budget declares convergence before a second tiling generation starts. Their EDP window is `--placement-window`
+instead (default infinite): they stop at `--max-time` or when the tiling GA's hypervolume stalls (`--hv-patience`).
 
 Run: python benchmarks/benchmark_accelerator_comparison.py --max-time 10800 --window 1800 --workers 8
 """
@@ -72,6 +78,8 @@ FORWARDED_OPTIONS = (
     "frozen_graphs",
     "max_grid",
     "shared_clusters",
+    "bus",
+    "placement_window",
 )
 
 logger = logging.getLogger(__name__)
@@ -109,6 +117,7 @@ def _run_tiling_placement(  # noqa: PLR0913
         core_pareto_points=10,
         core_optimization=core_optimization,
         cacti_precompute_workers=args.workers,
+        offchip_bus=args.bus,
     )
 
 
@@ -145,16 +154,17 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
 
     workload_path = _export_workload(workload, os.path.join(run_dir, "workload.onnx"))
     layer_stacks = single_stack(workload_path)
+    placement = method.startswith(("tiling_placement_", "tiling_coreopt_"))
     budget = SearchBudget(
         args.max_time,
-        args.window,
+        args.placement_window if placement else args.window,
         args.rel_tol,
         os.path.join(run_dir, "trace.csv"),
         artifact_dir=os.path.join(run_dir, "designs"),
     )
     error = None
     try:
-        if method.startswith(("tiling_placement_", "tiling_coreopt_")):
+        if placement:
             solver = method.rsplit("_", 1)[1]
             mapping = QUAD_CORE_MAPPINGS[workload]
             core_optimization = (
@@ -228,6 +238,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--solve-time", type=float, default=20, help="tiling_placement: time limit per solve.")
     parser.add_argument("--max-cores", type=int, default=None, help="tiling_placement: core limit (default none).")
     parser.add_argument("--mip-gap", type=float, default=0.0, help="tiling_placement: Gurobi relative MIP gap.")
+    parser.add_argument(
+        "--bus",
+        default="timed",
+        choices=("none", "aggregate", "timed"),
+        help="tiling_placement: how the placement model accounts for the off-chip loads over the bus.",
+    )
+    parser.add_argument(
+        "--placement-window",
+        type=float,
+        default=float("inf"),
+        help="tiling_placement: convergence window of the placement runs, in seconds (see the docstring).",
+    )
     parser.add_argument(
         "--shared-clusters", type=int, default=None, help="tiling_coreopt: clusters of shape classes (default sqrt)."
     )

@@ -1526,6 +1526,9 @@ def optimize_placement_tiling(  # noqa: PLR0913
     run to hypervolume convergence), full cost matrix and placement sweep; `level` only sets the tasks per group
     (1: one, 2: `chunks_per_group`, 3: one per tile).
 
+    The tiling GA's first generation holds the mapping's own tiling (`SeededTilingExplorationStage`), the rest is
+    random.
+
     The placement model needs the full shape x design cost matrix: a candidate whose matrix exceeds
     `max_cme_matrix_cells` fails and is penalized by the GA.
 
@@ -1538,6 +1541,7 @@ def optimize_placement_tiling(  # noqa: PLR0913
         GurobiPlacementOptimizationStage,
     )
     from stream.stages.generation.scheduling_order_generation import ProvidedSchedulingOrderStage  # noqa: PLC0415
+    from stream.stages.generation.tiling_exploration import SeededTilingExplorationStage  # noqa: PLC0415
 
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
     if placement_solver == "gurobi":
@@ -1559,7 +1563,7 @@ def optimize_placement_tiling(  # noqa: PLR0913
         AcceleratorParserStage,
         StreamONNXModelParserStage,
         LayerStacksGenerationStage,
-        TilingExplorationStage,
+        SeededTilingExplorationStage,
     ]
     per_candidate_stage_classes = [
         TilingGenerationStage,

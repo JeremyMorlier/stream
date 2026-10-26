@@ -380,6 +380,28 @@ def build_tiling_genes(workload: ONNXWorkload) -> list[TilingGene]:
     return genes
 
 
+def mapping_individual(workload: ONNXWorkload, genes: list[TilingGene]) -> list[int]:
+    """The gene indices of the tiling the mapping gives every layer (`all` is the dimension's size, `*` the layer's
+    core count). A factor no candidate offers falls back to index 0, no split."""
+    nodes = {node.id: node for node in workload.node_list if isinstance(node, ComputationNode)}
+    individual: list[int] = []
+    for gene in genes:
+        node = nodes[gene.node_id]
+        if gene.kind == "intra":
+            factor = 1
+            for dim, value in node.intra_core_tiling:
+                if dim == gene.dim:
+                    factor *= node.layer_dim_sizes[dim] if value == "all" else int(value)
+            individual.append(gene.candidates.index(factor) if factor in gene.candidates else 0)
+        else:
+            choice = None
+            for dim, value in node.inter_core_tiling[:1]:
+                factor = len(node.possible_core_allocation) if value == "*" else int(value)
+                choice = (dim, factor) if factor > 1 else None
+            individual.append(gene.candidates.index(choice) if choice in gene.candidates else 0)
+    return individual
+
+
 def scme_objective(scme: Any, sort_key: str) -> float:
     """The scalar a candidate is ranked by: a `StreamCostModelEvaluation` attribute (`latency`, `energy`), or
     `edp`, the latency x energy product."""
@@ -737,7 +759,7 @@ class TilingExplorationStage(Stage):
 
                 toolbox.register("map", _dedup_map)
 
-                population = toolbox.population(n=self.nb_tiling_ga_individuals)
+                population = self._initial_population(toolbox, genes)
                 hall_of_fame = tools.HallOfFame(min(10, self.nb_tiling_ga_individuals))
                 statistics = tools.Statistics(lambda ind: ind.fitness.values)
                 statistics.register("min", lambda values: min(v[0] for v in values))
@@ -818,6 +840,10 @@ class TilingExplorationStage(Stage):
                 info=f"tiling {key}",
                 artifact=lambda: design_record(scme, tiling=format_tiling(extra_info.get("tiling_config"))),
             )
+
+    def _initial_population(self, toolbox: base.Toolbox, genes: list[TilingGene]) -> list[Any]:
+        """The GA's first generation: random individuals."""
+        return toolbox.population(n=self.nb_tiling_ga_individuals)
 
     def _run_until_budget(
         self,
@@ -956,3 +982,22 @@ class TilingExplorationStage(Stage):
 
     def _build_genes(self) -> list[TilingGene]:
         return build_tiling_genes(self.workload)
+
+
+class SeededTilingExplorationStage(TilingExplorationStage):
+    """`TilingExplorationStage` whose first generation holds the mapping's own tiling (`mapping_individual`), the
+    rest random, so the search starts from the hand-written tiling the other searches start from."""
+
+    def _initial_population(self, toolbox: base.Toolbox, genes: list[TilingGene]) -> list[Any]:
+        population = super()._initial_population(toolbox, genes)
+        seed = mapping_individual(self.workload, genes)
+        if not _respects_tiling_constraints(seed, genes):
+            logger.warning(
+                "SeededTilingExplorationStage: the mapping's tiling breaks the tiling constraints; not seeded."
+            )
+            return population
+        population[0][:] = array.array("i", seed)
+        logger.info(
+            f"SeededTilingExplorationStage: seeded with the mapping's tiling (candidate {_candidate_key(seed)})."
+        )
+        return population

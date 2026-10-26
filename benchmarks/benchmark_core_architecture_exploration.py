@@ -12,7 +12,7 @@ and samples several random candidates per unique tile, reporting the same phase 
 of them -- a statistically meaningful picture of where `CoreArchitectureExplorationStage` spends its time,
 rather than one data point.
 
-Usage: `python benchmark_core_architecture_exploration.py [options]` (see --help).
+Usage: `python benchmarks/benchmark_core_architecture_exploration.py [options]` (see --help).
 """
 
 import argparse

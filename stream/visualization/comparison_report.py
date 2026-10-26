@@ -1,4 +1,4 @@
-"""The page for browsing an optimizer comparison (`benchmark_optimizer_comparison.py` output).
+"""The page for browsing an optimizer comparison (`benchmarks/benchmark_optimizer_comparison.py` output).
 
 The sibling of `topology_report`: where that page browses one exploration's Pareto front, this one puts the
 compared methods side by side for one workload at a time --
@@ -13,7 +13,7 @@ compared methods side by side for one workload at a time --
   added/removed links highlighted), **schedule** (a Gantt of the cores and links, drag to zoom) and **core
   configurations** (a schematic of each distinct core design's memory hierarchy, with every level's sizes,
   bandwidths and costs);
-- the per-run **comparison table** of `analyze_optimizer_comparison.py`.
+- the per-run **comparison table** of `benchmarks/analyze_optimizer_comparison.py`.
 
 The page inlines only what the overview needs (objectives and topology of each point). Each point's design
 record (schedule, memory hierarchies, energy breakdown -- see `design_record`) goes to its own
@@ -45,6 +45,10 @@ METHOD_STYLES: dict[str, dict[str, Any]] = {
     "graph_ga": {"color": "--m-graph", "marker": "triangle", "dash": False},
     "grid_2x2": {"color": "--m-grid", "marker": "square", "dash": False},
     "grid_4x4": {"color": "--m-grid", "marker": "diamond", "dash": True},
+    # benchmarks/benchmark_accelerator_comparison.py: the placement runs share the rolled flow's family.
+    "tiling_placement_cpsat": {"color": "--m-rolled", "marker": "square", "dash": False},
+    "tiling_placement_gurobi": {"color": "--m-rolled", "marker": "diamond", "dash": True},
+    "edge_tpu_template": {"color": "--m-template", "marker": "circle", "dash": False},
 }
 DEFAULT_STYLE = {"color": "--m-other", "marker": "circle", "dash": True}
 
@@ -59,7 +63,7 @@ _TEMPLATE = r"""<!doctype html>
     --bg: #f7f7f5; --panel: #fcfcfb; --ink: #0b0b0b; --muted: #52514e; --line: #dcdcd6; --grid: #ebebe6;
     --accent: #2a78d6; --dominated: #c9c9c3; --added: #2e7d4f; --removed: #b23b3b;
     --offchip: #8d8d86; --bus: #a9a9a2; --select: #e7eefa;
-    --m-rolled: #2a78d6; --m-graph: #eb6834; --m-grid: #1baf7a; --m-other: #52514e;
+    --m-rolled: #2a78d6; --m-graph: #eb6834; --m-grid: #1baf7a; --m-template: #8a5cd6; --m-other: #52514e;
     --c1: #2a78d6; --c2: #eb6834; --c3: #1baf7a; --c4: #eda100; --c5: #e87ba4; --c6: #008300; --c7: #4a3aa7; --c8: #e34948;
     --c-other: #b5b4ae; --xfer: #8d8d86; --block: #d6d5cf;
   }
@@ -69,7 +73,7 @@ _TEMPLATE = r"""<!doctype html>
       --bg: #121211; --panel: #1a1a19; --ink: #ffffff; --muted: #c3c2b7; --line: #34352f; --grid: #262724;
       --accent: #3987e5; --dominated: #4a4c46; --added: #6bbd8c; --removed: #e07a7a;
       --offchip: #7d7f78; --bus: #5f625a; --select: #1f2b3d;
-      --m-rolled: #3987e5; --m-graph: #d95926; --m-grid: #199e70; --m-other: #c3c2b7;
+      --m-rolled: #3987e5; --m-graph: #d95926; --m-grid: #199e70; --m-template: #a07ce8; --m-other: #c3c2b7;
       --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
       --c-other: #5f625a; --xfer: #8d8d86; --block: #3d3e39;
     }
@@ -79,7 +83,7 @@ _TEMPLATE = r"""<!doctype html>
     --bg: #121211; --panel: #1a1a19; --ink: #ffffff; --muted: #c3c2b7; --line: #34352f; --grid: #262724;
     --accent: #3987e5; --dominated: #4a4c46; --added: #6bbd8c; --removed: #e07a7a;
     --offchip: #7d7f78; --bus: #5f625a; --select: #1f2b3d;
-    --m-rolled: #3987e5; --m-graph: #d95926; --m-grid: #199e70; --m-other: #c3c2b7;
+    --m-rolled: #3987e5; --m-graph: #d95926; --m-grid: #199e70; --m-template: #a07ce8; --m-other: #c3c2b7;
     --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
     --c-other: #5f625a; --xfer: #8d8d86; --block: #3d3e39;
   }

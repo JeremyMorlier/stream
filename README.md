@@ -36,8 +36,10 @@ uv sync
 | `main_stream_tiling.py`, `example_tiling_exploration.py` | Tiling GA, optionally with a per-tile core search (`optimize_tiling`). |
 | `example_schedule_exploration.py` | Schedule search over the per-tile core fronts (`optimize_schedules`). |
 | `example_rolled_schedule_exploration.py` | Schedule search plus rolling, and TikZ export of the front (`optimize_rolled_schedules`). |
-| `benchmark_optimizer_comparison.py`, `analyze_optimizer_comparison.py` | Rolled methodology vs. graph GA vs. grid baselines on one wall-clock budget, then the comparison report. |
-| `benchmark_core_architecture_exploration.py` | Profiles one core-design evaluation of the per-tile search. |
+| `benchmarks/benchmark_optimizer_comparison.py`, `benchmarks/analyze_optimizer_comparison.py` | Rolled methodology vs. graph GA vs. grid baselines on one wall-clock budget, then the comparison report. |
+| `benchmarks/benchmark_accelerator_comparison.py` | Tiling GA + per-tile cores + placement optimization (CP-SAT, Gurobi) vs. graph GA vs. edge_tpu template NSGA2, on the same budget and report. |
+| `benchmarks/benchmark_schedule_optimization.py` | Rolled search vs. the schedule-optimization model levels and the placement optimization, from identical inputs. |
+| `benchmarks/benchmark_core_architecture_exploration.py` | Profiles one core-design evaluation of the per-tile search. |
 
 Outputs go to `outputs/<experiment id>/`. The stage chains behind each entry point are described in
 [docs/source/optimization.md](docs/source/optimization.md), the stages themselves in

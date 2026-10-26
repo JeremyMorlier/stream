@@ -1,5 +1,5 @@
-"""Torch workloads of the examples and the optimizer comparison (`benchmark_optimizer_comparison.py`), exported
-to ONNX.
+"""Torch workloads of the examples and the optimizer comparison (`benchmarks/benchmark_optimizer_comparison.py`),
+exported to ONNX.
 
 - `TwoConvBlock`: two 3x3 convolutions, small enough for the tiling and schedule examples to finish in about a
   minute.

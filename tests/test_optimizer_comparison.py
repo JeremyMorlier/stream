@@ -22,8 +22,8 @@ from stream.visualization.design_record import (
     rolled_design_record,
 )
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import analyze_optimizer_comparison  # noqa: E402  -- a script at the repository root
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmarks"))
+import analyze_optimizer_comparison  # noqa: E402  -- a script in benchmarks/
 
 
 class FakeClock:

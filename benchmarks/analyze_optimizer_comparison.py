@@ -22,7 +22,7 @@ design record per front point (`designs/<n_eval>.json`); older runs are rebuilt 
 The hypervolume of each workload is taken on objectives normalized to [ideal, nadir * 1.1] over the union of
 all methods' fronts, so methods on one workload share a reference point and the value lies in [0, 1].
 
-Run: python analyze_optimizer_comparison.py [--results-dir outputs/optimizer_comparison]
+Run: python benchmarks/analyze_optimizer_comparison.py [--results-dir outputs/optimizer_comparison]
 """
 
 import argparse
@@ -39,7 +39,15 @@ from stream.visualization.comparison_report import write_comparison_report
 from stream.visualization.design_record import design_record, format_tiling, rolled_design_record
 from stream.visualization.optimizer_comparison import plot_convergence, plot_fronts, step2_start
 
-METHOD_ORDER = ("rolled", "graph_ga", "grid_2x2", "grid_4x4")
+METHOD_ORDER = (
+    "rolled",
+    "tiling_placement_cpsat",
+    "tiling_placement_gurobi",
+    "graph_ga",
+    "edge_tpu_template",
+    "grid_2x2",
+    "grid_4x4",
+)
 
 
 def read_trace(path: str) -> list[dict[str, float]]:

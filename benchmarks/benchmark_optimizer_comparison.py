@@ -26,7 +26,7 @@ hierarchies and schedule -- of every point on the run's Pareto front) to `<outpu
 `analyze_optimizer_comparison.py` turns those into convergence plots, Pareto fronts, a comparison table and
 the interactive report.
 
-Run: python benchmark_optimizer_comparison.py --max-time 10800 --window 1800 --rel-tol 0.005 --workers 8
+Run: python benchmarks/benchmark_optimizer_comparison.py --max-time 10800 --window 1800 --rel-tol 0.005 --workers 8
 """
 
 # The stream imports are deferred to the per-run subprocess, so the orchestrator stays light.

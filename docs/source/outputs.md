@@ -122,6 +122,6 @@ maps onto) and the best genome's `accelerator.yaml`.
 
 ### Optimizer comparison
 
-`benchmark_optimizer_comparison.py` writes a `trace.csv` (every measured design, with the best EDP so far)
-and a `summary.json` per run. `analyze_optimizer_comparison.py` turns them into `convergence_<workload>.png`,
+`benchmarks/benchmark_optimizer_comparison.py` writes a `trace.csv` (every measured design, with the best EDP so far)
+and a `summary.json` per run. `benchmarks/analyze_optimizer_comparison.py` turns them into `convergence_<workload>.png`,
 `pareto_<workload>.png`, `comparison.csv` and the interactive `comparison.html`.

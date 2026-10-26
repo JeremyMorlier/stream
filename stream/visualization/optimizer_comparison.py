@@ -1,5 +1,6 @@
-"""Static figures comparing optimizer runs on a common wall-clock budget (see `benchmark_optimizer_comparison.py`
-and `analyze_optimizer_comparison.py`): best-EDP convergence over time and the methods' Pareto fronts."""
+"""Static figures comparing optimizer runs on a common wall-clock budget (see
+`benchmarks/benchmark_optimizer_comparison.py` and `benchmarks/analyze_optimizer_comparison.py`): best-EDP
+convergence over time and the methods' Pareto fronts."""
 
 import math
 
@@ -8,7 +9,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-METHOD_COLORS = {"rolled": "#2a6fdb", "graph_ga": "#d1495b", "grid_2x2": "#2e933c", "grid_4x4": "#e09f3e"}
+METHOD_COLORS = {
+    "rolled": "#2a6fdb",
+    "graph_ga": "#d1495b",
+    "grid_2x2": "#2e933c",
+    "grid_4x4": "#e09f3e",
+    "tiling_placement_cpsat": "#1b4f9c",
+    "tiling_placement_gurobi": "#6a9be8",
+    "edge_tpu_template": "#8a5cd6",
+}
 
 
 def step2_start(trace: list[dict]) -> float | None:

@@ -7,6 +7,9 @@ stages (see `docs/source/optimization.md` for the chains).
 - `optimize_rolled_schedules`: the same, plus folding the accelerators onto fewer cores.
 - `optimize_rolled_tiling`: the tiling search wrapped around the rolled schedule search.
 - `optimize_graph_evolution`: evolving-graph search of the hardware graph and the mapping.
+- `optimize_schedule_model` / `optimize_model_tiling`: the schedule-optimization model, alone or under the tiling GA.
+- `optimize_placement_tiling`: the placement optimization under the tiling GA.
+- `optimize_template_accelerator`: NSGA2 over a homogeneous grid of one parameterized core template.
 """
 
 import csv
@@ -1453,3 +1456,256 @@ def optimize_model_tiling(  # noqa: PLR0913
         f"(best EDP on its front={best_extra_info.get('fitness')})."
     )
     return best_scme, answers
+
+
+def optimize_placement_tiling(  # noqa: PLR0913
+    hardware: str,
+    workload: str,
+    mapping: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    search_budget: SearchBudget,
+    placement_solver: Literal["cpsat", "gurobi"],
+    level: Literal[1, 2, 3] = 2,
+    max_cores: int | None = None,
+    placement_allow_sibling_merge: bool = True,
+    mip_gap: float = 0.0,
+    scheduling_order_source: Literal["generated", "model"] = "model",
+    tiling_fitness: Literal["sort_key", "hypervolume_contribution"] = "hypervolume_contribution",
+    hypervolume_patience: int | None = 2,
+    hypervolume_rel_tol: float = 0.005,
+    nb_tiling_ga_individuals: int = 4,
+    chunks_per_group: int = 8,
+    solve_time_limit_s: float = 20.0,
+    solver_workers: int = 8,
+    area_levels: int = 5,
+    energy_levels: int = 3,
+    max_cme_matrix_cells: int = 20_000,
+    temporal_mapping_type: str = "uneven",
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+    nb_core_ga_generations: int = 1000,
+    nb_core_ga_individuals: int = 16,
+    core_convergence_patience: int = 5,
+    core_rel_tol: float = 0.005,
+    core_max_workers: int | None = None,
+    core_pareto_points: int = 10,
+    core_param_ranges: dict[str, Any] | None = None,
+    cacti_precompute_workers: int | None = None,
+    offchip_bus: Literal["none", "aggregate", "timed"] = "none",
+    link_transfers: Literal["none", "timed"] = "timed",
+    link_timing: Literal["width", "traffic"] = "width",
+) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
+    """The placement optimization (`stream.stages.generation.placement_optimization`) under the tiling GA: the
+    chain of `optimize_model_tiling` with the placement stage solved by `placement_solver` (`"cpsat"` or
+    `"gurobi"`) in place of the level's stage. Every tiling candidate gets its own per-tile core fronts (core NSGA2
+    run to hypervolume convergence), full cost matrix and placement sweep; `level` only sets the tasks per group
+    (1: one, 2: `chunks_per_group`, 3: one per tile).
+
+    The placement model needs the full shape x design cost matrix: a candidate whose matrix exceeds
+    `max_cme_matrix_cells` fails and is penalized by the GA.
+
+    Returns:
+        As `optimize_model_tiling`. Each candidate's placement report goes to
+        `{output_path}/{experiment_id}/tiling_search/candidate_<key>/placement_<placement_solver>/`.
+    """
+    from stream.stages.generation.placement_optimization import (  # noqa: PLC0415
+        CpSatPlacementOptimizationStage,
+        GurobiPlacementOptimizationStage,
+    )
+    from stream.stages.generation.scheduling_order_generation import ProvidedSchedulingOrderStage  # noqa: PLC0415
+
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    if placement_solver == "gurobi":
+        _sanity_check_gurobi_license()
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+    logger = _logging.getLogger(__name__)
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+    placement_stage = {
+        "cpsat": CpSatPlacementOptimizationStage,
+        "gurobi": GurobiPlacementOptimizationStage,
+    }[placement_solver]
+
+    outer_stage_classes = [
+        AcceleratorParserStage,
+        StreamONNXModelParserStage,
+        LayerStacksGenerationStage,
+        TilingExplorationStage,
+    ]
+    per_candidate_stage_classes = [
+        TilingGenerationStage,
+        TiledWorkloadGenerationStage,
+        *SCHEDULE_REPORT_STAGES,
+        CoreArchitectureExplorationStage,
+        ScheduleExplorationStage,
+        placement_stage,
+        ScheduleSelectionStage,
+        SetFixedAllocationPerformanceStage,
+        ProvidedSchedulingOrderStage,
+        GeneticAlgorithmAllocationStage,
+    ]
+
+    ranges = CoreParamRanges(**(core_param_ranges or {}))
+    design_space = precompute_cacti_design_space(ranges, max_workers=cacti_precompute_workers)
+    install_cacti_monkeypatch(design_space)
+
+    mainstage = MainStage(
+        outer_stage_classes + per_candidate_stage_classes,
+        accelerator=hardware,
+        workload_path=workload,
+        mapping_path=mapping,
+        loma_lpf_limit=6,
+        mode=mode,
+        layer_stacks=layer_stacks,
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],
+        # Outer tiling GA.
+        tiling_candidates_dir=f"{output_path}/{experiment_id}/tiling_search",
+        scme_path=f"{output_path}/{experiment_id}/scme.pickle",
+        sort_key="edp",
+        nb_tiling_ga_generations=10**9,  # the budget or the hypervolume rule stops it
+        nb_tiling_ga_individuals=nb_tiling_ga_individuals,
+        candidate_results_csv_path=f"{output_path}/{experiment_id}/tiling_search_all_candidates.csv",
+        evaluate_in_process=True,
+        search_budget=search_budget,
+        tiling_fitness=tiling_fitness,
+        hypervolume_patience=hypervolume_patience,
+        hypervolume_rel_tol=hypervolume_rel_tol,
+        # Per-candidate core search, cost matrix and placement sweep.
+        nb_ga_generations=nb_ga_generations,
+        nb_ga_individuals=nb_ga_individuals,
+        nb_core_ga_generations=nb_core_ga_generations,
+        nb_core_ga_individuals=nb_core_ga_individuals,
+        core_convergence_patience=core_convergence_patience,
+        core_rel_tol=core_rel_tol,
+        core_max_workers=core_max_workers,
+        core_pareto_points=core_pareto_points,
+        core_param_ranges=core_param_ranges,
+        reuse_pareto_fronts=False,
+        max_schedule_evaluations=1,
+        max_cme_matrix_cells=max_cme_matrix_cells,
+        tasks_per_group={1: 1, 2: chunks_per_group, 3: None}[level],
+        max_cores=max_cores,
+        allow_sibling_merge=placement_allow_sibling_merge,
+        mip_gap=mip_gap,
+        solve_time_limit_s=solve_time_limit_s,
+        solver_workers=solver_workers,
+        area_levels=area_levels,
+        energy_levels=energy_levels,
+        scheduling_order_source=scheduling_order_source,
+        offchip_bus=offchip_bus,
+        link_transfers=link_transfers,
+        interconnect_area_model={"link_timing": link_timing},
+    )
+    answers = [answer for answer in mainstage.run() if answer[0] is not None]
+    if not answers:
+        raise ValueError("No tiling candidate produced a schedule.")
+    best_scme, best_extra_info = min(answers, key=lambda answer: answer[1].get("fitness", math.inf))
+    logger.info(
+        f"optimize_placement_tiling ({placement_solver}): best tiling candidate "
+        f"{best_extra_info['candidate_index']} of {len(answers)} "
+        f"(best EDP on its front={best_extra_info.get('fitness')})."
+    )
+    return best_scme, answers
+
+
+def optimize_template_accelerator(  # noqa: PLR0913
+    template_core: str,
+    workload: str,
+    mode: Literal["lbl"] | Literal["fused"],
+    layer_stacks: list[tuple[int, ...]],
+    experiment_id: str,
+    output_path: str,
+    search_budget: SearchBudget | None = None,
+    template_param_ranges: dict[str, Any] | None = None,
+    population_size: int = 16,
+    nb_template_generations: int = 10,
+    max_workers: int | None = None,
+    cacti_precompute_workers: int | None = None,
+    temporal_mapping_type: str = "uneven",
+    nb_ga_generations: int = 4,
+    nb_ga_individuals: int = 4,
+) -> tuple[StreamCostModelEvaluation, dict[str, Any]]:
+    """NSGA2 over a homogeneous grid of one core template (`TemplateExplorationStage`): the grid's rows and
+    columns, the template's array and memory sizes, and every layer's inter-core tiling. Memory costs come from
+    CACTI, precomputed for every size the search can pick.
+
+    `template_core` is a core file of `stream/inputs/examples/hardware/cores/` (e.g. `edge_tpu_like.yaml`). The
+    seed accelerator and its mapping are `grid_generator.write_template_grid` at the largest grid of
+    `template_param_ranges`; the mapping's intra-core tiling is kept for every design.
+
+    Returns:
+        The best design's schedule by EDP, and the search's extra info (`pareto_designs`: every design on the front
+        with its parameters and objectives). Every evaluated design is listed in
+        `{output_path}/{experiment_id}/template_search/evaluated_designs.csv`.
+    """
+    from stream.hardware.architecture.cacti_precompute import precompute_cacti_configs  # noqa: PLC0415
+    from stream.hardware.architecture.grid_generator import write_template_grid  # noqa: PLC0415
+    from stream.stages.generation.template_exploration import (  # noqa: PLC0415
+        CORES_DIR,
+        TemplateExplorationStage,
+        TemplateGeneLayout,
+        TemplateParamRanges,
+        load_template_core,
+    )
+
+    ranges = TemplateParamRanges(**(template_param_ranges or {}))
+    hardware, mapping = write_template_grid(template_core, ranges.max_rows, ranges.max_cols)
+    _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
+    os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
+    logger = _logging.getLogger(__name__)
+    if temporal_mapping_type == "uneven":
+        temporal_mapping_type = TemporalMappingType.UNEVEN
+    elif temporal_mapping_type == "even":
+        temporal_mapping_type = TemporalMappingType.EVEN
+    else:
+        raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
+    template_core_path = os.path.join(CORES_DIR, template_core)
+
+    # The memory sizes do not depend on the workload: precompute their costs before the stage's pool forks.
+    layout = TemplateGeneLayout(load_template_core(template_core_path), [], ranges)
+    install_cacti_monkeypatch(precompute_cacti_configs(layout.cacti_configs(), max_workers=cacti_precompute_workers))
+
+    mainstage = MainStage(
+        [
+            AcceleratorParserStage,
+            StreamONNXModelParserStage,
+            LayerStacksGenerationStage,
+            TemplateExplorationStage,
+            TilingGenerationStage,
+            TiledWorkloadGenerationStage,
+            ZigZagCoreMappingEstimationStage,
+            *MEASUREMENT_STAGES,
+        ],
+        accelerator=hardware,
+        workload_path=workload,
+        mapping_path=mapping,
+        loma_lpf_limit=6,
+        mode=mode,
+        layer_stacks=layer_stacks,
+        temporal_mapping_type=temporal_mapping_type,
+        operands_to_prefetch=[],
+        nb_ga_generations=nb_ga_generations,
+        nb_ga_individuals=nb_ga_individuals,
+        template_core_path=template_core_path,
+        template_search_dir=f"{output_path}/{experiment_id}/template_search",
+        template_param_ranges=template_param_ranges,
+        population_size=population_size,
+        nb_template_generations=nb_template_generations,
+        max_workers=max_workers,
+        search_budget=search_budget,
+    )
+    best_scme, extra_info = mainstage.run()[0]
+    pickle_save(best_scme, f"{output_path}/{experiment_id}/scme.pickle")  # type: ignore
+    logger.info(
+        f"optimize_template_accelerator: {extra_info['nb_evaluated']} design(s) evaluated, "
+        f"{len(extra_info['pareto_designs'])} on the front."
+    )
+    return best_scme, extra_info

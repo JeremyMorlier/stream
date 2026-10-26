@@ -371,7 +371,7 @@ Step 1 is the existing per-tile core search.
 | `stage.py` | `PlacementSweep` (section 6) and the stages `CpSatPlacementOptimizationStage` and `GurobiPlacementOptimizationStage` (section 7) |
 
 They are selected with `optimize_schedule_model(..., placement_solver="cpsat" | "gurobi", max_cores=N)` and run as
-the `placement_cpsat` and `placement_gurobi` methods of `benchmark_schedule_optimization.py`. Each solve is logged to
+the `placement_cpsat` and `placement_gurobi` methods of `benchmarks/benchmark_schedule_optimization.py`. Each solve is logged to
 `placement_<solver>/solves.csv` with its status, time, objective, bound and gap. `tests/test_placement_optimization.py`
 checks that the two backends reach the same optimum of every objective on random instances covering every option.
 

@@ -93,6 +93,30 @@ The alternative to the rolled methodology. Instead of deriving the topology from
 a free hardware graph (core designs, explicit links) together with the allocation onto it, then freezes the
 best graphs and evolves the mapping (tiling and allocation) on them. Artifacts go to `graph_search/`.
 
+### `optimize_placement_tiling`
+
+```
+... -> TilingExploration -> [TilingGeneration -> TiledWorkloadGeneration -> CoreArchitectureExploration
+    -> ScheduleExploration -> {CpSat,Gurobi}PlacementOptimization -> ScheduleSelection -> measurement]
+```
+
+The chain of `optimize_model_tiling` with the placement optimization in place of the level's stage: per tiling
+candidate, per-tile core fronts (core NSGA2 run to hypervolume convergence), the full cost matrix, then the
+placement sweep solved with CP-SAT or Gurobi. `level` only sets the tasks per group. Reports go to
+`tiling_search/candidate_<key>/placement_<solver>/`.
+
+### `optimize_template_accelerator`
+
+```
+AcceleratorParser -> ONNXModelParser -> LayerStacksGeneration -> TemplateExploration
+    -> [TilingGeneration -> TiledWorkloadGeneration -> ZigZagCoreMappingEstimation -> measurement]
+```
+
+NSGA2 over a homogeneous grid of one core template (e.g. `cores/edge_tpu_like.yaml`): grid rows and columns, the
+template's array-dimension and memory sizes (memory costs from CACTI, precomputed), and each layer's inter-core
+tiling. The intra-core tiling is the mapping's. The seed accelerator and mapping are written by
+`grid_generator.write_template_grid`. Every evaluated design is listed in `template_search/evaluated_designs.csv`.
+
 ---
 
 ## What the schedule search stages hand down
@@ -112,8 +136,13 @@ see [Stages](stages.md).
 
 ## Comparing the optimizers
 
-`benchmark_optimizer_comparison.py` runs the rolled methodology, the graph GA and tiling GAs on fixed 2x2 and 4x4
-grids under one wall-clock `SearchBudget`. `analyze_optimizer_comparison.py` then turns the runs into
+`benchmarks/benchmark_optimizer_comparison.py` runs the rolled methodology, the graph GA and tiling GAs on fixed 2x2 and 4x4
+grids under one wall-clock `SearchBudget`. `benchmarks/analyze_optimizer_comparison.py` then turns the runs into
 convergence and Pareto-front figures (`stream.visualization.optimizer_comparison`), a comparison table and an
 interactive page (`stream.visualization.comparison_report`). See the docstrings of both scripts for their
 options.
+
+`benchmarks/benchmark_accelerator_comparison.py` compares three accelerator design flows the same way: the
+tiling GA with per-tile core search and the level-2 placement optimization (CP-SAT and Gurobi), the graph GA, and
+the edge_tpu template NSGA2. Its output is read by the same analysis script (`--results-dir
+outputs/accelerator_comparison`).

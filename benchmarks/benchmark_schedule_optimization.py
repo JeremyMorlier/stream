@@ -36,7 +36,7 @@ The comparison (`comparison.csv`, `comparison.json`, `fronts_<workload>.png`) re
 - for the levels, the model's prediction error (median and max relative error of latency and energy over every
   measured solution).
 
-Run: python benchmark_schedule_optimization.py --workloads resnet attention --chunks 8 --solve-time 20 --workers 8
+Run: python benchmarks/benchmark_schedule_optimization.py --workloads resnet attention --chunks 8 --solve-time 20 --workers 8
 """
 
 # The stream imports are deferred to the per-run subprocess, so the orchestrator stays light.

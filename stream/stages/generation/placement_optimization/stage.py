@@ -30,6 +30,7 @@ from stream.stages.generation.schedule_optimization import (
 from stream.stages.generation.schedule_space import ScheduleSearchState, ScheduleSpace
 from stream.stages.generation.tiled_workload_accelerator_generation import renumber_merged_cores
 from stream.stages.stage import StageCallable
+from stream.visualization.design_record import design_record
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +238,7 @@ class PlacementOptimizationStage(ScheduleSearchStage):
             return "infeasible"
         point = (float(scme.latency), float(scme.energy), area)
         if self.search_budget is not None:
-            self.search_budget.record(*point, info=record_id)
+            self.search_budget.record(*point, info=record_id, artifact=lambda: design_record(scme))
         record = {
             "id": record_id,
             "kind": "rolled",

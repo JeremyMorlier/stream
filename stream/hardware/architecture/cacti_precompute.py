@@ -86,7 +86,15 @@ def precompute_cacti_design_space(
 
     `CactiParser`'s "CactiBatch" pool-file writes are exclusive-lock-protected (see module docstring), so
     dispatching the deduplicated config set concurrently is safe."""
-    configs = enumerate_cacti_configs(ranges)
+    return precompute_cacti_configs(enumerate_cacti_configs(ranges), max_workers=max_workers)
+
+
+def precompute_cacti_configs(
+    configs: set[CactiConfig], max_workers: int | None = None
+) -> dict[CactiConfig, CactiResult]:
+    """Resolves the given `(mem_type, size, r_bw)` configs via CACTI, in parallel (every available core when
+    `max_workers` is None), into the lookup `install_cacti_monkeypatch` takes. For searches whose design space is
+    not `CoreParamRanges`', e.g. `TemplateGeneLayout.cacti_configs`."""
     if not configs:
         return {}
 

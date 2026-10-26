@@ -16,6 +16,8 @@ METHOD_COLORS = {
     "grid_4x4": "#e09f3e",
     "tiling_placement_cpsat": "#1b4f9c",
     "tiling_placement_gurobi": "#6a9be8",
+    "tiling_coreopt_cpsat": "#0f2f66",
+    "tiling_coreopt_gurobi": "#3c7fd0",
     "edge_tpu_template": "#8a5cd6",
 }
 

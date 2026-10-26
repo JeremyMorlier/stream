@@ -6,6 +6,9 @@ Methods:
   convergence), then the placement optimization at level 2 (`--chunks` tasks per layer group) picks the
   accelerator and schedule, solved with CP-SAT or as a Gurobi MILP -- the same model, epsilon grid and solve time,
   so the two differ by solver only. The tiling GA selects candidates by hypervolume contribution.
+- `tiling_coreopt_cpsat` / `tiling_coreopt_gurobi`: the same, with the core pool of `CoreOptimizationStage`
+  instead of the per-tile fronts alone: per-tile fronts plus designs specialized for operators with several tile
+  shapes and for clusters of similar shapes (`--shared-clusters`).
 - `graph_ga` (`optimize_graph_evolution`): the two-step evolving-graph GA of `benchmark_optimizer_comparison.py`
   (core designs and links with the allocation, then the mapping on the frozen best graphs).
 - `edge_tpu_template` (`optimize_template_accelerator`): NSGA2 over a homogeneous grid of edge_tpu-like cores --
@@ -40,7 +43,14 @@ from concurrent.futures import ThreadPoolExecutor
 from benchmark_optimizer_comparison import NO_CAP, QUAD_CORE, QUAD_CORE_MAPPINGS, _export_workload, _run_graph_ga
 
 WORKLOADS = ("resnet", "attention")
-METHODS = ("tiling_placement_cpsat", "tiling_placement_gurobi", "graph_ga", "edge_tpu_template")
+METHODS = (
+    "tiling_placement_cpsat",
+    "tiling_placement_gurobi",
+    "tiling_coreopt_cpsat",
+    "tiling_coreopt_gurobi",
+    "graph_ga",
+    "edge_tpu_template",
+)
 # The options every run subprocess receives (the orchestrator-only ones are left out).
 FORWARDED_OPTIONS = (
     "max_time",
@@ -61,12 +71,15 @@ FORWARDED_OPTIONS = (
     "step1_patience",
     "frozen_graphs",
     "max_grid",
+    "shared_clusters",
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _run_tiling_placement(solver, workload_path, mapping, layer_stacks, out_root, experiment_id, budget, args):
+def _run_tiling_placement(  # noqa: PLR0913
+    solver, workload_path, mapping, layer_stacks, out_root, experiment_id, budget, args, *, core_optimization=None
+):
     from stream.api import optimize_placement_tiling
 
     return optimize_placement_tiling(
@@ -94,6 +107,7 @@ def _run_tiling_placement(solver, workload_path, mapping, layer_stacks, out_root
         core_rel_tol=args.rel_tol,
         core_max_workers=args.workers,
         core_pareto_points=10,
+        core_optimization=core_optimization,
         cacti_precompute_workers=args.workers,
     )
 
@@ -140,10 +154,23 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
     )
     error = None
     try:
-        if method.startswith("tiling_placement_"):
-            solver = method.removeprefix("tiling_placement_")
+        if method.startswith(("tiling_placement_", "tiling_coreopt_")):
+            solver = method.rsplit("_", 1)[1]
             mapping = QUAD_CORE_MAPPINGS[workload]
-            _run_tiling_placement(solver, workload_path, mapping, layer_stacks, out_root, method, budget, args)
+            core_optimization = (
+                {"nb_shared_clusters": args.shared_clusters} if method.startswith("tiling_coreopt_") else None
+            )
+            _run_tiling_placement(
+                solver,
+                workload_path,
+                mapping,
+                layer_stacks,
+                out_root,
+                method,
+                budget,
+                args,
+                core_optimization=core_optimization,
+            )
         elif method == "graph_ga":
             _run_graph_ga(workload_path, QUAD_CORE_MAPPINGS[workload], layer_stacks, out_root, method, budget, args)
         elif method == "edge_tpu_template":
@@ -201,6 +228,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--solve-time", type=float, default=20, help="tiling_placement: time limit per solve.")
     parser.add_argument("--max-cores", type=int, default=None, help="tiling_placement: core limit (default none).")
     parser.add_argument("--mip-gap", type=float, default=0.0, help="tiling_placement: Gurobi relative MIP gap.")
+    parser.add_argument(
+        "--shared-clusters", type=int, default=None, help="tiling_coreopt: clusters of shape classes (default sqrt)."
+    )
     parser.add_argument("--graph-step-fraction", type=float, default=0.5, help="graph_ga: max budget for step 1.")
     parser.add_argument("--step1-patience", type=int, default=5, help="graph_ga: step 1 convergence patience.")
     parser.add_argument("--frozen-graphs", type=int, default=4, help="graph_ga: graphs frozen for step 2.")

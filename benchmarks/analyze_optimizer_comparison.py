@@ -43,6 +43,8 @@ METHOD_ORDER = (
     "rolled",
     "tiling_placement_cpsat",
     "tiling_placement_gurobi",
+    "tiling_coreopt_cpsat",
+    "tiling_coreopt_gurobi",
     "graph_ga",
     "edge_tpu_template",
     "grid_2x2",

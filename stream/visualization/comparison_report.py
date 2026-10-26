@@ -48,6 +48,8 @@ METHOD_STYLES: dict[str, dict[str, Any]] = {
     # benchmarks/benchmark_accelerator_comparison.py: the placement runs share the rolled flow's family.
     "tiling_placement_cpsat": {"color": "--m-rolled", "marker": "square", "dash": False},
     "tiling_placement_gurobi": {"color": "--m-rolled", "marker": "diamond", "dash": True},
+    "tiling_coreopt_cpsat": {"color": "--m-rolled", "marker": "triangle", "dash": False},
+    "tiling_coreopt_gurobi": {"color": "--m-rolled", "marker": "triangle", "dash": True},
     "edge_tpu_template": {"color": "--m-template", "marker": "circle", "dash": False},
 }
 DEFAULT_STYLE = {"color": "--m-other", "marker": "circle", "dash": True}

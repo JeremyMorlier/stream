@@ -163,6 +163,15 @@ def test_core_cap_and_siblings() -> None:
         check_schedule(apart.backend.problem, result)
 
 
+def test_area_grid_is_geometric_from_the_slackened_minimum() -> None:
+    for backend_cls in BACKENDS:
+        sweep = sweep_of(backend_cls, build_problem())
+        sweep.run()
+        # Area 2 at the minimum, 20 at the fastest point; 3 levels with 10% slack: 2.2, then 2.2 * (20 / 2.2) ** 0.5.
+        bounds = sorted({entry["bound_area"] for entry in sweep.solve_log if entry["label"].startswith("grid")})
+        assert bounds == [round(2.2e9), round(2.2e9 * (20 / 2.2) ** 0.5)], (backend_cls.name, bounds)
+
+
 def test_bus_loads_shared_tensors_once_per_core() -> None:
     # Two sibling groups read the same 300-bit tensor over a 10 bits/cycle bus: 30 cycles on one core, 60 on two.
     for backend_cls in BACKENDS:

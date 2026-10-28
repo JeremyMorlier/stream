@@ -66,21 +66,25 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CoreParamRanges:
     """Search ranges for the per-tile core-architecture GA, mirroring `core_generator.random_core_dict`'s
-    tunable knobs (same names/defaults) so the GA searches exactly the parameter space that generator can
-    randomize, just deliberately (via NSGA2) instead of uniformly at random. Cost ranges (`*_cost_range`) are
+    tunable knobs (same names) so the GA searches the parameter space that generator can randomize, just
+    deliberately (via NSGA2) instead of uniformly at random. Cost ranges (`*_cost_range`) are
     intentionally absent: memories always use `auto_cost_extraction` now, so read/write cost and area are
-    inferred by ZigZag/CACTI rather than chosen."""
+    inferred by ZigZag/CACTI rather than chosen.
+
+    The memory floors are low enough for a core well under 1 mm^2 (CACTI puts a 1 MiB memory at about 2.4 mm^2),
+    and the levels of `optional_levels` ("rf", "sram", "upper") may also be left out (see `CoreGeneLayout`)."""
 
     operands: tuple[str, ...] = OPERANDS
     oa_dims: tuple[str, ...] = ("D1", "D2", "D3")
     oa_size_ranges: tuple[tuple[int, int], ...] = ((2, 32), (2, 32), (1, 8))
     rf_size_range: tuple[int, int] = (8, 1024)
     rf_bandwidth_choices: tuple[int, ...] = (16, 32, 64, 128)
-    sram_size_range: tuple[int, int] = (2**19, 2**24)
+    sram_size_range: tuple[int, int] = (2**16, 2**24)
     sram_bandwidth_choices: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
-    upper_size_range: tuple[int, int] = (2**23, 2**27)
+    upper_size_range: tuple[int, int] = (2**20, 2**27)
     upper_bandwidth_choices: tuple[int, ...] = (256, 512, 1024, 2048, 4096)
     unit_energy_range: tuple[float, float] = (0.01, 0.1)
+    optional_levels: tuple[str, ...] = ("upper",)
 
 
 def _snap(value: float, choices: tuple[int, ...]) -> int:
@@ -133,6 +137,20 @@ def _snap_size_to_grid(value: float, size_range: tuple[int, int]) -> int:
     return grid_values[step]
 
 
+def _size_gene_bounds(size_range: tuple[int, int], optional: bool) -> tuple[float, float]:
+    """Bounds of a size gene, which holds log2 of the size: the range spans orders of magnitude, and a linear gene
+    would almost never sample its low end. An optional level's gene reaches one unit lower, its omit band."""
+    log_low = math.log2(max(size_range[0], 8))
+    return (log_low - 1 if optional else log_low, max(log_low, math.log2(max(size_range[1], 1))))
+
+
+def _decode_size_gene(value: float, size_range: tuple[int, int], optional: bool) -> int:
+    """A size gene's memory size: 0 (omit the level) in an optional level's omit band, else the grid point."""
+    if optional and value < math.log2(max(size_range[0], 8)) - 0.5:
+        return 0
+    return _snap_size_to_grid(2**value, size_range)
+
+
 def _validate_core_dict(core_dict: dict[str, Any]) -> dict[str, Any]:
     """`core_dict_from_params` only builds the schema-*shaped* dict; it never runs Cerberus normalization, so
     fields the schema fills in with defaults are missing until this runs -- exactly like
@@ -148,7 +166,8 @@ def _validate_core_dict(core_dict: dict[str, Any]) -> dict[str, Any]:
 class CoreGeneLayout:
     """Flattens `CoreParamRanges` into a fixed-length, per-tile real-valued gene segment (bounds + decode), so a
     DEAP real-coded NSGA2 individual directly encodes one tile's core design (unlike the old whole-accelerator
-    search, there is exactly one segment per individual now -- the search unit is a single tile)."""
+    search, there is exactly one segment per individual now -- the search unit is a single tile). Size genes hold
+    log2 of the size (`_size_gene_bounds`)."""
 
     ranges: CoreParamRanges
     array_dims: list[str] = field(init=False)
@@ -166,16 +185,18 @@ class CoreGeneLayout:
         high: list[float] = []
         names: list[str] = []
         for operand in ranges.operands:
-            low += [ranges.rf_size_range[0], min(ranges.rf_bandwidth_choices), 0]
-            high += [ranges.rf_size_range[1], max(ranges.rf_bandwidth_choices), len(self.served_choices) - 1]
+            size_low, size_high = _size_gene_bounds(ranges.rf_size_range, self.is_optional("rf"))
+            low += [size_low, min(ranges.rf_bandwidth_choices), 0]
+            high += [size_high, max(ranges.rf_bandwidth_choices), len(self.served_choices) - 1]
             names += [f"rf_{operand}_size", f"rf_{operand}_bandwidth", f"rf_{operand}_served"]
 
         for prefix, size_range, bandwidth_choices in (
             ("sram", ranges.sram_size_range, ranges.sram_bandwidth_choices),
             ("upper", ranges.upper_size_range, ranges.upper_bandwidth_choices),
         ):
-            low += [size_range[0], min(bandwidth_choices), min(bandwidth_choices)]
-            high += [size_range[1], max(bandwidth_choices), max(bandwidth_choices)]
+            size_low, size_high = _size_gene_bounds(size_range, self.is_optional(prefix))
+            low += [size_low, min(bandwidth_choices), min(bandwidth_choices)]
+            high += [size_high, max(bandwidth_choices), max(bandwidth_choices)]
             names += [f"{prefix}_size", f"{prefix}_bandwidth_min", f"{prefix}_bandwidth_max"]
 
         for dim, size_range in zip(ranges.oa_dims, ranges.oa_size_ranges, strict=True):
@@ -191,6 +212,11 @@ class CoreGeneLayout:
         self.high = high
         self.names = names
 
+    def is_optional(self, level: str) -> bool:
+        """Whether the search may leave out memory level `level` ("rf", "sram" or "upper")."""
+        size_range = getattr(self.ranges, f"{level}_size_range")
+        return level in self.ranges.optional_levels or size_range[0] <= 0
+
     @property
     def n_genes_per_node(self) -> int:
         """Length of one core's gene segment."""
@@ -204,13 +230,13 @@ class CoreGeneLayout:
         idx = 0
         rf_memories: dict[str, dict[str, Any] | None] = {}
         for operand in ranges.operands:
-            size = _snap_size_to_grid(values[idx], ranges.rf_size_range)
+            size = _decode_size_gene(values[idx], ranges.rf_size_range, self.is_optional("rf"))
             bandwidth = _snap(values[idx + 1], ranges.rf_bandwidth_choices)
             served_index = max(0, min(int(round(values[idx + 2])), len(self.served_choices) - 1))
             rf_memories[operand] = build_rf_memory_dict(operand, size, bandwidth, self.served_choices[served_index])
             idx += 3
 
-        sram_size = _snap_size_to_grid(values[idx], ranges.sram_size_range)
+        sram_size = _decode_size_gene(values[idx], ranges.sram_size_range, self.is_optional("sram"))
         sram_bandwidth_min = _snap(values[idx + 1], ranges.sram_bandwidth_choices)
         sram_bandwidth_choices_at_least_min = tuple(b for b in ranges.sram_bandwidth_choices if b >= sram_bandwidth_min)
         sram_bandwidth_max = _snap(
@@ -221,7 +247,7 @@ class CoreGeneLayout:
         )
         idx += 3
 
-        upper_size = _snap_size_to_grid(values[idx], ranges.upper_size_range)
+        upper_size = _decode_size_gene(values[idx], ranges.upper_size_range, self.is_optional("upper"))
         upper_bandwidth_min = _snap(values[idx + 1], ranges.upper_bandwidth_choices)
         upper_bandwidth_choices_at_least_min = tuple(
             b for b in ranges.upper_bandwidth_choices if b >= upper_bandwidth_min

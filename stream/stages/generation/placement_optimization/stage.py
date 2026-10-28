@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 SOLVE_COLUMNS = ["solver", "label", "objective", "bound_latency", "bound_energy", "bound_area", "status", "time_s",
                  "objective_value", "objective_bound", "gap", "latency", "energy", "area"]  # fmt: skip
+# The area grid's first level is the minimum area plus this fraction (see `PlacementSweep.run`).
+AREA_SLACK = 0.1
 
 
 def scaled(solution: ModelSolution, name: str) -> int:
@@ -57,11 +59,13 @@ class PlacementSweep:
         solve_time_limit_s: float,
         area_levels: int,
         energy_levels: int,
+        area_slack: float = AREA_SLACK,
     ):
         self.backend = backend
         self.solve_time_limit_s = solve_time_limit_s
         self.area_levels = area_levels
         self.energy_levels = energy_levels
+        self.area_slack = area_slack
         self.solve_log: list[dict[str, Any]] = []
 
     def solve(self, objective: str, bounds: dict[str, int], time_limit: float, label: str) -> SolveResult:
@@ -98,7 +102,12 @@ class PlacementSweep:
 
     def run(self) -> list[ModelSolution]:
         """Anchors (each objective minimized first), then latency minimized over an (area, energy) budget grid
-        between each objective's minimum and its value at the latency-optimal point."""
+        between each objective's minimum and its value at the latency-optimal point.
+
+        The grid is geometric: the fastest point's area can be hundreds of times the minimum, and a linear grid
+        leaves the low-area region empty. The area grid starts at the minimum area plus `area_slack`, not at the
+        minimum: MACs cost little area next to memories, so the minimum-area point has a tiny array and is far
+        slower than a point with a full array at a few percent more area."""
         solutions: dict[tuple, ModelSolution] = {}
 
         def keep(solution: ModelSolution | None) -> None:
@@ -114,15 +123,15 @@ class PlacementSweep:
         if fastest is None:
             return list(solutions.values())
 
-        def grid(name: str, levels: int) -> list[int]:
+        def grid(name: str, levels: int, slack: float = 0.0) -> list[int]:
             if anchors[name] is None or levels < MIN_GRID_LEVELS:
                 return []
-            low, high = scaled(anchors[name], name), scaled(fastest, name)
-            if high <= low:
+            low, high = scaled(anchors[name], name) * (1 + slack), scaled(fastest, name)
+            if high <= low or low <= 0:
                 return []
-            return sorted({round(low + (high - low) * i / (levels - 1)) for i in range(levels - 1)})
+            return sorted({round(low * (high / low) ** (i / (levels - 1))) for i in range(levels - 1)})
 
-        for area_bound in grid("area", self.area_levels):
+        for area_bound in grid("area", self.area_levels, self.area_slack):
             for energy_bound in [None, *grid("energy", self.energy_levels)]:
                 bounds = {"area": area_bound}
                 if energy_bound is not None:
@@ -150,6 +159,7 @@ class PlacementOptimizationStage(ScheduleSearchStage):
         allow_sibling_merge: bool = True,
         area_levels: int = 5,
         energy_levels: int = 3,
+        area_slack: float = AREA_SLACK,
         solve_time_limit_s: float = 20.0,
         solver_workers: int = 8,
         mip_gap: float = 0.0,
@@ -168,6 +178,7 @@ class PlacementOptimizationStage(ScheduleSearchStage):
             max_cores: at most this many cores (slots); `None`: one per group.
             allow_sibling_merge: let two groups of the same layer share a core.
             area_levels, energy_levels: the epsilon-constraint grid.
+            area_slack: the area grid's first level, relative to the minimum area (see `PlacementSweep.run`).
             solve_time_limit_s: time limit per solve (half of it for the tie-break solves). A solve that times out
                 still contributes its best solution.
             solver_workers: solver threads.
@@ -197,6 +208,7 @@ class PlacementOptimizationStage(ScheduleSearchStage):
         self.allow_sibling_merge = allow_sibling_merge
         self.area_levels = area_levels
         self.energy_levels = energy_levels
+        self.area_slack = area_slack
         self.solve_time_limit_s = solve_time_limit_s
         self.solver_workers = solver_workers
         self.mip_gap = mip_gap
@@ -326,6 +338,7 @@ class PlacementOptimizationStage(ScheduleSearchStage):
             solve_time_limit_s=self.solve_time_limit_s,
             area_levels=self.area_levels,
             energy_levels=self.energy_levels,
+            area_slack=self.area_slack,
         )
         solutions = sweep.run()
         t_solve = time.perf_counter() - t0 - t_model

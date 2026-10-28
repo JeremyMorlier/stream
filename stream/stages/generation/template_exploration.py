@@ -60,6 +60,9 @@ SIMD_CORE_YAML_PATH = os.path.normpath(os.path.join(CORES_DIR, "simd.yaml"))
 # The stage a forked worker evaluates against, set right before the pool is created (as in `graph_evolution`).
 _WORKER_STAGE: "TemplateExplorationStage | None" = None
 
+# The fewest rows (memory size over port width) CACTI builds an SRAM with: 16 rows fail, 32 work.
+CACTI_MIN_SRAM_ROWS = 32
+
 
 @dataclass
 class TemplateParamRanges:
@@ -135,7 +138,9 @@ class TemplateGeneLayout:
 
     def _memory_sizes(self, memory: dict[str, Any]) -> list[int]:
         size = memory["size"]
-        floor = max(8, *(int(port["bandwidth_max"]) for port in memory["ports"]))
+        bandwidth = max(int(port["bandwidth_max"]) for port in memory["ports"])
+        # CACTI cannot build an SRAM of fewer than `CACTI_MIN_SRAM_ROWS` rows of its port width.
+        floor = max(8, bandwidth * (CACTI_MIN_SRAM_ROWS if memory["mem_type"] == "sram" else 1))
         low = max(size // self.ranges.memory_shrink, floor)
         high = max(size * self.ranges.memory_growth, low)
         if high == low:

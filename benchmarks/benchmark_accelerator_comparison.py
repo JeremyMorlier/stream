@@ -1,14 +1,13 @@
 """Compare three accelerator design flows on a common wall-clock budget.
 
 Methods:
-- `tiling_placement_cpsat` / `tiling_placement_gurobi` (`optimize_placement_tiling`): a GA over intra-/inter-core
-  tilings; each tiling candidate gets per-tile core fronts from a core NSGA2 (stopping on front hypervolume
-  convergence), then the placement optimization at level 2 (`--chunks` tasks per layer group) picks the
-  accelerator and schedule, solved with CP-SAT or as a Gurobi MILP -- the same model, epsilon grid and solve time,
-  so the two differ by solver only. The model times the off-chip loads over the shared bus (`--bus`, default
+- `tiling_placement_cpsat` (`optimize_placement_tiling`): a GA over intra-/inter-core tilings; each tiling
+  candidate gets per-tile core fronts from a core NSGA2 (stopping on front hypervolume convergence), then the
+  placement optimization at level 2 (`--chunks` tasks per layer group), solved with CP-SAT, picks the accelerator
+  and schedule. The model times the off-chip loads over the shared bus (`--bus`, default
   `timed`). The tiling GA starts from the mapping's tiling plus random ones and selects candidates by hypervolume
   contribution.
-- `tiling_coreopt_cpsat` / `tiling_coreopt_gurobi`: the same, with the core pool of `CoreOptimizationStage`
+- `tiling_coreopt_cpsat`: the same, with the core pool of `CoreOptimizationStage`
   instead of the per-tile fronts alone: per-tile fronts plus designs specialized for operators with several tile
   shapes and for clusters of similar shapes (`--shared-clusters`).
 - `graph_ga` (`optimize_graph_evolution`): the two-step evolving-graph GA of `benchmark_optimizer_comparison.py`
@@ -25,6 +24,12 @@ the same `SearchBudget` (`--max-time`, or the best EDP improving by less than `-
 the generation under way always finishes) and writes `trace.csv`, `summary.json` and `designs/` to
 `<output-dir>/<workload>/<method>/`. Analyze them with
 `python benchmarks/analyze_optimizer_comparison.py --results-dir <output-dir>`.
+
+The methods explore comparable area ranges: the placement runs have at most as many cores as the template's
+largest grid (`--max-cores`, default `--max-grid` squared; graph_ga has one per group of its seed tiling, 16 on
+`resnet` and 11 on `attention`), and the template's memories range from 1/`--template-memory-shrink` to
+`--template-memory-growth` times their size, so its top memory spans about the generated cores' upper-memory range.
+`--area-ranges` prints the per-core area range of each design space (CACTI) with the core caps, and exits.
 
 One tiling candidate of the placement runs takes about as long as the default `--window`, so under that window the
 budget declares convergence before a second tiling generation starts. Their EDP window is `--placement-window`
@@ -51,9 +56,7 @@ from benchmark_optimizer_comparison import NO_CAP, QUAD_CORE, QUAD_CORE_MAPPINGS
 WORKLOADS = ("resnet", "attention")
 METHODS = (
     "tiling_placement_cpsat",
-    "tiling_placement_gurobi",
     "tiling_coreopt_cpsat",
-    "tiling_coreopt_gurobi",
     "graph_ga",
     "edge_tpu_template",
 )
@@ -72,11 +75,12 @@ FORWARDED_OPTIONS = (
     "chunks",
     "solve_time",
     "max_cores",
-    "mip_gap",
     "graph_step_fraction",
     "step1_patience",
     "frozen_graphs",
     "max_grid",
+    "template_memory_shrink",
+    "template_memory_growth",
     "shared_clusters",
     "bus",
     "placement_window",
@@ -102,8 +106,7 @@ def _run_tiling_placement(  # noqa: PLR0913
         placement_solver=solver,
         level=2,
         chunks_per_group=args.chunks,
-        max_cores=args.max_cores,
-        mip_gap=args.mip_gap,
+        max_cores=_max_cores(args),
         solve_time_limit_s=args.solve_time,
         solver_workers=args.workers,
         hypervolume_patience=args.hv_patience,
@@ -121,6 +124,58 @@ def _run_tiling_placement(  # noqa: PLR0913
     )
 
 
+def _max_cores(args: argparse.Namespace) -> int:
+    """The placement runs' core cap: `--max-cores`, else as many cores as the template's largest grid."""
+    return args.max_cores if args.max_cores is not None else args.max_grid**2
+
+
+def _template_ranges(args: argparse.Namespace) -> dict[str, int]:
+    return {
+        "max_rows": args.max_grid,
+        "max_cols": args.max_grid,
+        "memory_shrink": args.template_memory_shrink,
+        "memory_growth": args.template_memory_growth,
+    }
+
+
+def print_area_ranges(args: argparse.Namespace) -> None:
+    """The smallest and largest core of each design space (all genes at their low, then high, bounds; CACTI
+    areas) and each method's core cap, so the reachable accelerator areas can be compared before a run."""
+    from stream.hardware.architecture.core_generator import build_core_from_dict
+    from stream.stages.generation.core_architecture_exploration import CoreGeneLayout, CoreParamRanges
+    from stream.stages.generation.template_exploration import (
+        CORES_DIR,
+        TemplateDesign,
+        TemplateGeneLayout,
+        TemplateParamRanges,
+        load_template_core,
+    )
+
+    def area(core_dict: dict) -> float:
+        return build_core_from_dict(core_dict, core_id=0).get_area()
+
+    generated = CoreGeneLayout(CoreParamRanges())
+    generated_areas = [area(generated.decode_node(bounds, "core")) for bounds in (generated.low, generated.high)]
+    template_core = load_template_core(os.path.join(CORES_DIR, "edge_tpu_like.yaml"))
+    template = TemplateGeneLayout(template_core, [], TemplateParamRanges(**_template_ranges(args)))
+    nb_oa = len(template.oa_dims)
+    template_areas = []
+    for pick in (min, max):
+        oa_sizes = tuple(pick(choices) for choices in template.choices[2 : 2 + nb_oa])
+        memory_sizes = tuple(pick(choices) for choices in template.memory_choices)
+        template_areas.append(area(template.core_dict(TemplateDesign(1, 1, oa_sizes, memory_sizes, ()))))
+    # Every template accelerator also has the SIMD core of its grid (`template_grid_dict`).
+    simd = area(load_template_core(os.path.join(CORES_DIR, "simd.yaml")))
+    rows = [
+        ("tiling_placement / tiling_coreopt", *generated_areas, f"{_max_cores(args)}"),
+        ("graph_ga", *generated_areas, "one per seed-tiling group (resnet 16, attention 11)"),
+        ("edge_tpu_template", *template_areas, f"{args.max_grid**2}, plus a {simd:.2f} mm2 SIMD core"),
+    ]
+    print(f"{'method':38} {'core area [mm2]':>20}   max cores")
+    for name, low, high, cores in rows:
+        print(f"{name:38} {low:8.3f} - {high:9.3f}   {cores}")
+
+
 def _run_edge_tpu_template(workload_path, layer_stacks, out_root, experiment_id, budget, args):
     from stream.api import optimize_template_accelerator
 
@@ -132,7 +187,7 @@ def _run_edge_tpu_template(workload_path, layer_stacks, out_root, experiment_id,
         experiment_id=experiment_id,
         output_path=out_root,
         search_budget=budget,
-        template_param_ranges={"max_rows": args.max_grid, "max_cols": args.max_grid},
+        template_param_ranges=_template_ranges(args),
         population_size=args.population,
         max_workers=args.workers,
         cacti_precompute_workers=args.workers,
@@ -236,8 +291,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hv-patience", type=int, default=2, help="tiling_placement: tiling GA HV patience.")
     parser.add_argument("--chunks", type=int, default=8, help="tiling_placement: level-2 tasks per layer group.")
     parser.add_argument("--solve-time", type=float, default=20, help="tiling_placement: time limit per solve.")
-    parser.add_argument("--max-cores", type=int, default=None, help="tiling_placement: core limit (default none).")
-    parser.add_argument("--mip-gap", type=float, default=0.0, help="tiling_placement: Gurobi relative MIP gap.")
+    parser.add_argument(
+        "--max-cores", type=int, default=None, help="tiling_placement: core limit (default: --max-grid squared)."
+    )
     parser.add_argument(
         "--bus",
         default="timed",
@@ -257,6 +313,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--step1-patience", type=int, default=5, help="graph_ga: step 1 convergence patience.")
     parser.add_argument("--frozen-graphs", type=int, default=4, help="graph_ga: graphs frozen for step 2.")
     parser.add_argument("--max-grid", type=int, default=4, help="edge_tpu_template: max grid rows and columns.")
+    parser.add_argument(
+        "--template-memory-shrink", type=int, default=64, help="edge_tpu_template: smallest memory, template size / this."
+    )
+    parser.add_argument(
+        "--template-memory-growth", type=int, default=8, help="edge_tpu_template: largest memory, template size * this."
+    )
+    parser.add_argument("--area-ranges", action="store_true", help="Print each design space's area range and exit.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--parallel-runs", type=int, default=1, help="Runs executed side by side.")
     parser.add_argument("--output-dir", default="outputs/accelerator_comparison")
@@ -272,6 +335,9 @@ def main() -> None:
             level=logging.INFO, format="%(asctime)s - %(funcName)s +%(lineno)s - %(levelname)s - %(message)s"
         )
         run_single(*args.single, args)
+        return
+    if args.area_ranges:
+        print_area_ranges(args)
         return
     runs = [(workload, method) for workload in args.workloads for method in args.methods]
     with ThreadPoolExecutor(max_workers=args.parallel_runs) as executor:

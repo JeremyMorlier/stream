@@ -5,10 +5,12 @@ from math import ceil, prod
 from typing import Any
 
 from zigzag.cost_model.cost_model import CostModelEvaluation
-from zigzag.datatypes import Constants, LayerDim, MemoryOperand, UnrollFactor
+from zigzag.datatypes import Constants, LayerDim, LayerOperand, MemoryOperand, UnrollFactor
 from zigzag.hardware.architecture.memory_level import MemoryLevel
 from zigzag.hardware.architecture.memory_port import DataDirection, PortAllocation
+from zigzag.mapping.spatial_mapping_internal import SpatialMappingInternal
 from zigzag.mapping.temporal_mapping import TemporalMappingType
+from zigzag.opt.loma.engine import NoValidLoopOrderingFoundException
 from zigzag.stages.evaluation.cost_model_evaluation import CostModelStage
 from zigzag.stages.mapping.spatial_mapping_conversion import SpatialMappingConversionStage
 from zigzag.stages.mapping.spatial_mapping_generation import SpatialMappingGeneratorStage
@@ -70,7 +72,7 @@ def evaluate_node_on_core(
 
 class _UnusedLeafStage(Stage):
     """Placeholder sub-stage for ZigZag stages instantiated only to call one of their methods (see
-    `lowest_memory_level_violations`). `Stage.__init__` rejects an empty `list_of_callables` on a non-leaf
+    `memory_hierarchy_violations`). `Stage.__init__` rejects an empty `list_of_callables` on a non-leaf
     stage, and these are never `run()`."""
 
     def is_leaf(self) -> bool:
@@ -80,68 +82,266 @@ class _UnusedLeafStage(Stage):
         yield from ()
 
 
-def lowest_memory_level_violations(node: ComputationNode, core: Core) -> list[str]:
-    """Check ZigZag's "a single operand does not fit within the lowest memory level" precondition for `node` on
-    `core`, returning one human-readable message per violating `(spatial mapping, operand)` pair -- empty when
-    the pair is mappable.
+def memory_hierarchy_violations(
+    node: ComputationNode, core: Core, layer_stacks: list[STACK_T] | None = None
+) -> list[str]:
+    """Check the memory-capacity preconditions of ZigZag's temporal mapping for `node` on `core`, returning one
+    human-readable message per violating `(spatial mapping, memory level)` pair -- empty when none is violated.
 
-    `LomaEngine` only yields a temporal mapping for orderings whose *spatially unrolled* slice of every operand
-    already fits in the innermost memory level serving it: `MemoryAllocator.calc_size_slices` raises
-    `MemoryTooSmallException` on the empty slice otherwise. That slice is the same for every loop ordering, so
-    when it overflows, no ordering survives and LOMA raises `NoValidLoopOrderingFoundException` -- which aborts
-    the entire run rather than just this candidate (`ZigZagCoreMappingEstimationStage.update_cost_lut` has no
-    per-(node, core) recovery). ZigZag's own `SpatialMappingGeneratorStage.limit_unrolling_to_mem_capacity` is
-    meant to shrink the unrolling until it fits, but it cannot always: it only visits `get_inner_memories()`
-    (so an operand whose innermost level is shared with another operand's level above is never limited), and
-    its `factor_map` is keyed by unroll *value*, so two LayerDims unrolled by the same factor collapse onto one
-    another's replacement and the product can stay over capacity.
+    `LomaEngine` only yields a temporal mapping for loop orderings that `MemoryAllocator` can allocate bottom-up
+    through the memory hierarchy, and raises `NoValidLoopOrderingFoundException` when no ordering survives --
+    which aborts the entire run rather than just this candidate (`ZigZagCoreMappingEstimationStage.update_cost_lut`
+    has no per-(node, core) recovery). Some conditions hold for every ordering, so they can be checked up front,
+    without running LOMA or the cost model. At the operand's `m`-th memory level the allocator needs at least:
+    - the slice already allocated below it, which contains at least the spatial unrolling of levels `0..m`
+      (`MemoryAllocator.calc_size_slices` raises `MemoryTooSmallException` on the empty slice otherwise);
+    - at the operand's top level, the whole tile but the spatial unrolling above it
+      (`MemoryAllocator.allocate_node` raises `MemoryHierarchyTooSmallException` otherwise);
+    and a level shared by several operands needs the sum of those (`find_best_loop_combination` raises on its
+    first combination otherwise). ZigZag's own `SpatialMappingGeneratorStage.limit_unrolling_to_mem_capacity`
+    does not prevent this: it only visits `get_inner_memories()` (so an operand whose innermost level is shared
+    with another operand's level above is never limited), and its `factor_map` is keyed by unroll *value*, so two
+    LayerDims unrolled by the same factor collapse onto one another's replacement and the product can stay over
+    capacity.
 
-    Since the slice is ordering-independent it can be checked up front, without running LOMA or the cost model:
-    generate exactly the spatial mappings `SpatialMappingGeneratorStage` would, convert each the way
-    `SpatialMappingConversionStage` does, and compare every operand's level-0 tensor size against the capacity
-    of its innermost memory. `SpatialMappingGeneratorStage.run` feeds *every* mapping it generates to the
-    downstream stages, so a single violating mapping is enough to sink the pair -- hence all of them are
-    checked, not just the first.
+    The output takes the partial-sum precision where an irrelevant loop is necessarily still unallocated (one
+    unrolled further up, or at level 0 any irrelevant loop), else the final one, since the irrelevant loops may
+    have been allocated below. Every need is thus a lower bound: a core that passes may still fail every ordering
+    (LOMA fills the lower levels greedily), but one that fails cannot be mapped.
 
-    Any exception raised while generating or converting the mappings (e.g. ZigZag's own "No valid
-    SpatialMappings found" assertion) is reported as a violation too: it means the same thing for the caller --
-    this core cannot run this tile.
+    `layer_stacks` models the off-chip spill of `ZigZagCoreMappingEstimationStage`: the operands
+    `offchip_operands_for` sends to DRAM no longer need their whole tile on the core. Without it (as in
+    `evaluate_node_on_core`) the core's top memories must hold the whole tile.
+
+    Every spatial mapping `SpatialMappingGeneratorStage` would generate is checked, converted the way
+    `SpatialMappingConversionStage` does: `SpatialMappingGeneratorStage.run` feeds *every* mapping it generates
+    to the downstream stages, so a single violating mapping is enough to sink the pair. Any exception raised
+    while generating or converting the mappings (e.g. ZigZag's own "No valid SpatialMappings found" assertion) is
+    reported as a violation too: it means the same thing for the caller -- this core cannot run this tile.
     """
     # The generator mutates the layer it is given (`spatial_mapping`, `spatial_mapping_hint`), and callers
     # reuse the same tile across many candidate cores.
     layer = pickle_deepcopy(node)
-    hierarchy = core.memory_hierarchy
     violations: list[str] = []
     try:
+        offchip_operands = set(offchip_operands_for(node, core, layer_stacks)) if layer_stacks is not None else set()
         generator = SpatialMappingGeneratorStage([_UnusedLeafStage], accelerator=core, layer=layer)
         for mapping in generator.generate_spatial_mappings():
             layer.spatial_mapping = mapping
             conversion = SpatialMappingConversionStage([_UnusedLeafStage], accelerator=core, layer=layer)
             spatial_mapping, _ = conversion.convert_user_spatial_mapping(conversion.user_spatial_mapping)
-            for layer_op, mem_op in layer.memory_operand_links.layer_and_mem_ops():
-                levels = hierarchy.get_memory_levels(mem_op)
-                if not levels:
-                    continue
-                capacity = levels[0].memory_instance.size
-                # Same shape as `MemoryAllocator.calc_loops_size`: a defaultdict, so `calc_tensor_size` reads 1
-                # for every dimension the level-0 unrolling does not mention (including a PR dim's related
-                # dims).
-                unrolled_sizes: dict[LayerDim, UnrollFactor] = defaultdict(lambda: 1)
-                for layer_dim, unroll_factor in spatial_mapping.get_unrolling(op=layer_op, level=0):
-                    unrolled_sizes[layer_dim] *= unroll_factor
-                # `operand_precision[layer_op]` is the partial-sum precision for the output operand, i.e. the
-                # larger of the two precisions `MemoryAllocator.get_precision` can pick -- the conservative
-                # choice, and the one ZigZag's own capacity limiting uses.
-                precision = layer.operand_precision[layer_op]
-                needed = layer.calc_tensor_size(layer_op, LayerDimSizes(unrolled_sizes)) * precision
-                if needed > capacity:
-                    violations.append(
-                        f"operand {mem_op} needs {needed:.0f} bit(s) in {levels[0].name} (capacity {capacity}) "
-                        f"for spatial mapping {mapping}"
-                    )
+            violations += [
+                f"{violation} for spatial mapping {mapping}"
+                for violation in _spatial_mapping_violations(layer, core, spatial_mapping, offchip_operands)
+            ]
     except Exception as exc:  # noqa: BLE001 -- any failure here means the same thing: not mappable
         violations.append(f"no spatial mapping could be derived: {exc!r}")
     return violations
+
+
+def _spatial_mapping_violations(
+    layer: ComputationNode,
+    core: Core,
+    spatial_mapping: SpatialMappingInternal,
+    offchip_operands: set[MemoryOperand],
+) -> list[str]:
+    """The capacity violations of one converted spatial mapping (see `memory_hierarchy_violations`)."""
+    levels_by_id: dict[int, MemoryLevel] = {}
+    needs: dict[int, dict[MemoryOperand, int]] = defaultdict(dict)
+    for layer_op, mem_op in layer.memory_operand_links.layer_and_mem_ops():
+        levels = core.memory_hierarchy.get_memory_levels(mem_op)
+        operand_needs = _operand_needs(
+            layer, layer_op, mem_op, spatial_mapping.mapping_dict_origin[layer_op], len(levels), offchip_operands
+        )
+        for level, needed in zip(levels, operand_needs, strict=True):
+            levels_by_id[id(level)] = level
+            needs[id(level)][mem_op] = needed
+
+    # Generated memories never force double buffering, which would double every slice but the last.
+    violations: list[str] = []
+    for level_id, needs_per_operand in needs.items():
+        level = levels_by_id[level_id]
+        capacity = level.memory_instance.size
+        if sum(needs_per_operand.values()) > capacity:
+            detail = ", ".join(f"{mem_op} {needed:.0f}" for mem_op, needed in needs_per_operand.items())
+            violations.append(f"{level.name} (capacity {capacity}) needs {detail} bit(s)")
+    return violations
+
+
+def _operand_needs(
+    layer: ComputationNode,
+    layer_op: LayerOperand,
+    mem_op: MemoryOperand,
+    unrolling_per_level: list[list[tuple[LayerDim, UnrollFactor]]],
+    nb_levels: int,
+    offchip_operands: set[MemoryOperand],
+) -> list[int]:
+    """The bits operand `mem_op` needs at least in each of its `nb_levels` memory levels (see
+    `memory_hierarchy_violations`)."""
+    total_unrolling: dict[LayerDim, UnrollFactor] = defaultdict(lambda: 1)
+    for level_unrolling in unrolling_per_level:
+        for layer_dim, unroll_factor in level_unrolling:
+            total_unrolling[layer_dim] *= unroll_factor
+    temporal_dims = {
+        layer_dim for layer_dim, size in layer.layer_dim_sizes.items() if ceil(size / total_unrolling[layer_dim]) > 1
+    }
+    ir_dims = layer.loop_relevancy_info.get_ir_layer_dims(layer_op) if mem_op == Constants.OUTPUT_MEM_OP else []
+    # Same shape as `MemoryAllocator.calc_loops_size`: a defaultdict, so `calc_tensor_size` reads 1 for every
+    # dimension the unrolling does not mention (including a PR dim's related dims).
+    unrolled_below: dict[LayerDim, UnrollFactor] = defaultdict(lambda: 1)
+    needs: list[int] = []
+    for index in range(nb_levels):
+        for layer_dim, unroll_factor in unrolling_per_level[index]:
+            unrolled_below[layer_dim] *= unroll_factor
+        dim_sizes = defaultdict(lambda: 1, unrolled_below)
+        if index == nb_levels - 1 and mem_op not in offchip_operands:
+            # The top level takes every temporal loop (`LomaEngine.get_temporal_loops`: the ceil of the dimension
+            # over its whole spatial unrolling) on top of the spatial unrolling below it.
+            for layer_dim, size in layer.layer_dim_sizes.items():
+                dim_sizes[layer_dim] = ceil(size / total_unrolling[layer_dim]) * unrolled_below[layer_dim]
+        unrolled_above = {
+            layer_dim for level_unrolling in unrolling_per_level[index + 1 :] for layer_dim, _ in level_unrolling
+        }
+        # `MemoryAllocator.get_precision`: partial sums while an irrelevant loop is still unallocated. Level 0 has
+        # nothing allocated below it, so every temporal irrelevant loop is; above it they may not be.
+        unallocated = unrolled_above | (temporal_dims if index == 0 else set())
+        if mem_op != Constants.OUTPUT_MEM_OP or any(dim in unallocated for dim in ir_dims):
+            precision = layer.operand_precision[layer_op]
+        else:
+            precision = layer.operand_precision.final_output_precision
+        needs.append(layer.calc_tensor_size(layer_op, LayerDimSizes(dim_sizes)) * precision)
+    return needs
+
+
+def offchip_operands_for(node: ComputationNode, core: Core, layer_stacks: list[STACK_T]) -> list[MemoryOperand]:
+    """The memory operands of `node` that `ZigZagCoreMappingEstimationStage` sends to an off-chip memory added on
+    top of `core`: all of them when `node` is alone in its layer stack, else those its top memories cannot hold
+    whole. The DRAM can span one or more operands, based on the total size of available on-chip memory and the
+    stored operands inside each memory."""
+    too_large_operands_for_cme: list[MemoryOperand] = []
+
+    # ! Always use blocking for single-stack nodes -RG
+    stack_this_node = next(stack for stack in layer_stacks if node.id in stack)
+    node_is_alone_in_stack = len(stack_this_node) == 1
+    if node_is_alone_in_stack:
+        return node.memory_operand_links.mem_operands
+
+    # Step 1: get all the unique top level memories of the core
+    memory_hierarchy_dict = core.mem_hierarchy_dict
+    top_memories = [memory[-1] for (_, memory) in memory_hierarchy_dict.items()]
+    unique_top_memories = set(top_memories)
+
+    # Step 2: for each top level memory, for each operand this memory holds, calculate the required capacity
+    # (in bit) for holding them
+    memory_operand_link = node.memory_operand_links
+    for top_memory in unique_top_memories:
+        top_level_capacity = top_memory.memory_instance.size
+        memory_operands = list(top_memory.mem_level_of_operands.keys())
+        layer_operands = [memory_operand_link.mem_to_layer_op(mem_operand) for mem_operand in memory_operands]
+        bits_to_be_stored_in_top_level: dict[MemoryOperand, int] = {}
+        for layer_operand, memory_operand in zip(layer_operands, memory_operands, strict=False):
+            nb_bits = node.operand_size_bit[layer_operand]
+            bits_to_be_stored_in_top_level[memory_operand] = nb_bits
+        total_required_capacity = sum(bits_to_be_stored_in_top_level.values())
+
+        # Step 3: compare the total required capacity with the top level memory capacity
+        if top_level_capacity < total_required_capacity:
+            # when the memory capacity is smaller than the requirement, sort the required capacity of each operand
+            # that shares this memory based on the operand's required size, from small to large
+            # Fit the operands to the memory from small to large
+            bits_to_be_stored_in_top_level = {
+                k: v for k, v in sorted(bits_to_be_stored_in_top_level.items(), key=lambda item: item[1])
+            }
+            nb_operands_in_top_level = len(bits_to_be_stored_in_top_level)
+            while top_level_capacity < sum(list(bits_to_be_stored_in_top_level.values())[:nb_operands_in_top_level]):
+                nb_operands_in_top_level -= 1
+                if nb_operands_in_top_level == 0:
+                    break
+            operands_stored_in_top_level = list(bits_to_be_stored_in_top_level.keys())[:nb_operands_in_top_level]
+            operands_stored_in_offchip = list(bits_to_be_stored_in_top_level.keys())[nb_operands_in_top_level:]
+
+            # Step 4: Check when some operand(s) fit in the top level core memory, and some cannot fit
+            # (too_large_operands), the top level core memory has enough space for supporting the SU of not-fitted
+            #  operands
+            if not operands_stored_in_top_level or not operands_stored_in_offchip:
+                pass
+            else:
+                rest_capacity = _top_level_memory_rest_capacity(
+                    operands_stored_in_top_level,
+                    bits_to_be_stored_in_top_level,
+                    top_level_capacity,
+                )
+                required_capacity = _too_large_operands_minimal_required_capacity_in_top_level_memory(
+                    operands_stored_in_offchip, core
+                )
+                while rest_capacity < required_capacity:
+                    # put_the_largest operands_stored_in_top_level to operands_stored_in_offchip
+                    nb_operands_in_top_level -= 1
+                    operands_stored_in_top_level = list(bits_to_be_stored_in_top_level.keys())[
+                        :nb_operands_in_top_level
+                    ]
+                    operands_stored_in_offchip = list(bits_to_be_stored_in_top_level.keys())[nb_operands_in_top_level:]
+                    if not operands_stored_in_top_level:
+                        break
+                    rest_capacity = _top_level_memory_rest_capacity(
+                        operands_stored_in_top_level,
+                        bits_to_be_stored_in_top_level,
+                        top_level_capacity,
+                    )
+                    required_capacity = _too_large_operands_minimal_required_capacity_in_top_level_memory(
+                        operands_stored_in_offchip, core
+                    )
+
+            too_large_operands_for_cme += operands_stored_in_offchip
+    return too_large_operands_for_cme
+
+
+def _top_level_memory_rest_capacity(
+    operands_stored_in_top_level: list[MemoryOperand],
+    bits_to_be_stored_in_top_level: dict[MemoryOperand, int],
+    top_level_capacity_bits: int,
+) -> int:
+    """Calculate the remaining capacity in the top level core memory after storing the operands_stored_in_top_level
+
+    Args:
+        operands_stored_in_top_level: list of operands that can fit in the top memory level of the core
+        bits_to_be_stored_in_top_level: the data size in bit for each variable operands
+        top_level_capacity_bits: the total capacity of the top level core memory
+
+    Returns:
+        The memory capacity left after storing the operands_stored_in_top_level
+    """
+    rest_capacity = top_level_capacity_bits
+    for mem_operand in operands_stored_in_top_level:
+        rest_capacity -= bits_to_be_stored_in_top_level[mem_operand]
+    return rest_capacity
+
+
+def _too_large_operands_minimal_required_capacity_in_top_level_memory(
+    operands_stored_in_offchip: list[MemoryOperand],
+    core: Core,
+) -> int:
+    """Calculate the required capacity in the top level core memory for operands_stored_in_offchip due to spatial
+    unrolling
+
+    Args:
+        operands_stored_in_offchip: list of operands that cannot fit in the top memory level of the core
+        dataflows (list of dict): the dataflows (spatial mappings) that current core supports
+        node (ComputationNode): The computational node we want to map onto the core
+
+    Returns:
+        The required memory capacity in the top memory of the core for operands_stored_in_offchip
+    """
+
+    def get_lowest_level_unrolled_memory_capacity(memory_operand: MemoryOperand):
+        memory_level = core.memory_hierarchy.get_memory_levels(memory_operand)[0]
+        return memory_level.memory_instance.size * memory_level.unroll_count
+
+    unroll_dict: dict[MemoryOperand, int] = {}
+    for mem_operand in operands_stored_in_offchip:
+        capacity = get_lowest_level_unrolled_memory_capacity(mem_operand)
+        unroll_dict[mem_operand] = capacity
+    return round(sum(unroll_dict.values()))
 
 
 class ZigZagCoreMappingEstimationStage(Stage):
@@ -173,6 +373,10 @@ class ZigZagCoreMappingEstimationStage(Stage):
         self.loma_show_progress_bar: bool = kwargs.get("loma_show_progress_bar", False)
         self.layer_stacks: list[STACK_T] = kwargs["layer_stacks"]
         self.temporal_mapping_type: TemporalMappingType = kwargs["temporal_mapping_type"]
+        # When set, a (node, core) pair ZigZag cannot map is recorded in `unmappable` and left out of the LUT
+        # instead of aborting the whole update; the caller decides what to do with the core.
+        self.skip_unmappable: bool = kwargs.get("skip_unmappable", False)
+        self.unmappable: list[tuple[ComputationNode, Core]] = []
 
         # Extract all unique nodes that will have to be evaluated
         self.unique_nodes = get_unique_nodes(self.workload)
@@ -242,7 +446,20 @@ class ZigZagCoreMappingEstimationStage(Stage):
                     if core.dataflows:
                         node_duplicate.spatial_mapping = core.dataflows
 
-                    cme = self.run_zigzag(node_duplicate, too_large_operands_for_cme, core_id)
+                    if self.skip_unmappable and any(
+                        failed_node.has_same_performance(node) and failed_core.has_same_performance(core)
+                        for failed_node, failed_core in self.unmappable
+                    ):
+                        self.unmappable.append((node, core))
+                        continue
+                    try:
+                        cme = self.run_zigzag(node_duplicate, too_large_operands_for_cme, core_id)
+                    except NoValidLoopOrderingFoundException:
+                        if not self.skip_unmappable:
+                            raise
+                        logger.warning(f"ZigZag cannot map {node} on core {core_id}; leaving it out of the cost LUT.")
+                        self.unmappable.append((node, core))
+                        continue
                     cme = self.increase_cc_per_op(cme, node.type)
 
                     node_duplicate.set_chosen_core_allocation(None)  # Reset the node's chosen core allocation
@@ -328,9 +545,8 @@ class ZigZagCoreMappingEstimationStage(Stage):
         return main_stage
 
     def check_core_capacity_for_node(self, core: Core, node: ComputationNode) -> list[MemoryOperand]:
-        """Check if we need to add a DRAM memory to the given core for the given node.
-        The DRAM can span one or more operands, based on the total size of available on-chip memory
-        and the stored operands inside each memory.
+        """Check if we need to add a DRAM memory to the given core for the given node (see
+        `offchip_operands_for`).
 
         Args:
             core: The core onto which we want to map the node
@@ -339,134 +555,7 @@ class ZigZagCoreMappingEstimationStage(Stage):
         Returns:
             A list of memory operands for which the capacity on the core is insufficient.
         """
-        too_large_operands_for_cme: list[MemoryOperand] = []
-
-        # ! Always use blocking for single-stack nodes -RG
-        stack_this_node = next(stack for stack in self.layer_stacks if node.id in stack)
-        node_is_alone_in_stack = len(stack_this_node) == 1
-        if node_is_alone_in_stack:
-            return node.memory_operand_links.mem_operands
-
-        # Step 1: get all the unique top level memories of the core
-        memory_hierarchy_dict = core.mem_hierarchy_dict
-        top_memories = [memory[-1] for (_, memory) in memory_hierarchy_dict.items()]
-        unique_top_memories = set(top_memories)
-
-        # Step 2: for each top level memory, for each operand this memory holds, calculate the required capacity
-        # (in bit) for holding them
-        memory_operand_link = node.memory_operand_links
-        for top_memory in unique_top_memories:
-            top_level_capacity = top_memory.memory_instance.size
-            memory_operands = list(top_memory.mem_level_of_operands.keys())
-            layer_operands = [memory_operand_link.mem_to_layer_op(mem_operand) for mem_operand in memory_operands]
-            bits_to_be_stored_in_top_level: dict[MemoryOperand, int] = {}
-            for layer_operand, memory_operand in zip(layer_operands, memory_operands, strict=False):
-                nb_bits = node.operand_size_bit[layer_operand]
-                bits_to_be_stored_in_top_level[memory_operand] = nb_bits
-            total_required_capacity = sum(bits_to_be_stored_in_top_level.values())
-
-            # Step 3: compare the total required capacity with the top level memory capacity
-            if top_level_capacity < total_required_capacity:
-                # when the memory capacity is smaller than the requirement, sort the required capacity of each operand
-                # that shares this memory based on the operand's required size, from small to large
-                # Fit the operands to the memory from small to large
-                bits_to_be_stored_in_top_level = {
-                    k: v for k, v in sorted(bits_to_be_stored_in_top_level.items(), key=lambda item: item[1])
-                }
-                nb_operands_in_top_level = len(bits_to_be_stored_in_top_level)
-                while top_level_capacity < sum(
-                    list(bits_to_be_stored_in_top_level.values())[:nb_operands_in_top_level]
-                ):
-                    nb_operands_in_top_level -= 1
-                    if nb_operands_in_top_level == 0:
-                        break
-                operands_stored_in_top_level = list(bits_to_be_stored_in_top_level.keys())[:nb_operands_in_top_level]
-                operands_stored_in_offchip = list(bits_to_be_stored_in_top_level.keys())[nb_operands_in_top_level:]
-
-                # Step 4: Check when some operand(s) fit in the top level core memory, and some cannot fit
-                # (too_large_operands), the top level core memory has enough space for supporting the SU of not-fitted
-                #  operands
-                if not operands_stored_in_top_level or not operands_stored_in_offchip:
-                    pass
-                else:
-                    rest_capacity = self.get_top_level_memory_rest_capacity(
-                        operands_stored_in_top_level,
-                        bits_to_be_stored_in_top_level,
-                        top_level_capacity,
-                    )
-                    required_capacity = self.get_too_large_operands_minimal_required_capacity_in_top_level_memory(
-                        operands_stored_in_offchip, core
-                    )
-                    while rest_capacity < required_capacity:
-                        # put_the_largest operands_stored_in_top_level to operands_stored_in_offchip
-                        nb_operands_in_top_level -= 1
-                        operands_stored_in_top_level = list(bits_to_be_stored_in_top_level.keys())[
-                            :nb_operands_in_top_level
-                        ]
-                        operands_stored_in_offchip = list(bits_to_be_stored_in_top_level.keys())[
-                            nb_operands_in_top_level:
-                        ]
-                        if not operands_stored_in_top_level:
-                            break
-                        rest_capacity = self.get_top_level_memory_rest_capacity(
-                            operands_stored_in_top_level,
-                            bits_to_be_stored_in_top_level,
-                            top_level_capacity,
-                        )
-                        required_capacity = self.get_too_large_operands_minimal_required_capacity_in_top_level_memory(
-                            operands_stored_in_offchip, core
-                        )
-
-                too_large_operands_for_cme += operands_stored_in_offchip
-        return too_large_operands_for_cme
-
-    @staticmethod
-    def get_top_level_memory_rest_capacity(
-        operands_stored_in_top_level: list[MemoryOperand],
-        bits_to_be_stored_in_top_level: dict[MemoryOperand, int],
-        top_level_capacity_bits: int,
-    ) -> int:
-        """Calculate the remaining capacity in the top level core memory after storing the operands_stored_in_top_level
-
-        Args:
-            operands_stored_in_top_level: list of operands that can fit in the top memory level of the core
-            bits_to_be_stored_in_top_level: the data size in bit for each variable operands
-            top_level_capacity_bits: the total capacity of the top level core memory
-
-        Returns:
-            The memory capacity left after storing the operands_stored_in_top_level
-        """
-        rest_capacity = top_level_capacity_bits
-        for mem_operand in operands_stored_in_top_level:
-            rest_capacity -= bits_to_be_stored_in_top_level[mem_operand]
-        return rest_capacity
-
-    def get_too_large_operands_minimal_required_capacity_in_top_level_memory(
-        self,
-        operands_stored_in_offchip: list[MemoryOperand],
-        core: Core,
-    ) -> int:
-        """Calculate the required capacity in the top level core memory for operands_stored_in_offchip due to spatial
-        unrolling
-
-        Args:
-            operands_stored_in_offchip: list of operands that cannot fit in the top memory level of the core
-            dataflows (list of dict): the dataflows (spatial mappings) that current core supports
-            node (ComputationNode): The computational node we want to map onto the core
-
-        Returns:
-            The required memory capacity in the top memory of the core for operands_stored_in_offchip
-        """
-
-        def get_lowest_level_unrolled_memory_capacity(memory_operand: MemoryOperand):
-            memory_level = core.memory_hierarchy.get_memory_levels(memory_operand)[0]
-            return memory_level.memory_instance.size * memory_level.unroll_count
-
-        unroll_dict: dict[MemoryOperand, int] = {}
-        for mem_operand in operands_stored_in_offchip:
-            capacity = get_lowest_level_unrolled_memory_capacity(mem_operand)
-            unroll_dict[mem_operand] = capacity
-        return round(sum(unroll_dict.values()))
+        return offchip_operands_for(node, core, self.layer_stacks)
 
     def add_offchip_to_core(self, core: Core, too_large_operands: list[MemoryOperand], layer_idx: int):
         """Add the offchip memory as the top level memory of the core with core_id in a copy of the accelerator

@@ -41,7 +41,7 @@ from stream.hardware.architecture.noc.interconnect_area import (
 )
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
     ZigZagCoreMappingEstimationStage,
-    lowest_memory_level_violations,
+    memory_hierarchy_violations,
 )
 from stream.stages.generation.core_architecture_exploration import (
     ParetoCoreSearchResult,
@@ -70,12 +70,13 @@ logger = logging.getLogger(__name__)
 _WARM_UP_CONTEXT: tuple["ScheduleSpace", Any, str] | None = None
 
 
-def _warm_up_column_worker(item: tuple[str, dict[str, Any]]) -> CostCaches:
+def _warm_up_column_worker(item: tuple[str, dict[str, Any]]) -> tuple[CostCaches, set[str]]:
     assert _WARM_UP_CONTEXT is not None
     space, workload, cache_dir = _WARM_UP_CONTEXT
     space.costs = CostCaches(latency_attr=space.costs.latency_attr)
+    space.unmappable_designs = set()
     space.warm_up_uniform_design(*item, workload, cache_dir)
-    return space.costs
+    return space.costs, space.unmappable_designs
 
 
 class ScheduleSpace:
@@ -122,6 +123,8 @@ class ScheduleSpace:
         self.max_workers = max_workers
         self.costs = CostCaches(latency_attr=latency_attr)
         self.full_matrix = False
+        # Designs the warm-up found ZigZag cannot map on one of their tiles; see `_estimate`.
+        self.unmappable_designs: set[str] = set()
         self.interconnect_model = InterconnectAreaModel.from_config(interconnect_model)
         self.unrolled_link_widths: dict[tuple[int, int], int] | None = None
         # One pinned workload copy drives both the plan and the warm-up: the pinning is design-independent, so it
@@ -282,7 +285,7 @@ class ScheduleSpace:
         """Drop front designs that cannot run every tile shape they will be asked to.
 
         The per-tile core GA only ever guarantees a design maps *its own* tile (see
-        `lowest_memory_level_violations`), but the warm-up cost-models each design against every shape
+        `memory_hierarchy_violations`), but the warm-up cost-models each design against every shape
         `shapes_needing_design` lists. A pair ZigZag cannot map raises `NoValidLoopOrderingFoundException`
         inside `update_cost_lut`, which aborts the whole warm-up -- and with it the run -- rather than leaving
         one cell empty, so such designs are removed from the fronts here, before `warm_up`. Ranks are only read
@@ -296,7 +299,9 @@ class ScheduleSpace:
                 violations = [
                     (shape, violation)
                     for shape in shapes
-                    for violation in lowest_memory_level_violations(self.unique_tiles[shape], core)
+                    for violation in memory_hierarchy_violations(
+                        self.unique_tiles[shape], core, self.estimation_kwargs["layer_stacks"]
+                    )
                 ]
                 if violations:
                     dropped += 1
@@ -365,10 +370,12 @@ class ScheduleSpace:
             accelerator = self.build_accelerator(node_core_dicts, workload)
             # A fresh LUT per warm-up: sharing one would evict entries through `remove_cores_with_same_id`,
             # since every accelerator reuses the same core ids with different designs.
-            cost_lut = self._estimate(workload, accelerator, os.path.join(cache_dir, f"cost_lut_warmup_{rank}.pickle"))
-            self.costs.harvest(
-                cost_lut, workload, accelerator, self.design_key_of_core(node_core_dicts), self.shape_class_of_tile
+            design_key_of_core = self.design_key_of_core(node_core_dicts)
+            cost_lut = self._estimate(
+                workload, accelerator, os.path.join(cache_dir, f"cost_lut_warmup_{rank}.pickle"), design_key_of_core
             )
+            self.costs.harvest(cost_lut, workload, accelerator, design_key_of_core, self.shape_class_of_tile)
+        self._drop_unmappable_designs()
         self._check_complete()
 
     def _warm_up_full(self, designs: dict[str, dict[str, Any]], nb_shapes: int, cache_dir: str) -> None:
@@ -387,18 +394,18 @@ class ScheduleSpace:
             for design_key, core_dict in designs.items():
                 self.warm_up_uniform_design(design_key, core_dict, workload, cache_dir)
         self.full_matrix = True
+        self._drop_unmappable_designs()
         self._check_complete()
 
     def warm_up_uniform_design(self, design_key: str, core_dict: dict[str, Any], workload: Any, cache_dir: str) -> None:
         """One column of the cost matrix: every node on `core_dict`, harvested into `costs`."""
         node_core_dicts = dict.fromkeys(self.design_class_of_node, core_dict)
         accelerator = self.build_accelerator(node_core_dicts, workload)
+        design_key_of_core = self.design_key_of_core(node_core_dicts)
         cost_lut = self._estimate(
-            workload, accelerator, os.path.join(cache_dir, f"cost_lut_design_{design_key}.pickle")
+            workload, accelerator, os.path.join(cache_dir, f"cost_lut_design_{design_key}.pickle"), design_key_of_core
         )
-        self.costs.harvest(
-            cost_lut, workload, accelerator, self.design_key_of_core(node_core_dicts), self.shape_class_of_tile
-        )
+        self.costs.harvest(cost_lut, workload, accelerator, design_key_of_core, self.shape_class_of_tile)
 
     def _warm_up_designs_in_parallel(self, designs: dict[str, dict[str, Any]], workload: Any, cache_dir: str) -> None:
         """The columns are independent, so fill them on `max_workers` forked processes. Each worker starts from
@@ -407,21 +414,53 @@ class ScheduleSpace:
         _WARM_UP_CONTEXT = (self, workload, cache_dir)
         mp_context = multiprocessing.get_context("fork")
         with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=mp_context) as executor:
-            for harvested in executor.map(_warm_up_column_worker, list(designs.items())):
+            for harvested, unmappable in executor.map(_warm_up_column_worker, list(designs.items())):
                 self.costs.update(harvested)
+                self.unmappable_designs |= unmappable
 
-    def _estimate(self, workload: Any, accelerator: Any, cost_lut_path: str):
+    def _estimate(self, workload: Any, accelerator: Any, cost_lut_path: str, design_key_of_core: dict[int, str]):
         """Run ZigZag on every unique tile of `workload` on `accelerator`, through the same stage the regular
-        pipeline uses, and return its cost LUT (loaded from `cost_lut_path` instead when it already exists)."""
+        pipeline uses, and return its cost LUT (loaded from `cost_lut_path` instead when it already exists).
+
+        `memory_hierarchy_violations` only checks necessary conditions, so a design `drop_infeasible_designs`
+        kept can still be unmappable for some tile (LOMA fills the lower memories greedily). Rather than let that
+        one pair abort the warm-up, its design is recorded in `unmappable_designs` and dropped afterwards by
+        `_drop_unmappable_designs`."""
         estimation = ZigZagCoreMappingEstimationStage(
             [_UnusedLeafStage],
             workload=workload,
             accelerator=accelerator,
             cost_lut_path=cost_lut_path,
+            skip_unmappable=True,
             **self.estimation_kwargs,
         )
         estimation.update_cost_lut()
+        self.unmappable_designs |= {design_key_of_core[core.id] for _, core in estimation.unmappable}
         return estimation.cost_lut
+
+    def _drop_unmappable_designs(self) -> None:
+        """Remove from the fronts every design the warm-up found ZigZag cannot map on one of its tiles (see
+        `_estimate`). Like `drop_infeasible_designs`, it keeps a class's front non-empty or raises; ranks are
+        content-keyed in the cost caches, so renumbering them is safe."""
+        if not self.unmappable_designs:
+            return
+        for class_index in self.decision_classes:
+            kept = [
+                design
+                for design in self.designs_per_class[class_index]
+                if core_dict_key(design["core_dict"]) not in self.unmappable_designs
+            ]
+            if not kept:
+                raise ValueError(
+                    f"ScheduleSpace: ZigZag cannot map every design on class {class_index}'s front on all the tile "
+                    f"shapes it has to run."
+                )
+            self.designs_per_class[class_index] = kept
+        logger.warning(
+            f"ScheduleSpace: the warm-up dropped {len(self.unmappable_designs)} core design(s) ZigZag cannot map on "
+            f"one of their tiles; front sizes are now "
+            f"{[len(self.designs_per_class[c]) for c in self.decision_classes]}."
+        )
 
     def required_cme_keys(self) -> list[tuple[int, str]]:
         """The `(shape class, design key)` cells the searches will look up: the whole matrix after a full

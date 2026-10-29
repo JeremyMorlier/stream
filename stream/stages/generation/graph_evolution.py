@@ -27,7 +27,7 @@ interconnect's (`interconnect_area`), every link `LINK_BANDWIDTH` wide since tha
 Each tiling is generated once (`TilingGenerationStage` + `TiledWorkloadGenerationStage`) and cached; a design's
 cost on a tiling's shapes is learned once with a uniform accelerator, as the rolled schedule search fills its cost
 matrix, and shared across tilings through global tile-shape ids. A design must map every shape of the genome's tiling (the cheap
-`lowest_memory_level_violations` pre-check), so any node can host any group.
+`memory_hierarchy_violations` pre-check), so any node can host any group.
 """
 
 import copy
@@ -52,7 +52,7 @@ from stream.opt.search_budget import SearchBudget, map_recording
 from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
     ZigZagCoreMappingEstimationStage,
-    lowest_memory_level_violations,
+    memory_hierarchy_violations,
 )
 from stream.stages.generation.core_architecture_exploration import (
     CoreGeneLayout,
@@ -338,7 +338,8 @@ class GraphEvolutionStage(Stage):
                 try:
                     core = build_core_from_dict(core_dict, core_id=0)
                     ok = not any(
-                        lowest_memory_level_violations(self.unique_tiles[shape], core) for shape in context.shapes
+                        memory_hierarchy_violations(self.unique_tiles[shape], core, self.kwargs["layer_stacks"])
+                        for shape in context.shapes
                     )
                 except Exception:
                     ok = False

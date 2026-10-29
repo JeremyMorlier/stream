@@ -43,8 +43,9 @@ from stream.parser.accelerator_factory import AcceleratorFactory
 from stream.parser.core_validator import CoreValidator
 from stream.stages.estimation.zigzag_core_mapping_estimation import (
     evaluate_node_on_core,
-    lowest_memory_level_violations,
+    memory_hierarchy_violations,
 )
+from stream.stages.generation.layer_stacks_generation import STACK_T
 from stream.stages.generation.schedule_evaluation import downstream_requires
 from stream.stages.generation.tiled_workload_accelerator_generation import (
     RolledTopology,
@@ -453,7 +454,7 @@ def _evaluate_design_on_tile(
         # worthless as designs, and the check is far cheaper than the mapping search that would reject them.
         # It also keeps them out of the per-tile Pareto fronts, where a design that is fine for its own tile
         # but not for another one later aborts the schedule search's cost-model warm-up.
-        violations = lowest_memory_level_violations(tile, core)
+        violations = memory_hierarchy_violations(tile, core)
         if violations:
             logger.debug(
                 f"CoreArchitectureExplorationStage: candidate '{name}' cannot map tile {tile} "
@@ -1228,10 +1229,12 @@ class CoreDesignSelectionStage(Stage):
         designs: list[dict[str, Any]],
         unique_tiles: list[ComputationNode],
         extra_shapes: dict[int, set[int]],
+        layer_stacks: list[STACK_T] | None,
     ) -> list[dict[str, Any]]:
         """`designs` restricted to the ones that can also map the other shapes they will have to run (see
         `extra_shapes_per_unique_tile`). A design that cannot raises `NoValidLoopOrderingFoundException` in the
-        downstream `ZigZagCoreMappingEstimationStage`, which aborts the whole pipeline."""
+        downstream `ZigZagCoreMappingEstimationStage`, which aborts the whole pipeline; its off-chip spill is
+        modeled when `layer_stacks` is given."""
         shapes = extra_shapes.get(unique_index)
         if not shapes:
             return designs
@@ -1239,8 +1242,8 @@ class CoreDesignSelectionStage(Stage):
             design
             for design in designs
             if not any(
-                lowest_memory_level_violations(
-                    unique_tiles[shape], build_core_from_dict(design["core_dict"], core_id=0)
+                memory_hierarchy_violations(
+                    unique_tiles[shape], build_core_from_dict(design["core_dict"], core_id=0), layer_stacks
                 )
                 for shape in sorted(shapes)
             )
@@ -1264,7 +1267,9 @@ class CoreDesignSelectionStage(Stage):
         extra_shapes = extra_shapes_per_unique_tile(search)
         best_design_per_tile: list[dict[str, Any]] = []
         for unique_index, designs in enumerate(search.designs_per_tile):
-            usable = self._designs_running(unique_index, designs, search.unique_tiles, extra_shapes)
+            usable = self._designs_running(
+                unique_index, designs, search.unique_tiles, extra_shapes, self.kwargs.get("layer_stacks")
+            )
             best_design_per_tile.append(min(usable, key=lambda design: design["fitness"][sort_index])["core_dict"])
 
         kwargs = self.kwargs.copy()

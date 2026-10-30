@@ -48,6 +48,8 @@ class GurobiBackend:
     name = "gurobi"
 
     def __init__(self, problem: PlacementProblem, options: BackendOptions):
+        if options.refinements:
+            raise NotImplementedError(f"GurobiBackend: {options.refinements} are only modelled by CpSatBackend.")
         self.problem = problem
         self.options = options
         self.env = gp.Env(empty=True)

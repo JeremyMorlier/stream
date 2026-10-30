@@ -25,6 +25,22 @@ class BackendOptions:
     # core: on the ResNet bottleneck it reports an energy optimum of 220.7M pJ as OPTIMAL while 191.9M is feasible
     # (found by CP-SAT without presolve, by Gurobi, and by CP-SAT 9.12 / 9.14 on the exported model). Off until fixed.
     cpsat_presolve: bool = False
+    # Refinements of the CP-SAT model towards what Stream measures; see the module docstring of `cpsat_backend`.
+    # The defaults keep the model as it was, and `GurobiBackend` implements none of them.
+    shared_loads: bool = False  # timed bus: a tensor shared by groups on one slot is loaded once
+    comm_energy: bool = False  # energy of off-chip loads and core-to-core transfers (memory reads and writes)
+    capacity: Literal["none", "filter", "overflow"] = "none"  # core memory capacity
+    link_contention: Literal["none", "pair", "link"] = "none"  # transfers sharing a link
+
+    @property
+    def refinements(self) -> dict[str, object]:
+        """The refinements set away from their defaults."""
+        defaults = BackendOptions()
+        return {
+            name: getattr(self, name)
+            for name in ("shared_loads", "comm_energy", "capacity", "link_contention")
+            if getattr(self, name) != getattr(defaults, name)
+        }
 
 
 @dataclass
@@ -59,7 +75,7 @@ class PlacementBackend(Protocol):
         ...
 
 
-def make_solution(  # noqa: PLR0913
+def make_solution(  # noqa: PLR0913, PLR0917
     problem: PlacementProblem,
     slot_of_group: dict[int, int],
     design_of_slot: dict[int, str],
@@ -67,13 +83,23 @@ def make_solution(  # noqa: PLR0913
     group_link_widths: dict[tuple[int, int], int] | None,
     offchip_bus: str,
     model_values: dict[str, int],
+    comm_energy: bool = False,
+    capacity: str = "none",
 ) -> tuple[ModelSolution, dict[str, int]]:
     """A `ModelSolution` from a backend's decisions, with its objectives recomputed by `PlacementProblem.evaluate`
     (scaled units, returned too): they never exceed the model's own values `model_values`, and the next solve can
     be bounded by them. A task's tiles all take its start time and keep their sub id order inside it."""
     used = set(slot_of_group.values())
     design_of_slot = {slot: key for slot, key in design_of_slot.items() if slot in used}
-    values = problem.evaluate(slot_of_group, design_of_slot, starts, group_link_widths, offchip_bus)
+    values = problem.evaluate(
+        slot_of_group,
+        design_of_slot,
+        starts,
+        group_link_widths,
+        offchip_bus,
+        comm_energy=comm_energy,
+        capacity=capacity,
+    )
     for name, value in values.items():
         if value > model_values[name]:
             logger.warning(f"make_solution: {name} {value} recomputed above the model's {model_values[name]}.")

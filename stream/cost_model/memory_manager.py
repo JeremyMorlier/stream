@@ -229,6 +229,14 @@ class MemoryManager:
         stored_tensors = self.get_tensors_stored_at_timestep(top_instance, timestep)
         exception_ids = {id(tensor) for tensor in exceptions}
         evictable_tensors = [tensor for tensor in stored_tensors if id(tensor) not in exception_ids]
+        if not evictable_tensors:
+            present_size = sum(tensor.size for tensor in stored_tensors)
+            raise ValueError(
+                f"Cannot make room for {tensor_to_add} ({tensor_to_add.size} bits) in {top_instance} "
+                f"(capacity {capacity}) at t={timestep}: {min_size_to_evict} bits to free, but every tensor stored "
+                f"there is needed by the node being scheduled ({len(stored_tensors)} tensor(s), {present_size} bits; "
+                f"{stored_tensors_size - present_size} more bits are reserved by tensors added later)."
+            )
         evictable_tensors_priority_size: list[int] = []
         for tensor in evictable_tensors:
             instance_priority = tensor.get_instance_priority(top_instance, self)

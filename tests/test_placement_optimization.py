@@ -10,7 +10,9 @@ epsilon bounds. Besides:
 - every solution respects the core cap, sibling exclusion, precedences, and never overlaps two tasks on a core,
 - with the interconnect area on, the model's area is the exact `interconnect_area` of its fold (up to the rounding
   of the wire pitch),
-- groups of one layer may share a core by default, and the bus loads a tensor shared by merged groups once.
+- groups of one layer may share a core by default, and the bus loads a tensor shared by merged groups once,
+- the CP-SAT refinements (`shared_loads`, `comm_energy`, `capacity="overflow"`, `link_contention`) each change the
+  optimum the way Stream's measurement would, and the model's objectives match `PlacementProblem.evaluate`.
 
 All synthetic: problems are built directly, without workload, cost model or scheduler. Gurobi tests are skipped
 without a license. Run with `python tests/test_placement_optimization.py`, or collect with pytest.
@@ -27,7 +29,7 @@ from stream.hardware.architecture.noc.interconnect_area import (
 )
 from stream.stages.generation.placement_optimization.backend import BackendOptions
 from stream.stages.generation.placement_optimization.cpsat_backend import CpSatBackend
-from stream.stages.generation.placement_optimization.problem import PlacementProblem
+from stream.stages.generation.placement_optimization.problem import OffchipLoad, PlacementProblem
 from stream.stages.generation.placement_optimization.stage import PlacementSweep
 from stream.stages.generation.schedule_optimization import LinkTransfer
 from stream.stages.generation.tiled_workload_accelerator_generation import renumber_merged_cores
@@ -89,8 +91,8 @@ def build_problem(  # noqa: PLR0913, PLR0917
     )
 
 
-def options(offchip_bus="none", link_transfers="none") -> BackendOptions:
-    return BackendOptions(offchip_bus=offchip_bus, link_transfers=link_transfers, workers=4)
+def options(offchip_bus="none", link_transfers="none", **refinements) -> BackendOptions:
+    return BackendOptions(offchip_bus=offchip_bus, link_transfers=link_transfers, workers=4, **refinements)
 
 
 def sweep_of(backend_cls, problem, **kwargs) -> PlacementSweep:
@@ -278,6 +280,141 @@ def test_backends_agree_on_random_instances() -> None:
         budget = (optima["area"] + round(fastest_area * 1e9)) // 2
         values = [sweep.solve("latency", {"area": budget}, TIME_LIMIT, "eps").objective_value for sweep in sweeps]
         assert values[0] == values[1], (seed, "eps", opts, values)
+
+
+# ------------------------------------------------------------------------------------- CP-SAT refinements ------
+
+
+def solve_cpsat(problem: PlacementProblem, objective: str, pin=(), **kwargs):
+    """CP-SAT's optimum of `objective`, with groups pinned to slots by `pin` (`(group, slot)` pairs)."""
+    backend = CpSatBackend(problem, options(**kwargs))
+    for g, p in pin:
+        backend.model.Add(backend.x[g, p] == 1)
+    result = backend.solve(objective, {}, TIME_LIMIT)
+    assert result.status == "OPTIMAL", result.status
+    check_schedule(problem, result)
+    return result
+
+
+def test_shared_loads_load_a_tensor_once_per_slot() -> None:
+    # Two independent groups on one core read the same 300-bit tensor (30 bus cycles). Loaded per group, the second
+    # load waits for the first: 30 + 30 + 10 = 70. Shared, both tasks wait for one load: 30 + 10 + 10 = 50.
+    def problem():
+        p = build_problem(groups=(0, 1), layers=(0, 1), dependencies=(), max_cores=1, load_bits=[300, 300])
+        p.offchip_bits = {frozenset({0, 1}): 300}
+        p.offchip_loads = [OffchipLoad(users=frozenset({0, 1}), first_task={0: 0, 1: 1}, bits=300)]
+        return p
+
+    alone = solve_cpsat(problem(), "latency", offchip_bus="timed")
+    shared = solve_cpsat(problem(), "latency", offchip_bus="timed", shared_loads=True)
+    assert (alone.solution.latency, shared.solution.latency) == (70, 50)
+
+
+def test_comm_energy_counts_loads_and_transfers() -> None:
+    # Two groups of one layer, 0 -> 1, with a transfer (read 5, write 7) and a 100-bit tensor both use (energy 3 per
+    # load). Together on one slow core: 100 + 3, the transfer is free. Apart: 100 + 2 * 3 + 5 + 7.
+    def problem(allow_sibling_merge):
+        p = build_problem(groups=(0, 1), layers=(0, 0), dependencies=((0, 1),), allow_sibling_merge=allow_sibling_merge)
+        p.transfers = [LinkTransfer(producer=0, consumer=1, source=0, target=1, bits=64, splits=1)]
+        p.transfer_energy = [({FAST: 5, SLOW: 5}, {FAST: 7, SLOW: 7})]
+        p.offchip_loads = [
+            OffchipLoad(users=frozenset({0, 1}), first_task={0: 0, 1: 1}, bits=100, energy={FAST: 3, SLOW: 3})
+        ]
+        return p
+
+    for allow, expected in ((True, 103), (False, 118)):
+        p = problem(allow)
+        result = solve_cpsat(p, "energy", comm_energy=True)
+        assert result.objective_value == expected, (allow, result.objective_value)
+        solution = result.solution
+        evaluated = p.evaluate(solution.slot_of_group, solution.design_of_slot, result.starts, None, "none", True)
+        assert evaluated["energy"] == expected
+
+
+def test_overflow_charges_a_refetch_of_what_a_core_cannot_keep() -> None:
+    # Two groups each load their own 100-bit weights; a core keeps 150 bits. On one core 50 bits overflow, re-fetched
+    # at 2 pJ/bit (+100 pJ, and 5 more bus cycles); on two cores nothing overflows.
+    def problem(max_cores):
+        p = build_problem(groups=(0, 1), layers=(0, 1), dependencies=(), max_cores=max_cores, load_bits=[100, 100])
+        p.offchip_bits = {frozenset({0}): 100, frozenset({1}): 100}
+        p.offchip_loads = [
+            OffchipLoad(users=frozenset({g}), first_task={g: g}, bits=100, energy={FAST: 0, SLOW: 0}) for g in (0, 1)
+        ]
+        p.resident_capacity = {FAST: 150, SLOW: 150}
+        p.refetch_pj_per_bit = 2.0
+        return p
+
+    one = solve_cpsat(problem(1), "energy", offchip_bus="aggregate", capacity="overflow")
+    two = solve_cpsat(problem(2), "energy", offchip_bus="aggregate", capacity="overflow")
+    assert (one.objective_value, two.objective_value) == (200, 100)
+    # On one core the bus carries 200 loaded + 50 re-fetched bits at 10 bits/cycle (25 cycles), above the 20 cycles
+    # of two fast tasks.
+    fastest = solve_cpsat(problem(1), "latency", offchip_bus="aggregate", capacity="overflow")
+    assert fastest.solution.latency == 25
+
+
+def test_capacity_filter_forbids_designs_a_group_overflows() -> None:
+    # The fast design is forbidden for group 0: the latency optimum runs it slow (30 + 10 after it on 1). If both
+    # designs overflow group 0, the filter is dropped for it rather than making the model infeasible.
+    problem = build_problem()
+    problem.forbidden = {(0, FAST)}
+    result = solve_cpsat(problem, "latency", capacity="filter")
+    assert result.solution.design_of_slot[result.solution.slot_of_group[0]] == SLOW
+    assert result.solution.latency == 40
+    problem.forbidden = {(0, FAST), (0, SLOW)}
+    assert solve_cpsat(problem, "latency", capacity="filter").solution.latency == 20
+
+
+def link_problem(transfers):
+    """Groups 0, 1 (layers 0, 1) feed groups 2, 3 (layers 0, 1); siblings apart, so at most two slots hold them."""
+    p = build_problem(groups=(0, 1, 2, 3), layers=(0, 1, 0, 1), dependencies=(), max_cores=2, allow_sibling_merge=False)
+    p.transfers = [
+        LinkTransfer(producer=g, consumer=h, source=g, target=h, bits=25_600, splits=1) for g, h in transfers
+    ]
+    p.group_link_widths = {(min(g, h), max(g, h)): 512 for g, h in transfers}
+    return p
+
+
+def test_pair_contention_serializes_the_transfers_of_one_group_pair() -> None:
+    # Group 0 (two tasks, 0-10 and 10-20) sends 50 cycles of data to each of group 1's two tasks. Without contention
+    # both transfers overlap (10-60, 20-70): 80. Sharing their link, the second waits for the first (60-110): 120.
+    p = build_problem(
+        groups=(0, 1), layers=(0, 0), tasks_per_group=2, dependencies=(), allow_sibling_merge=False, max_cores=2
+    )
+    p.transfers = [
+        LinkTransfer(producer=0, consumer=1, source=0, target=2, bits=25_600, splits=1),
+        LinkTransfer(producer=0, consumer=1, source=1, target=3, bits=25_600, splits=1),
+    ]
+    p.group_link_widths = {(0, 1): 512}
+    free = solve_cpsat(p, "latency", link_transfers="timed")
+    pair = solve_cpsat(p, "latency", link_transfers="timed", link_contention="pair")
+    assert (free.solution.latency, pair.solution.latency) == (80, 120)
+
+
+def test_link_contention_serializes_transfers_of_different_pairs_on_one_link() -> None:
+    # 0 and 1 pinned on slot 0, 2 and 3 on slot 1: transfers 0 -> 2 and 1 -> 3 (50 cycles each) share the link
+    # from slot 0 to slot 1. Per pair they overlap (10-60, 20-70; tasks 2, 3 at 60-80): 80. Per link: 120.
+    p = link_problem(((0, 2), (1, 3)))
+    pin = ((0, 0), (1, 0))
+    pair = solve_cpsat(p, "latency", pin, link_transfers="timed", link_contention="pair")
+    link = solve_cpsat(p, "latency", pin, link_transfers="timed", link_contention="link")
+    assert (pair.solution.latency, link.solution.latency) == (80, 120)
+
+
+def test_refinements_need_cpsat_and_their_data() -> None:
+    try:
+        CpSatBackend(build_problem(), options(link_contention="pair"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("link_contention without timed links must be rejected")
+    if len(BACKENDS) > 1:
+        try:
+            BACKENDS[1](build_problem(), options(shared_loads=True))
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError("GurobiBackend must reject the CP-SAT refinements")
 
 
 if __name__ == "__main__":

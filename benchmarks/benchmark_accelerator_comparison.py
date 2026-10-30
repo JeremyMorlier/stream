@@ -5,8 +5,11 @@ Methods:
   candidate gets per-tile core fronts from a core NSGA2 (stopping on front hypervolume convergence), then the
   placement optimization at level 2 (`--chunks` tasks per layer group), solved with CP-SAT, picks the accelerator
   and schedule. The model times the off-chip loads over the shared bus (`--bus`, default
-  `timed`). The tiling GA starts from the mapping's tiling plus random ones and selects candidates by hypervolume
-  contribution.
+  `timed`), and by default takes the CP-SAT refinements towards Stream's measurement: shared loads, the memory
+  energy of loads and transfers, core memory capacity (`--capacity overflow`) and contention between the transfers
+  of a group pair (`--link-contention pair`); `--no-shared-loads`, `--no-comm-energy`, `--capacity none` and
+  `--link-contention none` give the earlier model. The tiling GA starts from the mapping's tiling plus random
+  ones and selects candidates by hypervolume contribution.
 - `tiling_coreopt_cpsat`: the same, with the core pool of `CoreOptimizationStage`
   instead of the per-tile fronts alone: per-tile fronts plus designs specialized for operators with several tile
   shapes and for clusters of similar shapes (`--shared-clusters`).
@@ -83,6 +86,10 @@ FORWARDED_OPTIONS = (
     "template_memory_growth",
     "shared_clusters",
     "bus",
+    "shared_loads",
+    "comm_energy",
+    "capacity",
+    "link_contention",
     "placement_window",
 )
 
@@ -121,6 +128,10 @@ def _run_tiling_placement(  # noqa: PLR0913
         core_optimization=core_optimization,
         cacti_precompute_workers=args.workers,
         offchip_bus=args.bus,
+        shared_loads=args.shared_loads,
+        comm_energy=args.comm_energy,
+        capacity=args.capacity,
+        link_contention=args.link_contention,
     )
 
 
@@ -268,8 +279,11 @@ def _launch(workload: str, method: str, args: argparse.Namespace) -> int:
     command = [sys.executable, __file__, "--single", workload, method]
     for option in FORWARDED_OPTIONS:
         value = getattr(args, option)
-        if value is not None:
-            command += [f"--{option.replace('_', '-')}", str(value)]
+        flag = f"--{option.replace('_', '-')}"
+        if isinstance(value, bool):
+            command.append(flag if value else f"--no-{flag[2:]}")
+        elif value is not None:
+            command += [flag, str(value)]
     print(f"[{time.strftime('%H:%M:%S')}] start {workload}/{method} -> {log_path}", flush=True)
     with open(log_path, "w") as log:
         returncode = subprocess.call(command, stdout=log, stderr=subprocess.STDOUT)
@@ -301,6 +315,31 @@ def _parse_args() -> argparse.Namespace:
         help="tiling_placement: how the placement model accounts for the off-chip loads over the bus.",
     )
     parser.add_argument(
+        "--shared-loads",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="tiling_placement: the timed bus loads a tensor shared by groups on one core once.",
+    )
+    parser.add_argument(
+        "--comm-energy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="tiling_placement: the model counts the memory energy of off-chip loads and core-to-core transfers.",
+    )
+    parser.add_argument(
+        "--capacity",
+        default="overflow",
+        choices=("none", "filter", "overflow"),
+        help="tiling_placement: core memory capacity in the model (filter infeasible designs, or also charge the "
+        "re-fetch of the weights a core cannot keep).",
+    )
+    parser.add_argument(
+        "--link-contention",
+        default="pair",
+        choices=("none", "pair", "link"),
+        help="tiling_placement: contention between transfers in the model (of one group pair, or on one link).",
+    )
+    parser.add_argument(
         "--placement-window",
         type=float,
         default=float("inf"),
@@ -314,7 +353,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--frozen-graphs", type=int, default=4, help="graph_ga: graphs frozen for step 2.")
     parser.add_argument("--max-grid", type=int, default=4, help="edge_tpu_template: max grid rows and columns.")
     parser.add_argument(
-        "--template-memory-shrink", type=int, default=64, help="edge_tpu_template: smallest memory, template size / this."
+        "--template-memory-shrink",
+        type=int,
+        default=64,
+        help="edge_tpu_template: smallest memory, template size / this.",
     )
     parser.add_argument(
         "--template-memory-growth", type=int, default=8, help="edge_tpu_template: largest memory, template size * this."

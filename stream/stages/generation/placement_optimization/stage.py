@@ -167,6 +167,10 @@ class PlacementOptimizationStage(ScheduleSearchStage):
         scheduling_order_source: Literal["generated", "model"] = "generated",
         offchip_bus: Literal["none", "aggregate", "timed"] = "none",
         link_transfers: Literal["none", "timed"] = "timed",
+        shared_loads: bool = False,
+        comm_energy: bool = False,
+        capacity: Literal["none", "filter", "overflow"] = "none",
+        link_contention: Literal["none", "pair", "link"] = "none",
         **kwargs: Any,
     ):
         """
@@ -188,12 +192,20 @@ class PlacementOptimizationStage(ScheduleSearchStage):
             offchip_bus: `"none"`, `"aggregate"` (bus time bounds latency) or `"timed"` (a load before each task).
             link_transfers: `"none"` (links at their traffic-derived width, transfers free) or `"timed"` (a width
                 per communicating group pair, transfers delay their consumers).
+            shared_loads, comm_energy, capacity, link_contention: the CP-SAT model's refinements towards what
+                Stream measures (see `cpsat_backend`): a tensor shared by groups on one core loaded once on the
+                timed bus; the energy of off-chip loads and core-to-core transfers; core memory capacity
+                (`"filter"`: forbid designs that cannot hold a task's tiles, `"overflow"`: also charge a re-fetch
+                of the weights a core cannot keep); and contention between transfers on a link (`"pair"`: of one
+                group pair, `"link"`: of every pair on one physical link).
         """
         super().__init__(list_of_callables, **kwargs)
         for name, value, allowed in (
             ("scheduling_order_source", scheduling_order_source, ("generated", "model")),
             ("offchip_bus", offchip_bus, ("none", "aggregate", "timed")),
             ("link_transfers", link_transfers, ("none", "timed")),
+            ("capacity", capacity, ("none", "filter", "overflow")),
+            ("link_contention", link_contention, ("none", "pair", "link")),
         ):
             if value not in allowed:
                 raise ValueError(f"{type(self).__name__}: unknown {name} {value!r}.")
@@ -216,6 +228,10 @@ class PlacementOptimizationStage(ScheduleSearchStage):
         self.scheduling_order_source = scheduling_order_source
         self.offchip_bus = offchip_bus
         self.link_transfers = link_transfers
+        self.shared_loads = shared_loads
+        self.comm_energy = comm_energy
+        self.capacity = capacity
+        self.link_contention = link_contention
         self.search_budget = kwargs.get("search_budget")
 
     # ------------------------------------------------------------------------------------- measuring -------
@@ -322,6 +338,8 @@ class PlacementOptimizationStage(ScheduleSearchStage):
             tasks_per_group=self.tasks_per_group,
             max_cores=self.max_cores,
             allow_sibling_merge=self.allow_sibling_merge,
+            memory_model=self.comm_energy or self.capacity == "overflow",
+            capacity_filter=self.capacity != "none",
         )
         problem.save(os.path.join(self.out_dir, "problem.pickle"))
         options = BackendOptions(
@@ -330,6 +348,10 @@ class PlacementOptimizationStage(ScheduleSearchStage):
             workers=self.solver_workers,
             mip_gap=self.mip_gap,
             log_path=os.path.join(self.out_dir, f"{self.solver}.log"),
+            shared_loads=self.shared_loads,
+            comm_energy=self.comm_energy,
+            capacity=self.capacity,
+            link_contention=self.link_contention,
         )
         backend = self.backend_cls(problem, options)
         t_model = time.perf_counter() - t0
@@ -355,6 +377,7 @@ class PlacementOptimizationStage(ScheduleSearchStage):
         state.stats[f"placement_{self.solver}"] = {
             **problem.size_report(),
             **backend.size(),
+            "refinements": options.refinements,
             "solves": len(sweep.solve_log),
             "solve_statuses": solve_statuses,
             "solutions": len(solutions),

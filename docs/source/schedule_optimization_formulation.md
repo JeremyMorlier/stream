@@ -273,6 +273,57 @@ $$
   linearized with a one-hot of the slot's port count. Off-chip memory is excluded.
 - The **energy** has no static/leakage term, so it does not depend on latency.
 
+### 5.6 Refinements towards the measurement (CP-SAT only)
+
+On the ResNet bottleneck, the model above predicted multi-core points up to 2.7x too fast and 3 to 7x too
+frugal, and the error grew with the number of cores. Four refinements close the gap. Each is an option of
+`CpSatBackend` (`BackendOptions`), off by default; `GurobiBackend` rejects them.
+
+**Shared loads** (`shared_loads`). A load is a bundle of off-chip tensors with the same users, each needing them
+first in the same task. A bundle two of whose groups may share a slot gets, per slot $p$, a literal
+$\lambda_{bp} = \max_{g \in b} x_{g,p}$ (the one the aggregate bus bound already uses) and an optional bus interval
+present iff $\lambda_{bp}$. Each user task waits for it when its group sits on $p$. Fetching on demand is kept for
+the bundle's first user task only (in task order): the interval cannot end before that task's predecessor has
+ended, when that task sits on $p$. Other bundles keep one interval per task.
+
+**Communication energy** (`comm_energy`). The cost model's energy only counts the accesses of a tile's own
+mapping. Stream adds the memory energy of every transfer (`get_memory_energy_cost_of_transfer`): a read in the
+sender's top memory and a write in the receiver's, at $r/w$ cost per access over the port width.
+
+- A load costs $\text{bits}\,(\epsilon^{\text{dram}}_r + \epsilon^{d}_w)$ at the design $d$ of the slot that
+  receives it. A shared bundle pays it once per slot where $\lambda_{bp}$ is true; the others once per user group,
+  folded into $e_{g,c}$.
+- A transfer between groups on different slots costs $\text{bits}\,(\epsilon^{d(p)}_{r} + \epsilon^{d(q)}_{w})$,
+  and nothing when they share a slot.
+
+Links cost nothing per bit in the accelerator templates (`unit_energy_cost: 0`).
+
+**Capacity** (`capacity`). The model still has no tensor lifetimes. With `"overflow"`, it charges the weights and
+inputs a slot cannot keep. Per slot $p$ and layer stack $s$ (stacks run one after the other, so their loads do not
+coexist), with $R_d$ the capacity of design $d$'s top memories holding loaded operands:
+$$
+o_{ps} \ \ge\ \textstyle\sum_{b \in s} \text{bits}_b\,\lambda_{bp} \;-\; \sum_d R_d\, y_{p,d}, \qquad o_{ps} \ge 0 .
+$$
+Each overflowing bit is re-fetched at least once: $\sum o$ is added to the bus bits, and
+$\sum o \cdot (\epsilon^{\text{dram}}_r + \max_d \epsilon^d_w)$ to the energy. Evicting a constant needs no
+write-back, since off-chip keeps its copy.
+
+`"filter"` (and `"overflow"`) also forbid $x_{g,p} \wedge y_{p,d}$ when a tile of $g$ cannot fit on $d$ as
+Stream's scheduler fills memories (`PlacementProblem.forbidden`). The scheduler brings the constant operands, the
+*whole* output tensor of every predecessor tile and the tile's own output into the top memories, leaving out the
+operands streamed from DRAM (`offchip_operands_for`). The per-tile check of the core search
+(`memory_hierarchy_violations`) only counts the tile's own operand slices, so it misses a design whose memory holds
+the tile but not its producers' larger tiles. Such a placement fails to schedule (no tensor left to evict).
+
+**Link contention** (`link_contention`). Transfers become intervals of their own, between their source task's end
+and their target task's start, fetched on demand.
+
+- `"pair"`: the transfers of one directed group pair share a `Cumulative` of capacity `splits`.
+- `"link"`: per ordered slot pair $(p, q)$, an optional copy of each transfer whose groups may sit there, present
+  iff $x_{g,p} \wedge x_{h,q}$, demanding $\lceil 64 / \text{splits} \rceil$ of a capacity-64 `Cumulative`.
+  This is Stream's per-link bandwidth sharing. It adds one copy per transfer and slot pair, so it suits small
+  `max_cores`.
+
 ---
 
 ## 6. Pareto front extraction
@@ -345,9 +396,9 @@ operator as the parallelism needs. With CP-SAT, $Q$ becomes $T\cdot N$ optional 
 - compute and memory energy.
 
 **Not modelled, deliberately:**
-- **On-chip memory capacity.** No capacity constraint and no eviction or re-fetch. Its effects only appear in
-  the re-measurement. Left as is for now, which means fused designs (case 4 of section 3.1) are not yet
-  worth exploring.
+- **On-chip memory capacity** (but see `capacity="overflow"`, section 5.6). No capacity constraint and no
+  eviction or re-fetch. Its effects only appear in the re-measurement. Left as is for now, which means fused
+  designs (case 4 of section 3.1) are not yet worth exploring.
 - **Static/leakage energy.**
 - **Area outside the cores and the interconnect** (off-chip memory).
 - **Steady-state throughput.** The objective is single-inference latency.
@@ -359,17 +410,17 @@ operator as the parallelism needs. With CP-SAT, $Q$ becomes $T\cdot N$ optional 
 - **Non-preemptive tasks**, run in tile order within a group.
 
 **Open points:**
-- **Contention between group pairs sharing one physical link.** Each group pair is timed at its own width.
-  Transfers of different pairs that land on the same slot link may overlap in the model, and only the
-  re-measurement sees the contention.
+- **Contention between group pairs sharing one physical link** (unless `link_contention="link"`, section 5.6).
+  Each group pair is timed at its own width. Transfers of different pairs that land on the same slot link may
+  overlap in the model, and only the re-measurement sees the contention.
 - **How groups are cut.** Contiguous in tile order is the simplest choice. Cutting along a chosen loop
   dimension would make a parallel placement match a regular split of the operator, which is easier to read
   and to implement in hardware.
 - **Coverage of the candidate pool.** Fronts built shape by shape can miss a "generalist" design that is optimal
   on no single shape but good across all of them. Cases 2 to 4 of section 3.1 address this, but how to cluster
   shape classes for case 3 is still open.
-- **Loads shared by groups merged onto one core.** In the timed bus model, each group still issues its own
-  load. The aggregate bound counts the tensor once.
+- **Loads shared by groups merged onto one core** (unless `shared_loads`, section 5.6). In the timed bus model,
+  each group still issues its own load. The aggregate bound counts the tensor once.
 
 ---
 
@@ -399,5 +450,6 @@ Two choices differ from sections 5.1 and 5.4:
   transfers of a split layer, even when its groups are merged.
 - **Transfers do not contend.** Each transfer only delays its consumer task by its duration at its group pair's
   chosen width, or not at all when both groups share a core. Contention on a link is left to the re-measurement.
-  Without contention the just-in-time constraint is implied by the chain order, so it is not stated.
+  Without contention the just-in-time constraint is implied by the chain order, so it is not stated. With
+  `link_contention` (section 5.6), transfers are intervals and fetched on demand.
 

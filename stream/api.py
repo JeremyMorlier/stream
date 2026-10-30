@@ -1146,6 +1146,10 @@ def optimize_schedule_model(  # noqa: PLR0913
     offchip_bus: Literal["none", "aggregate", "timed"] = "none",
     link_transfers: Literal["none", "timed"] = "timed",
     link_timing: Literal["width", "traffic"] = "width",
+    shared_loads: bool = False,
+    comm_energy: bool = False,
+    capacity: Literal["none", "filter", "overflow"] = "none",
+    link_contention: Literal["none", "pair", "link"] = "none",
     placement_solver: Literal["cpsat", "gurobi"] | None = None,
     max_cores: int | None = None,
     placement_allow_sibling_merge: bool = True,
@@ -1186,6 +1190,8 @@ def optimize_schedule_model(  # noqa: PLR0913
             on its link that overlaps compute).
         link_timing: what the measurement times a link's transfers with: its physical width (`"width"`) or its
             core pair's whole traffic (`"traffic"`, about one cycle per transfer -- the earlier convention).
+        shared_loads, comm_energy, capacity, link_contention: with `placement_solver="cpsat"`, the placement
+            model's refinements towards what Stream measures (see `PlacementOptimizationStage`); off by default.
         placement_solver: `"cpsat"` or `"gurobi"` replaces the level's stage with the placement optimization
             (`stream.stages.generation.placement_optimization`) solved by that solver: at most `max_cores` cores,
             a design usable on several of them, groups of one layer allowed to share a core
@@ -1301,6 +1307,10 @@ def optimize_schedule_model(  # noqa: PLR0913
         scheduling_order_source=scheduling_order_source,
         offchip_bus=offchip_bus,
         link_transfers=link_transfers,
+        shared_loads=shared_loads,
+        comm_energy=comm_energy,
+        capacity=capacity,
+        link_contention=link_contention,
         interconnect_area_model={"link_timing": link_timing},
         co_time_limit=co_time_limit,
         co_measurement_dir=f"{output_path}/{experiment_id}/co_measurements",
@@ -1519,6 +1529,10 @@ def optimize_placement_tiling(  # noqa: PLR0913
     offchip_bus: Literal["none", "aggregate", "timed"] = "none",
     link_transfers: Literal["none", "timed"] = "timed",
     link_timing: Literal["width", "traffic"] = "width",
+    shared_loads: bool = False,
+    comm_energy: bool = False,
+    capacity: Literal["none", "filter", "overflow"] = "none",
+    link_contention: Literal["none", "pair", "link"] = "none",
 ) -> tuple[StreamCostModelEvaluation, list[tuple[StreamCostModelEvaluation, Any]]]:
     """The placement optimization (`stream.stages.generation.placement_optimization`) under the tiling GA: the
     chain of `optimize_model_tiling` with the placement stage solved by `placement_solver` (`"cpsat"` or
@@ -1531,6 +1545,9 @@ def optimize_placement_tiling(  # noqa: PLR0913
 
     The placement model needs the full shape x design cost matrix: a candidate whose matrix exceeds
     `max_cme_matrix_cells` fails and is penalized by the GA.
+
+    `shared_loads`, `comm_energy`, `capacity` and `link_contention` are the CP-SAT model's refinements towards what
+    Stream measures (see `PlacementOptimizationStage`); off by default, and rejected by Gurobi.
 
     Returns:
         As `optimize_model_tiling`. Each candidate's placement report goes to
@@ -1629,6 +1646,10 @@ def optimize_placement_tiling(  # noqa: PLR0913
         scheduling_order_source=scheduling_order_source,
         offchip_bus=offchip_bus,
         link_transfers=link_transfers,
+        shared_loads=shared_loads,
+        comm_energy=comm_energy,
+        capacity=capacity,
+        link_contention=link_contention,
         interconnect_area_model={"link_timing": link_timing},
     )
     answers = [answer for answer in mainstage.run() if answer[0] is not None]

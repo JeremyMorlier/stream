@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+from zigzag.mapping.spatial_mapping import SpatialMapping
 from zigzag.utils import pickle_deepcopy
 
 from stream.hardware.architecture.core_generator import _align_to_byte
@@ -283,7 +284,10 @@ class TemplateExplorationStage(Stage):
             inter_genes,
             TemplateParamRanges(**(template_param_ranges or {})),
         )
+        # simd.yaml fixes `D1: K, 64`, which unrolls nothing on a layer without K (attention's Add on {B, H, D}):
+        # without the dataflow, ZigZag searches the SIMD core's spatial mapping as it does the template core's.
         self.simd_core = validate_core_yaml(SIMD_CORE_YAML_PATH)
+        self.simd_core["dataflows"] = None
         self.offchip_core = load_offchip_core_data()
         self.fitness_of_key: dict[str, tuple[float, float, float]] = {}
         self.evaluated: list[dict[str, Any]] = []
@@ -317,6 +321,8 @@ class TemplateExplorationStage(Stage):
             on_simd = node.possible_core_allocation == [self.seed_simd_id]
             node.core_allocation = [simd_id] if on_simd else list(range(design.nb_cores))
             node.possible_core_allocation = list(node.core_allocation)
+            # The parser gave the SIMD layers the seed SIMD core's dataflow; ZigZag searches it instead.
+            node.spatial_mapping = SpatialMapping.empty()
             if not on_simd and node.id in inter_of_node:
                 choice = inter_of_node[node.id]
                 # No split: an empty tiling, which `TilingGenerationStage` turns into a factor of 1.

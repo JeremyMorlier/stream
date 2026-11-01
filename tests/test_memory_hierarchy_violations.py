@@ -65,7 +65,6 @@ def core(sram_size: int, sram_bandwidth: int, upper_size: int | None):
             operands=OPERANDS,
             oa_dims=("D1", "D2", "D3"),
             oa_sizes=[8, 8, 2],
-            unit_energy=0.05,
             rf_memories={operand: build_rf_memory_dict(operand, 256, 32, []) for operand in OPERANDS},
             sram_memory=build_shared_memory_dict(
                 list(OPERANDS), sram_size, sram_bandwidth, sram_bandwidth, ["D1", "D2"]

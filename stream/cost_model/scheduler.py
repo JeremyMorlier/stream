@@ -163,11 +163,24 @@ class CoalaScheduler:
         while not done:
             best_candidate, preds_end = self.pop_best_candidate()
             core = self.get_allocated_core(best_candidate)
-            full_tensors_this_candidate_needs, tensors_operands = self.get_tensors_needed_for_node(best_candidate)
-            sub_tensors_this_candidate_needs = [
-                self.split_tensor_if_needed(t, best_candidate, core, timestep=preds_end)
-                for t in full_tensors_this_candidate_needs
-            ]
+            full_tensors_this_candidate_needs, tensors_operands, edge_slices = self.get_tensors_needed_for_node(
+                best_candidate
+            )
+            # The tensor each transfer moves, and the stored tensor it is read from when that is an edge slice
+            sub_tensors_this_candidate_needs: list[Tensor] = []
+            transfer_sources: list[Tensor | None] = []
+            for full_tensor, edge_slice in zip(full_tensors_this_candidate_needs, edge_slices, strict=True):
+                if self.accelerator.core_contains_tensor(full_tensor, core):
+                    sub_tensors_this_candidate_needs.append(full_tensor)
+                    transfer_sources.append(None)
+                elif edge_slice is not None:
+                    sub_tensors_this_candidate_needs.append(edge_slice)
+                    transfer_sources.append(full_tensor)
+                else:
+                    sub_tensors_this_candidate_needs.append(
+                        self.split_tensor_if_needed(full_tensor, best_candidate, core, timestep=preds_end)
+                    )
+                    transfer_sources.append(None)
             self.reset_too_large_operands_for_subtensors(
                 best_candidate, sub_tensors_this_candidate_needs, tensors_operands, core
             )
@@ -199,7 +212,9 @@ class CoalaScheduler:
                 for tensor, tensor_operand in zip(sub_tensors_this_candidate_needs, tensors_operands, strict=False)
             )
             earliest_t = core_idle_from - transfer_headstart
-            for tensor, tensor_operand in zip(sub_tensors_this_candidate_needs, tensors_operands, strict=False):
+            for tensor, tensor_operand, source_tensor in zip(
+                sub_tensors_this_candidate_needs, tensors_operands, transfer_sources, strict=True
+            ):
                 transfer_complete_timestep = self.schedule_tensor_transfer(
                     tensor=tensor,
                     tensor_operand=tensor_operand,
@@ -207,6 +222,7 @@ class CoalaScheduler:
                     non_evictable_tensors=sub_tensors_this_candidate_needs,
                     earliest_t=earliest_t,
                     transfer_bandwidth_fraction=transfer_bw_fraction,
+                    source_tensor=source_tensor,
                 )
                 timestep = max(timestep, transfer_complete_timestep)
 
@@ -467,9 +483,12 @@ class CoalaScheduler:
         Returns:
             tensors_this_candidate_needs: list[Tensor]
             tensors_operands: list[MemoryOperand]
+            edge_slices: for each tensor, the part of it the node reads (`edge_slice`), None when it reads all of it or
+                the edge does not say
         """
         tensors_this_candidate_needs: list[Tensor] = []
         tensors_operands: list[MemoryOperand] = []
+        edge_slices: list[Tensor | None] = []
         # Constant operands
         for layer_op in node.constant_operands:
             memory_op = node.memory_operand_links.layer_to_mem_op(layer_op)
@@ -477,6 +496,7 @@ class CoalaScheduler:
                 continue
             tensors_this_candidate_needs.append(node.operand_tensors[layer_op])
             tensors_operands.append(memory_op)
+            edge_slices.append(None)
         # Non-constant operands
         for pred, _, edge_data in sorted(self.G.in_edges(node, data=True), key=itemgetter(0)):
             if pred.id == node.id:
@@ -488,12 +508,36 @@ class CoalaScheduler:
             pred_output_tensor = pred.operand_tensors[pred.output_operand]
             tensors_this_candidate_needs.append(pred_output_tensor)
             tensors_operands.append(consumer_memory_op)
+            edge_slices.append(self.edge_slice(pred_output_tensor, edge_data))
         if tensors_this_candidate_needs:
             # Sort these tensors based on their earliest possible transfer time
-            zipped = list(zip(tensors_this_candidate_needs, tensors_operands, strict=False))
+            zipped = list(zip(tensors_this_candidate_needs, tensors_operands, edge_slices, strict=True))
             zipped.sort(key=lambda x: x[0].origin.id if hasattr(x[0], "origin") and hasattr(x[0].origin, "id") else 0)
-            tensors_this_candidate_needs, tensors_operands = map(list, zip(*zipped, strict=False))
-        return tensors_this_candidate_needs, tensors_operands
+            tensors_this_candidate_needs, tensors_operands, edge_slices = map(list, zip(*zipped, strict=True))
+        return tensors_this_candidate_needs, tensors_operands, edge_slices
+
+    @staticmethod
+    def edge_slice(tensor: Tensor, edge_data: dict) -> Tensor | None:
+        """The part of a predecessor's output `tensor` an edge's consumer reads (`TiledWorkloadGenerationStage` sets
+        the edge's "slice" and "bits"), or None when it reads all of it or the edge has no slice. A slice along the
+        output's dimensions takes them as loop ranges; one read through a reshape or transpose ("window") keeps the
+        tensor's ranges and is told apart by the consumer's window."""
+        slice_data = edge_data.get("slice")
+        bits = edge_data.get("bits", 0)
+        if slice_data is None or not 0 < bits < tensor.size:
+            return None
+        if slice_data[0] == "window":
+            loop_ranges, slice_key = tensor.loop_ranges, tuple(slice_data)
+        else:
+            loop_ranges, slice_key = tuple(slice_data), ()
+        return Tensor(
+            size=bits,
+            origin=tensor.origin,
+            layer_operand=tensor.layer_operand,
+            loop_dimensions=tensor.loop_dimensions,
+            loop_ranges=loop_ranges,
+            slice_key=slice_key,
+        )
 
     def clear_memories(
         self,
@@ -581,16 +625,19 @@ class CoalaScheduler:
         sending_core: Core | None = None,
         transfer_bandwidth_fraction: float = 1,
         transfer_cause: TransferCause | None = None,
+        source_tensor: Tensor | None = None,
     ):
         """Find the earliest time to transfer the tensor to the receiving core, and register the transfer.
-        Evictions of older tensors might be necessary
+        Evictions of older tensors might be necessary. `tensor` may be a slice of the stored `source_tensor` (see
+        `edge_slice`): it is read from wherever `source_tensor` is, and only the slice moves.
         """
         if non_evictable_tensors is None:
             non_evictable_tensors = []
         if self.accelerator.core_contains_tensor(tensor, receiving_core):
             return earliest_t
+        stored_tensor = source_tensor if source_tensor is not None else tensor
 
-        tensor_available_since_timestep = self.accelerator.get_available_timestep(tensor, sending_core)
+        tensor_available_since_timestep = self.accelerator.get_available_timestep(stored_tensor, sending_core)
         earliest_tensor_addition_t = max(earliest_t, tensor_available_since_timestep)
 
         # Evict older tensors if given tensor doesn't fit yet
@@ -605,7 +652,7 @@ class CoalaScheduler:
         # Find idle window between sender and receiver cores
         # TODO If the storing_instance is a shared instance across more than one core, there will be multiple possible
         # TODO cores to transfer between. For now, we take the first one
-        sending_cores = self.accelerator.get_storing_cores(tensor, sending_core)
+        sending_cores = self.accelerator.get_storing_cores(stored_tensor, sending_core)
         sending_core = sending_cores[0]
 
         transfer_start, transfer_end = self.accelerator.find_earliest_time_for_transfer(
@@ -625,6 +672,7 @@ class CoalaScheduler:
             transfer_start=transfer_start,
             transfer_end=transfer_end,
             transfer_bandwidth_fraction=transfer_bandwidth_fraction,
+            is_slice=source_tensor is not None,
         )
 
         # Register energy

@@ -285,9 +285,11 @@ class Accelerator:
         transfer_start: int,
         transfer_end: int,
         transfer_bandwidth_fraction: float,
+        is_slice: bool = False,
     ):
         """Register a tensor transfer between two cores: spawn the tensor on the receiving core, remove it form the
-        sending core and update the communication links."""
+        sending core and update the communication links. A slice (`is_slice`, see `CoalaScheduler.edge_slice`) is
+        read from the tensor it is part of, which stays on the sending core until its own priority drops."""
         transfer_duration = transfer_end - transfer_start
 
         # Spawn at the receiving core
@@ -308,7 +310,7 @@ class Accelerator:
         )
 
         # Remove from sending core (except if it is offchip)
-        if sending_core.id != self.offchip_core_id:
+        if sending_core.id != self.offchip_core_id and not is_slice:
             not_on_producing_core = sending_core.id != tensor.origin.chosen_core_allocation
             storing_instance = self.get_storing_memory_instance(tensor, sending_core)
             tensor_priority = tensor.get_instance_priority(storing_instance, self.memory_manager)

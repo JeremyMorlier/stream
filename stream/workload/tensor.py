@@ -25,6 +25,7 @@ class Tensor:
         layer_operand: LayerOperand,
         loop_dimensions: list[LayerDim],
         loop_ranges: tuple[tuple[int, int], ...],
+        slice_key: tuple = (),
     ):
         """Initialize the Tensor instance.
 
@@ -34,6 +35,9 @@ class Tensor:
             layer_operand (str, optional): The layer operand to which this tensor belongs
             loop_dimensions (tuple, optional): The loop dimensions for this tensor
             loop_ranges (tuple, optional): The loop range span for the different dimensions of this operand
+            slice_key: tells apart the slices of one tensor that `loop_ranges` cannot express (a slice read through a
+                reshape or transpose, see `TiledWorkloadGenerationStage.get_inter_edges_hybrid`); part of the
+                equality hash when given
         """
         self.size = size
         self.__origin = origin
@@ -44,7 +48,9 @@ class Tensor:
         self.base_priority: None | int = None  # Will be set when we know how many successors this node has (static)
         self.instance_priorities: dict[MemoryInstance, int] = {}
         self.id = (self.origin.id, self.origin.sub_id, layer_operand)
-        self.equality_hash = hash((self.origin.id, self.layer_operand, self.loop_ranges))
+        self.slice_key = slice_key
+        identity = (self.origin.id, self.layer_operand, self.loop_ranges)
+        self.equality_hash = hash((*identity, slice_key) if slice_key else identity)
         self.__static_hash = hash((origin, layer_operand))
 
     def set_base_priorities(self, base_priority: int):

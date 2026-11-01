@@ -84,7 +84,6 @@ class CoreParamRanges:
     sram_bandwidth_choices: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
     upper_size_range: tuple[int, int] = (2**20, 2**27)
     upper_bandwidth_choices: tuple[int, ...] = (256, 512, 1024, 2048, 4096)
-    unit_energy_range: tuple[float, float] = (0.01, 0.1)
     optional_levels: tuple[str, ...] = ("upper",)
 
 
@@ -205,10 +204,6 @@ class CoreGeneLayout:
             high.append(size_range[1])
             names.append(f"oa_{dim}_size")
 
-        low.append(ranges.unit_energy_range[0])
-        high.append(ranges.unit_energy_range[1])
-        names.append("unit_energy")
-
         self.low = low
         self.high = high
         self.names = names
@@ -264,14 +259,11 @@ class CoreGeneLayout:
         oa_sizes = [max(1, round(values[idx + i])) for i in range(len(ranges.oa_dims))]
         idx += len(ranges.oa_dims)
 
-        unit_energy = float(values[idx])
-
         core_dict = core_dict_from_params(
             name,
             operands=ranges.operands,
             oa_dims=ranges.oa_dims,
             oa_sizes=oa_sizes,
-            unit_energy=unit_energy,
             rf_memories=rf_memories,
             sram_memory=sram_memory,
             upper_memory=upper_memory,

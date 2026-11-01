@@ -192,6 +192,13 @@ class TiledWorkloadGenerationStage(Stage):
         """Check if the tiles match the cached tiled workload.
         Can't use 'has_same_performance' because nb_real_predecessors is not set yet for tiles."""
         logger.info("Checking if the cached workload is valid for this run.")
+        # Saved before the inter-layer edges carried the slice their consumer reads (see `get_inter_edges_rtree`)
+        if any(
+            "slice" not in data
+            for producer, consumer, data in cached_tiles.edges(data=True)
+            if producer.id != consumer.id and data.get("bits", 0) > 0
+        ):
+            return False
         # Create hashes of the cached tiles
         cached_tiles_hashes = [tile.static_hash for tile in cached_tiles.node_list]
         # Check for each tile hash if it is in the cached tile hashes
@@ -766,19 +773,62 @@ class TiledWorkloadGenerationStage(Stage):
 
                 for intersecting_consumer_node_id in intersecting_consumer_node_ids:
                     intersecting_consumer = consumer_tiles[intersecting_consumer_node_id]
+                    slice_ranges, bits = self.get_rtree_edge_slice(
+                        producer, consumer, producer_tile, intersecting_consumer, input_operand
+                    )
                     # Create a new communication node that will reside between the producer and consumer node
                     edges += [
                         (
                             producer_tile,
                             intersecting_consumer,
-                            {
-                                "operand": input_operand,
-                                "bits": producer_tile.data_produced_unique,
-                            },
+                            {"operand": input_operand, "bits": bits, "slice": slice_ranges},
                         )
                     ]
 
         return edges
+
+    def get_rtree_edge_slice(
+        self,
+        producer: ComputationNode,
+        consumer: ComputationNode,
+        producer_tile: ComputationNode,
+        consumer_tile: ComputationNode,
+        input_operand: LayerOperand,
+    ) -> tuple[tuple[tuple[int, int], ...], int]:
+        """The part of `producer_tile`'s output that `consumer_tile` reads through `input_operand`: its loop ranges
+        along the producer's output dimensions (the order of the output tensor's `loop_ranges`) and its size in bits.
+
+        The two operands line up axis by axis once G and C/K are merged into one channel axis, as in the rtree
+        (`get_bounding_box_dimensions`), whatever the dimensions are called (a Conv's OY is a Relu's D): the slice is
+        the intersection of the two boxes. A merged channel range maps back to K only when the producer tile holds a
+        single group; with several, the slice keeps the tile's whole G and K ranges."""
+        output_dims = producer.operand_dimensionality_order[Constants.OUTPUT_LAYER_OP]
+        producer_dims, producer_ranges = self.flatten_grouped_convolution_ranges(
+            producer, consumer, output_dims, self.convert_to_inclusive_data_range(producer_tile.loop_ranges)
+        )
+        consumer_dims, consumer_ranges = self.flatten_grouped_convolution_ranges(
+            producer,
+            consumer,
+            consumer_tile.operand_dimensionality_order[input_operand],
+            self.convert_to_inclusive_data_range(consumer_tile.loop_ranges),
+        )
+        assert len(producer_dims) == len(consumer_dims), f"{producer} and {consumer} operands do not line up"
+
+        slice_ranges = dict(producer_tile.loop_ranges)
+        dim_g, dim_ch = LayerDim("G"), LayerDim("CH")
+        for producer_dim, consumer_dim in zip(producer_dims, consumer_dims, strict=True):
+            start = max(producer_ranges[producer_dim][0], consumer_ranges[consumer_dim][0])
+            stop = min(producer_ranges[producer_dim][1], consumer_ranges[consumer_dim][1]) + 1
+            assert start < stop, f"{producer_tile} and {consumer_tile} share no data"
+            if producer_dim != dim_ch:
+                slice_ranges[producer_dim] = (start, stop)
+            elif producer_tile.loop_ranges[dim_g] == (0, 1):
+                channel_dim = next(dim for dim in output_dims if dim not in producer_dims and dim != dim_g)
+                slice_ranges[channel_dim] = (start, stop)
+
+        ranges = tuple(slice_ranges[dim] for dim in output_dims)
+        precision = producer_tile.operand_precision[Constants.FINAL_OUTPUT_LAYER_OP]
+        return ranges, int(prod(stop - start for start, stop in ranges) * precision)
 
     def get_inter_edges_numpy(
         self,
@@ -818,17 +868,9 @@ class TiledWorkloadGenerationStage(Stage):
             timesteps += (time.time(),)
             self._print_time_delta_to_logger(timesteps, str(path_between))
 
-            for p, c in inter_edges:
-                all_inter_edges.append(
-                    (
-                        p,
-                        c,
-                        {
-                            "operand": dependent_operand,
-                            "bits": p.data_produced_unique,
-                        },
-                    )
-                )
+            for (p, c), (bits, window) in inter_edges.items():
+                edge_data = {"operand": dependent_operand, "bits": bits, "slice": ("window", window)}
+                all_inter_edges.append((p, c, edge_data))
         return all_inter_edges
 
     def _print_time_delta_to_logger(self, timesteps: tuple[float, float, float], path: str):
@@ -884,13 +926,20 @@ class TiledWorkloadGenerationStage(Stage):
             final_node (ComputationNode): The node for which to get the inter-edges
             operand (LayerOperand): The input operand of final_node for which to get the inter-edges
             relevant_axes (list): A list of boolean values indicating which axes are relevant for the final_node
+
+        Returns:
+            For each (producer tile, consumer tile) edge, the bits of the producer tile's output the consumer tile reads
+            and the consumer tile's window, in the consumer's coordinates: the tensor went through the intermediate
+            nodes' reshapes and transposes, so the slice has no range along the producer's dimensions.
         """
-        inter_edges: set[tuple[ComputationNode, ComputationNode]] = set()
+        inter_edges: dict[tuple[ComputationNode, ComputationNode], tuple[int, tuple[tuple[int, int], ...]]] = {}
         dims = final_node.operand_dimensionality_order[op]
+        tensor_shape = tensor.tensor_shape
 
         assert len(dims) == len(relevant_axes)
         for consumer_tile in self.tiles_dict[final_node]:
-            relevant_loop_ranges = [consumer_tile.loop_ranges[dim] for dim in dims]
+            window = tuple(consumer_tile.loop_ranges[dim] for dim in dims)
+            relevant_loop_ranges = list(window)
             # Override loop ranges of irrelevant axes to only include a single slice
             for i, relevant in enumerate(relevant_axes):
                 if not relevant:
@@ -898,10 +947,22 @@ class TiledWorkloadGenerationStage(Stage):
             # Ellipsis adds the entire last axis for the extra dimension in NodeTensor
             slices = tuple(slice(start, stop) for start, stop in relevant_loop_ranges) + (Ellipsis,)
             sliced_tensor = tensor[slices]
-            producer_tiles = set(sliced_tensor[sliced_tensor != 0].flat.flat)  # type: ignore
-
-            for producer_tile in producer_tiles:
-                inter_edges.add((producer_tile, consumer_tile))
+            # Positions each producer tile fills in the window; a producer tile spans every irrelevant axis (it is not
+            # tiled along it), so the window's extent there multiplies them.
+            positions: dict[ComputationNode, int] = defaultdict(int)
+            for position in sliced_tensor.flat:
+                for producer_tile in set(position[position != 0]):
+                    positions[producer_tile] += 1
+            irrelevant_extent = prod(
+                max(0, min(stop, size) - max(start, 0))
+                for (start, stop), size, relevant in zip(window, tensor_shape, relevant_axes, strict=True)
+                if not relevant
+            )
+            for producer_tile, count in positions.items():
+                output_tensor = producer_tile.operand_tensors[Constants.OUTPUT_LAYER_OP]
+                precision = producer_tile.operand_precision[Constants.FINAL_OUTPUT_LAYER_OP]
+                bits = min(int(max(1, count * irrelevant_extent) * precision), output_tensor.size)
+                inter_edges[(producer_tile, consumer_tile)] = (bits, window)
         return inter_edges
 
     @staticmethod

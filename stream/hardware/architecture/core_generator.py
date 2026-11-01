@@ -29,6 +29,9 @@ OPERANDS = ("I1", "I2", "O")
 # interconnect area (`interconnect_area`): about 350 GE for an 8-bit MAC with its pipeline register, at GF22's
 # 2e-7 mm^2/GE. A calibration point, not a synthesis result.
 MAC_UNIT_AREA_MM2 = 350 * 2e-7
+# Energy of one MAC in pJ: a technology constant like the area, not a design choice, and the value of the hand-written
+# cores (`tpu_like.yaml`, `edge_tpu_like.yaml`) the generated ones are compared against.
+MAC_UNIT_ENERGY_PJ = 0.04
 
 
 def _direction_allocations(operand: str) -> tuple[list[str], list[str]]:
@@ -159,7 +162,6 @@ def core_dict_from_params(
     operands: tuple[str, ...],
     oa_dims: tuple[str, ...],
     oa_sizes: list[int],
-    unit_energy: float,
     rf_memories: dict[str, dict[str, Any] | None],
     sram_memory: dict[str, Any] | None,
     upper_memory: dict[str, Any] | None,
@@ -191,7 +193,7 @@ def core_dict_from_params(
         "type": "compute",
         "memories": memories,
         "operational_array": {
-            "unit_energy": unit_energy,
+            "unit_energy": MAC_UNIT_ENERGY_PJ,
             "unit_area": MAC_UNIT_AREA_MM2,
             "dimensions": list(oa_dims),
             "sizes": oa_sizes,
@@ -253,7 +255,6 @@ def random_core_dict(
         operands=operands,
         oa_dims=oa_dims,
         oa_sizes=sizes,
-        unit_energy=round(rng.uniform(0.01, 0.1), 4),
         rf_memories=rf_memories,
         sram_memory=sram_memory,
         upper_memory=upper_memory,

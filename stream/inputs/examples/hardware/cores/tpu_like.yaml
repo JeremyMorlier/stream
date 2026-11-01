@@ -89,7 +89,7 @@ memories:
 
 operational_array:
   unit_energy: 0.04 # pJ
-  unit_area: 1 # unit
+  unit_area: 0.00007 # mm^2, core_generator.MAC_UNIT_AREA_MM2
   dimensions: [D1, D2]
   sizes: [32, 32]
 

@@ -15,6 +15,7 @@ from typing import Any
 
 import networkx as nx
 
+from stream.cost_model.scheduler import CoalaScheduler
 from stream.hardware.architecture.core_generator import build_core_from_dict
 from stream.hardware.architecture.noc.interconnect_area import (
     ROUTER_EXTRA_PORTS,
@@ -655,10 +656,10 @@ def _add_memory_model(
 
 def _working_set_overflows(tile: ComputationNode, workload: Any, core: Any, layer_stacks: list) -> bool:
     """Whether Stream's scheduler cannot fit `tile` on `core`: what `CoalaScheduler.get_tensors_needed_for_node`
-    brings into a top memory -- the constant operands, the *whole* output tensor of every predecessor tile (not
-    just the slice the tile reads) -- plus the tile's own output, leaving out the operands `offchip_operands_for`
-    streams from DRAM, exceeds that memory. `memory_hierarchy_violations` only checks the tile's own operand sizes,
-    so a design can pass it and still fail here, when a producer's tiles are larger than its consumer's."""
+    brings into a top memory -- the constant operands, the slice of every predecessor tile's output the tile reads
+    (`CoalaScheduler.edge_slice`) -- plus the tile's own output, leaving out the operands `offchip_operands_for`
+    streams from DRAM, exceeds that memory. `memory_hierarchy_violations` checks each operand level by level, not
+    the operands of several predecessor tiles held at once, so a design can pass it and still fail here."""
     too_large = set(offchip_operands_for(tile, core, layer_stacks))
     needed: list[tuple[Any, Any]] = []  # (memory operand, tensor)
     for layer_op in tile.constant_operands:
@@ -666,15 +667,16 @@ def _working_set_overflows(tile: ComputationNode, workload: Any, core: Any, laye
     for pred, _, data in workload.in_edges(tile, data=True):
         if pred.id != tile.id and isinstance(pred, ComputationNode):
             memory_op = tile.memory_operand_links.layer_to_mem_op(data["operand"])
-            needed.append((memory_op, pred.operand_tensors[pred.output_operand]))
+            output_tensor = pred.operand_tensors[pred.output_operand]
+            needed.append((memory_op, CoalaScheduler.edge_slice(output_tensor, data) or output_tensor))
     output = tile.memory_operand_links.layer_to_mem_op(tile.output_operand)
     needed.append((output, tile.operand_tensors[tile.output_operand]))
-    stored: dict[int, tuple[Any, dict[int, int]]] = {}  # top instance -> (instance, tensor id -> bits)
+    stored: dict[int, tuple[Any, dict[int, int]]] = {}  # top instance -> (instance, tensor equality hash -> bits)
     for memory_op, tensor in needed:
         if memory_op in too_large:
             continue
         instance = core.get_top_memory_instance(memory_op)
-        stored.setdefault(id(instance), (instance, {}))[1][id(tensor)] = tensor.size
+        stored.setdefault(id(instance), (instance, {}))[1][tensor.equality_hash] = tensor.size
     return any(sum(sizes.values()) > instance.size for instance, sizes in stored.values())
 
 

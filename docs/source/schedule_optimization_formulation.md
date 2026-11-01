@@ -310,10 +310,11 @@ write-back, since off-chip keeps its copy.
 
 `"filter"` (and `"overflow"`) also forbid $x_{g,p} \wedge y_{p,d}$ when a tile of $g$ cannot fit on $d$ as
 Stream's scheduler fills memories (`PlacementProblem.forbidden`). The scheduler brings the constant operands, the
-*whole* output tensor of every predecessor tile and the tile's own output into the top memories, leaving out the
-operands streamed from DRAM (`offchip_operands_for`). The per-tile check of the core search
-(`memory_hierarchy_violations`) only counts the tile's own operand slices, so it misses a design whose memory holds
-the tile but not its producers' larger tiles. Such a placement fails to schedule (no tensor left to evict).
+slice of every predecessor tile's output the tile reads (the edge's $b_{tu}$ bits, `CoalaScheduler.edge_slice`) and
+the tile's own output into the top memories, leaving out the operands streamed from DRAM (`offchip_operands_for`).
+The per-tile check of the core search (`memory_hierarchy_violations`) checks each operand level by level, not these
+tensors held at once, so it can pass a design they overflow. Such a placement fails to schedule (no tensor left to
+evict).
 
 **Link contention** (`link_contention`). Transfers become intervals of their own, between their source task's end
 and their target task's start, fetched on demand.

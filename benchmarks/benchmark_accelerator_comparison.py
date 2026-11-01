@@ -18,10 +18,10 @@ Methods:
 - `edge_tpu_template` (`optimize_template_accelerator`), on `resnet`: NSGA2 over a homogeneous grid of edge_tpu-like
   cores -- grid rows and columns (up to `--max-grid`), the four array dimensions, and the four memory sizes (costed
   by CACTI) -- with every layer's inter-core tiling; the intra-core tiling is the grid mapping's.
-- `fusemax_template`, on `attention`: the same over a grid of FuseMax 2D arrays (`fusemax_like.yaml`: the two array
-  dimensions and the four memory sizes) whose vector core, running the Softmax and the residual Add, is FuseMax's 1D
-  array (`fusemax_vec_like.yaml`), searched too. The array unrolls the sequence D the grid mapping tiles one row per
-  tile, so the search also picks one intra-core tile count for every layer among `--template-intra-tiles`.
+- `fusemax_template`, on `attention`: the same on FuseMax itself -- one 2D array (`fusemax_like.yaml`: the two array
+  dimensions and the four memory sizes) and its 1D vector array (`fusemax_vec_like.yaml`, likewise), running the
+  Softmax and the residual Add. The array unrolls the sequence D the grid mapping tiles one row per tile, so the
+  search also picks one intra-core tile count for every layer among `--template-intra-tiles`.
 
 `tiling_placement_*` and `graph_ga` start from tpu_like_quad_core and its mapping as a seed. Workloads: `resnet`
 (ResNet-50 first bottleneck) and `attention` (an LLM layer's attention half).
@@ -160,8 +160,9 @@ def _template_ranges(args: argparse.Namespace, method: str) -> dict[str, Any]:
         "memory_growth": args.template_memory_growth,
     }
     if method == "fusemax_template":
-        # Up to FuseMax's own 256x256 array: each PE has its own registers, so a 1024x1024 one reaches 10^4 mm2.
-        ranges["oa_growth"] = 1
+        # FuseMax is one array and its vector array, the array up to its own 256x256: each PE has its own
+        # registers, so a 1024x1024 one reaches 10^4 mm2.
+        ranges.update(max_rows=1, max_cols=1, oa_growth=1)
         ranges["intra_tiles"] = tuple(args.template_intra_tiles)
     return ranges
 
@@ -217,7 +218,8 @@ def print_area_ranges(args: argparse.Namespace) -> None:
             vector = f"a {area(load_template_core(os.path.join(CORES_DIR, 'simd.yaml'))):.2f} mm2 SIMD core"
         else:
             vector = f"a {vector_areas[0]:.2f} - {vector_areas[1]:.2f} mm2 vector core"
-        rows.append((f"{method} ({workload})", *template_areas, f"{args.max_grid**2}, plus {vector}"))
+        nb_cores = template.ranges.max_rows * template.ranges.max_cols
+        rows.append((f"{method} ({workload})", *template_areas, f"{nb_cores}, plus {vector}"))
     print(f"{'method':38} {'core area [mm2]':>20}   max cores")
     for name, low, high, cores in rows:
         print(f"{name:38} {low:8.3f} - {high:9.3f}   {cores}")
@@ -391,7 +393,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-step-fraction", type=float, default=0.5, help="graph_ga: max budget for step 1.")
     parser.add_argument("--step1-patience", type=int, default=5, help="graph_ga: step 1 convergence patience.")
     parser.add_argument("--frozen-graphs", type=int, default=4, help="graph_ga: graphs frozen for step 2.")
-    parser.add_argument("--max-grid", type=int, default=4, help="*_template: max grid rows and columns.")
+    parser.add_argument("--max-grid", type=int, default=4, help="edge_tpu_template: max grid rows and columns.")
     parser.add_argument(
         "--template-memory-shrink",
         type=int,

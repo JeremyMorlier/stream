@@ -13,6 +13,8 @@ import os
 from zigzag.datatypes import LayerDim
 
 from stream.hardware.architecture.grid_generator import template_grid_dict, tpu_grid_dict
+from stream.parser.accelerator_factory import AcceleratorFactory
+from stream.stages.generation.tiled_workload_accelerator_generation import load_offchip_core_data, validate_core_yaml
 from stream.stages.generation.template_exploration import (
     CORES_DIR,
     TemplateGeneLayout,
@@ -117,9 +119,33 @@ def test_template_grid_layout():
     links = [tuple(c["cores"]) for c in grid["core_connectivity"] if c["type"] == "link"]
     # 2x3 mesh: 2 rows x 2 horizontal + 3 vertical links, plus one link from each compute core to the SIMD core.
     assert len(links) == 2 * 2 + 3 + 6
-    assert grid["core_connectivity"][-1] == {"type": "bus", "cores": list(range(8)), "bandwidth": 128}
+    assert grid["core_connectivity"][0] == {"type": "bus", "cores": list(range(8)), "bandwidth": 128}
     # The tpu_like grid is the same layout with core files.
     assert tpu_grid_dict(2, 3)["core_connectivity"] == grid["core_connectivity"]
+
+
+def test_template_grid_keeps_its_links():
+    """Built, a 2x2 edge_tpu grid joins its mesh neighbours and its SIMD core by links, the rest by the bus: the
+    bus, which joins every pair, must not replace the links."""
+    layout = TemplateGeneLayout(TEMPLATE, [], TemplateParamRanges())
+    design = layout.decode(layout.encode(layout.template_values(2, 2)))
+    data = template_grid_dict(
+        layout.core_dict(design),
+        2,
+        2,
+        name="grid",
+        simd_core=validate_core_yaml(os.path.join(CORES_DIR, "simd.yaml")),
+        offchip_core=load_offchip_core_data(),
+    )
+    data["core_memory_sharing"] = []
+    accelerator = AcceleratorFactory(data).create()
+    is_bus = {
+        (sender.id, receiver.id): link.bus_id is not None and link.bus_id >= 0
+        for sender, receiver, link in accelerator.cores.edges(data="cl")
+    }
+    mesh_and_simd = [(0, 1), (0, 2), (1, 3), (2, 3), *((core, 4) for core in range(4))]
+    assert not any(is_bus[pair] or is_bus[pair[::-1]] for pair in mesh_and_simd)
+    assert is_bus[(0, 3)] and is_bus[(0, 5)] and is_bus[(4, 5)]
 
 
 if __name__ == "__main__":

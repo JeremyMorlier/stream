@@ -13,7 +13,7 @@ out as `grid_generator.template_grid_dict`. A genome sets:
   the dimensions of the mapping's intra-core tiling (the largest divisor of each dimension not above it). A template
   whose array unrolls the dimension the mapping tiles (FuseMax's D) needs fewer, larger tiles than its `all`;
 - the inter-core tiling: one `TilingExplorationStage` inter gene per layer (at most one split dimension), its
-  factor clamped to the grid's core count.
+  factor clamped to the grid's core count; none when the grid is a single core (`max_rows = max_cols = 1`).
 
 Otherwise the intra-core tiling stays the mapping's. Genes are real values in `[0, 1)`, each the index of a
 discrete choice, so the core NSGA2 operators (`_make_core_toolbox`, `_run_nsga2`) apply unchanged. Every distinct
@@ -359,11 +359,14 @@ class TemplateExplorationStage(Stage):
         self.search_budget: SearchBudget | None = kwargs.get("search_budget")
         self.interconnect_model = InterconnectAreaModel.from_config(kwargs.get("interconnect_area_model"))
         self.seed_simd_id: int = accelerator.offchip_core_id - 1
-        inter_genes = [gene for gene in build_tiling_genes(workload) if gene.kind == "inter"]
+        ranges = TemplateParamRanges(**(template_param_ranges or {}))
+        # On a single core there is nothing to split across
+        single_core = ranges.max_rows * ranges.max_cols == 1
+        inter_genes = [] if single_core else [gene for gene in build_tiling_genes(workload) if gene.kind == "inter"]
         self.layout = TemplateGeneLayout(
             load_template_core(template_core_path),
             inter_genes,
-            TemplateParamRanges(**(template_param_ranges or {})),
+            ranges,
             vector_template=None if vector_core_path is None else load_template_core(vector_core_path),
         )
         # Without a vector template, the grid's vector core is simd.yaml.
@@ -411,9 +414,10 @@ class TemplateExplorationStage(Stage):
                     (dim, _largest_divisor_at_most(node.layer_dim_sizes[dim], design.intra_tiles))
                     for dim, _ in node.intra_core_tiling
                 ]
-            if not on_simd and node.id in inter_of_node:
-                choice = inter_of_node[node.id]
-                # No split: an empty tiling, which `TilingGenerationStage` turns into a factor of 1.
+            if not on_simd:
+                # No split (no gene, as on a single core, or its None): an empty tiling, which
+                # `TilingGenerationStage` turns into a factor of 1, instead of the mapping's `K, *`.
+                choice = inter_of_node.get(node.id)
                 node.inter_core_tiling = [] if choice is None else [choice]
         return accelerator, workload
 

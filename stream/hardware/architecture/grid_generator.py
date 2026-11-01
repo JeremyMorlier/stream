@@ -7,7 +7,7 @@ The layout follows `stream/inputs/examples/hardware/tpu_like_quad_core.yaml`:
 - one shared SIMD core (`rows*cols`), linked to every compute core, for the elementwise ops (residual Add,
   Softmax) a systolic core does not run;
 - the off-chip DRAM controller (`rows*cols + 1`);
-- a bus joining every core, the DRAM included.
+- a bus joining every core, the DRAM included, carrying what no link does (listed first, so the links stay).
 
 The YAML references core files by name, which the accelerator parser resolves against `cores/` next to the
 accelerator file, so write it into `stream/inputs/examples/hardware/` (the default).
@@ -66,12 +66,14 @@ def template_grid_dict(
     ]
     bus = {"type": "bus", "cores": list(range(nb_compute + 2)), "bandwidth": BUS_BANDWIDTH}
 
+    # The bus first: `AcceleratorFactory.create_core_graph` keeps one edge per core pair, the last one listed, so a
+    # bus listed after the links would replace every one of them (as in `derive_group_dedicated_topology`).
     return {
         "name": name,
         "cores": cores,
         "offchip_core_id": offchip_id,
         "unit_energy_cost": 0,
-        "core_connectivity": [*links, bus],
+        "core_connectivity": [bus, *links],
     }
 
 

@@ -10,46 +10,6 @@ cores:
 offchip_core_id: 5
 unit_energy_cost: 0
 core_connectivity:
-- type: link
-  cores:
-  - 0
-  - 1
-  bandwidth: 32
-- type: link
-  cores:
-  - 0
-  - 2
-  bandwidth: 32
-- type: link
-  cores:
-  - 1
-  - 3
-  bandwidth: 32
-- type: link
-  cores:
-  - 2
-  - 3
-  bandwidth: 32
-- type: link
-  cores:
-  - 0
-  - 4
-  bandwidth: 32
-- type: link
-  cores:
-  - 1
-  - 4
-  bandwidth: 32
-- type: link
-  cores:
-  - 2
-  - 4
-  bandwidth: 32
-- type: link
-  cores:
-  - 3
-  - 4
-  bandwidth: 32
 - type: bus
   cores:
   - 0
@@ -59,3 +19,43 @@ core_connectivity:
   - 4
   - 5
   bandwidth: 128
+- type: link
+  cores:
+  - 0
+  - 1
+  bandwidth: 32
+- type: link
+  cores:
+  - 0
+  - 2
+  bandwidth: 32
+- type: link
+  cores:
+  - 1
+  - 3
+  bandwidth: 32
+- type: link
+  cores:
+  - 2
+  - 3
+  bandwidth: 32
+- type: link
+  cores:
+  - 0
+  - 4
+  bandwidth: 32
+- type: link
+  cores:
+  - 1
+  - 4
+  bandwidth: 32
+- type: link
+  cores:
+  - 2
+  - 4
+  bandwidth: 32
+- type: link
+  cores:
+  - 3
+  - 4
+  bandwidth: 32

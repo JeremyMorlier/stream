@@ -15,9 +15,13 @@ Methods:
   shapes and for clusters of similar shapes (`--shared-clusters`).
 - `graph_ga` (`optimize_graph_evolution`): the two-step evolving-graph GA of `benchmark_optimizer_comparison.py`
   (core designs and links with the allocation, then the mapping on the frozen best graphs).
-- `edge_tpu_template` (`optimize_template_accelerator`): NSGA2 over a homogeneous grid of edge_tpu-like cores --
-  grid rows and columns (up to `--max-grid`), the four array dimensions, and the four memory sizes (costed by
-  CACTI) -- with every layer's inter-core tiling; the intra-core tiling is the grid mapping's.
+- `edge_tpu_template` (`optimize_template_accelerator`), on `resnet`: NSGA2 over a homogeneous grid of edge_tpu-like
+  cores -- grid rows and columns (up to `--max-grid`), the four array dimensions, and the four memory sizes (costed
+  by CACTI) -- with every layer's inter-core tiling; the intra-core tiling is the grid mapping's.
+- `fusemax_template`, on `attention`: the same over a grid of FuseMax 2D arrays (`fusemax_like.yaml`: the two array
+  dimensions and the four memory sizes) whose vector core, running the Softmax and the residual Add, is FuseMax's 1D
+  array (`fusemax_vec_like.yaml`), searched too. The array unrolls the sequence D the grid mapping tiles one row per
+  tile, so the search also picks one intra-core tile count for every layer among `--template-intra-tiles`.
 
 `tiling_placement_*` and `graph_ga` start from tpu_like_quad_core and its mapping as a seed. Workloads: `resnet`
 (ResNet-50 first bottleneck) and `attention` (an LLM layer's attention half).
@@ -53,6 +57,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from benchmark_optimizer_comparison import NO_CAP, QUAD_CORE, QUAD_CORE_MAPPINGS, _export_workload, _run_graph_ga
 
@@ -62,7 +67,13 @@ METHODS = (
     "tiling_coreopt_cpsat",
     "graph_ga",
     "edge_tpu_template",
+    "fusemax_template",
 )
+# Per template method: its core, its vector core (None: simd.yaml), and the workload it runs on.
+TEMPLATES = {
+    "edge_tpu_template": ("edge_tpu_like.yaml", None, "resnet"),
+    "fusemax_template": ("fusemax_like.yaml", "fusemax_vec_like.yaml", "attention"),
+}
 # The options every run subprocess receives (the orchestrator-only ones are left out).
 FORWARDED_OPTIONS = (
     "max_time",
@@ -84,6 +95,7 @@ FORWARDED_OPTIONS = (
     "max_grid",
     "template_memory_shrink",
     "template_memory_growth",
+    "template_intra_tiles",
     "shared_clusters",
     "bus",
     "shared_loads",
@@ -140,13 +152,18 @@ def _max_cores(args: argparse.Namespace) -> int:
     return args.max_cores if args.max_cores is not None else args.max_grid**2
 
 
-def _template_ranges(args: argparse.Namespace) -> dict[str, int]:
-    return {
+def _template_ranges(args: argparse.Namespace, method: str) -> dict[str, Any]:
+    ranges: dict[str, Any] = {
         "max_rows": args.max_grid,
         "max_cols": args.max_grid,
         "memory_shrink": args.template_memory_shrink,
         "memory_growth": args.template_memory_growth,
     }
+    if method == "fusemax_template":
+        # Up to FuseMax's own 256x256 array: each PE has its own registers, so a 1024x1024 one reaches 10^4 mm2.
+        ranges["oa_growth"] = 1
+        ranges["intra_tiles"] = tuple(args.template_intra_tiles)
+    return ranges
 
 
 def print_area_ranges(args: argparse.Namespace) -> None:
@@ -167,38 +184,59 @@ def print_area_ranges(args: argparse.Namespace) -> None:
 
     generated = CoreGeneLayout(CoreParamRanges())
     generated_areas = [area(generated.decode_node(bounds, "core")) for bounds in (generated.low, generated.high)]
-    template_core = load_template_core(os.path.join(CORES_DIR, "edge_tpu_like.yaml"))
-    template = TemplateGeneLayout(template_core, [], TemplateParamRanges(**_template_ranges(args)))
-    nb_oa = len(template.oa_dims)
-    template_areas = []
-    for pick in (min, max):
-        oa_sizes = tuple(pick(choices) for choices in template.choices[2 : 2 + nb_oa])
-        memory_sizes = tuple(pick(choices) for choices in template.memory_choices)
-        template_areas.append(area(template.core_dict(TemplateDesign(1, 1, oa_sizes, memory_sizes, ()))))
-    # Every template accelerator also has the SIMD core of its grid (`template_grid_dict`).
-    simd = area(load_template_core(os.path.join(CORES_DIR, "simd.yaml")))
     rows = [
         ("tiling_placement / tiling_coreopt", *generated_areas, f"{_max_cores(args)}"),
         ("graph_ga", *generated_areas, "one per seed-tiling group (resnet 16, attention 11)"),
-        ("edge_tpu_template", *template_areas, f"{args.max_grid**2}, plus a {simd:.2f} mm2 SIMD core"),
     ]
+    for method, (core_file, vector_file, workload) in TEMPLATES.items():
+        vector_template = None if vector_file is None else load_template_core(os.path.join(CORES_DIR, vector_file))
+        template = TemplateGeneLayout(
+            load_template_core(os.path.join(CORES_DIR, core_file)),
+            [],
+            TemplateParamRanges(**_template_ranges(args, method)),
+            vector_template=vector_template,
+        )
+        nb_oa, nb_vector_oa = len(template.oa_dims), len(template.vector_oa_dims)
+        vector_oa_offset = 2 + nb_oa + len(template.memory_names)
+        template_areas, vector_areas = [], []
+        for pick in (min, max):
+            design = TemplateDesign(
+                1,
+                1,
+                tuple(pick(choices) for choices in template.choices[2 : 2 + nb_oa]),
+                tuple(pick(choices) for choices in template.memory_choices),
+                (),
+                tuple(pick(choices) for choices in template.choices[vector_oa_offset:][:nb_vector_oa]),
+                tuple(pick(choices) for choices in template.vector_memory_choices),
+            )
+            template_areas.append(area(template.core_dict(design)))
+            if vector_template is not None:
+                vector_areas.append(area(template.vector_core_dict(design)))
+        # Every template accelerator also has the vector core of its grid (`template_grid_dict`).
+        if vector_template is None:
+            vector = f"a {area(load_template_core(os.path.join(CORES_DIR, 'simd.yaml'))):.2f} mm2 SIMD core"
+        else:
+            vector = f"a {vector_areas[0]:.2f} - {vector_areas[1]:.2f} mm2 vector core"
+        rows.append((f"{method} ({workload})", *template_areas, f"{args.max_grid**2}, plus {vector}"))
     print(f"{'method':38} {'core area [mm2]':>20}   max cores")
     for name, low, high, cores in rows:
         print(f"{name:38} {low:8.3f} - {high:9.3f}   {cores}")
 
 
-def _run_edge_tpu_template(workload_path, layer_stacks, out_root, experiment_id, budget, args):
+def _run_template(method, workload_path, layer_stacks, out_root, budget, args):
     from stream.api import optimize_template_accelerator
 
+    core_file, vector_file, _workload = TEMPLATES[method]
     return optimize_template_accelerator(
-        template_core="edge_tpu_like.yaml",
+        template_core=core_file,
+        vector_core=vector_file,
         workload=workload_path,
         mode="fused",
         layer_stacks=layer_stacks,
-        experiment_id=experiment_id,
+        experiment_id=method,
         output_path=out_root,
         search_budget=budget,
-        template_param_ranges=_template_ranges(args),
+        template_param_ranges=_template_ranges(args, method),
         population_size=args.population,
         max_workers=args.workers,
         cacti_precompute_workers=args.workers,
@@ -249,8 +287,8 @@ def run_single(workload: str, method: str, args: argparse.Namespace) -> None:
             )
         elif method == "graph_ga":
             _run_graph_ga(workload_path, QUAD_CORE_MAPPINGS[workload], layer_stacks, out_root, method, budget, args)
-        elif method == "edge_tpu_template":
-            _run_edge_tpu_template(workload_path, layer_stacks, out_root, method, budget, args)
+        elif method in TEMPLATES:
+            _run_template(method, workload_path, layer_stacks, out_root, budget, args)
         else:
             raise ValueError(f"Unknown method {method}")
     except Exception as exc:  # keep the trace and summary of a run that crashed late
@@ -282,6 +320,8 @@ def _launch(workload: str, method: str, args: argparse.Namespace) -> int:
         flag = f"--{option.replace('_', '-')}"
         if isinstance(value, bool):
             command.append(flag if value else f"--no-{flag[2:]}")
+        elif isinstance(value, list):
+            command += [flag, *map(str, value)]
         elif value is not None:
             command += [flag, str(value)]
     print(f"[{time.strftime('%H:%M:%S')}] start {workload}/{method} -> {log_path}", flush=True)
@@ -299,7 +339,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--window", type=float, default=1800, help="Convergence window, in seconds.")
     parser.add_argument("--rel-tol", type=float, default=0.005, help="Converged below this EDP gain per window.")
     parser.add_argument("--workers", type=int, default=8, help="Worker processes, the same for every method.")
-    parser.add_argument("--population", type=int, default=16, help="GA population (graph_ga, edge_tpu_template).")
+    parser.add_argument("--population", type=int, default=16, help="GA population (graph_ga, *_template).")
     parser.add_argument("--tiling-population", type=int, default=4, help="tiling_placement: tiling GA population.")
     parser.add_argument("--core-patience", type=int, default=5, help="tiling_placement: core GA HV patience.")
     parser.add_argument("--hv-patience", type=int, default=2, help="tiling_placement: tiling GA HV patience.")
@@ -351,15 +391,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-step-fraction", type=float, default=0.5, help="graph_ga: max budget for step 1.")
     parser.add_argument("--step1-patience", type=int, default=5, help="graph_ga: step 1 convergence patience.")
     parser.add_argument("--frozen-graphs", type=int, default=4, help="graph_ga: graphs frozen for step 2.")
-    parser.add_argument("--max-grid", type=int, default=4, help="edge_tpu_template: max grid rows and columns.")
+    parser.add_argument("--max-grid", type=int, default=4, help="*_template: max grid rows and columns.")
     parser.add_argument(
         "--template-memory-shrink",
         type=int,
         default=64,
-        help="edge_tpu_template: smallest memory, template size / this.",
+        help="*_template: smallest memory, template size / this.",
     )
     parser.add_argument(
-        "--template-memory-growth", type=int, default=8, help="edge_tpu_template: largest memory, template size * this."
+        "--template-memory-growth", type=int, default=8, help="*_template: largest memory, template size * this."
+    )
+    parser.add_argument(
+        "--template-intra-tiles",
+        type=int,
+        nargs="*",
+        default=[2, 4, 8, 16, 32, 64, 128],
+        help="fusemax_template: the intra-core tile counts per layer it picks from (attention's sequence is 128).",
     )
     parser.add_argument("--area-ranges", action="store_true", help="Print each design space's area range and exit.")
     parser.add_argument("--seed", type=int, default=0)
@@ -381,7 +428,13 @@ def main() -> None:
     if args.area_ranges:
         print_area_ranges(args)
         return
-    runs = [(workload, method) for workload in args.workloads for method in args.methods]
+    # A template method runs on its own workload only.
+    runs = [
+        (workload, method)
+        for workload in args.workloads
+        for method in args.methods
+        if method not in TEMPLATES or TEMPLATES[method][2] == workload
+    ]
     with ThreadPoolExecutor(max_workers=args.parallel_runs) as executor:
         codes = list(executor.map(lambda run: _launch(*run, args), runs))
     failed = [run for run, code in zip(runs, codes, strict=True) if code]

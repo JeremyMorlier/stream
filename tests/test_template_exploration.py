@@ -17,6 +17,7 @@ from stream.stages.generation.template_exploration import (
     CORES_DIR,
     TemplateGeneLayout,
     TemplateParamRanges,
+    _largest_divisor_at_most,
     load_template_core,
 )
 from stream.stages.generation.tiling_exploration import TilingGene
@@ -66,6 +67,47 @@ def test_every_gene_value_decodes_to_a_valid_core():
             # Every memory size a design can pick has its CACTI cost precomputed.
             read_bandwidth = TemplateGeneLayout._read_bandwidth(TEMPLATE["memories"][name])
             assert (memory["mem_type"], memory["size"], read_bandwidth) in configs
+
+
+FUSEMAX = load_template_core(os.path.join(CORES_DIR, "fusemax_like.yaml"))
+FUSEMAX_VECTOR = load_template_core(os.path.join(CORES_DIR, "fusemax_vec_like.yaml"))
+
+
+def _fusemax_layout() -> TemplateGeneLayout:
+    ranges = TemplateParamRanges(max_rows=2, max_cols=2, oa_growth=1, intra_tiles=(2, 8, 32, 128))
+    return TemplateGeneLayout(FUSEMAX, [INTER_GENE], ranges, vector_template=FUSEMAX_VECTOR)
+
+
+def test_vector_template_and_intra_tiles_round_trip():
+    """With a vector template and intra tile counts, the template itself decodes back, the most tiles included."""
+    layout = _fusemax_layout()
+    design = layout.decode(_values(layout, 2, 2, 0))
+    assert design.oa_sizes == (256, 256) and design.vector_oa_sizes == (256,)
+    assert design.intra_tiles == 128 and design.inter == (0,)
+    for name, size in zip(layout.vector_memory_names, design.vector_memory_sizes, strict=True):
+        assert abs(size - FUSEMAX_VECTOR["memories"][name]["size"]) / FUSEMAX_VECTOR["memories"][name]["size"] < 0.25
+    assert layout.describe(design)["intra_tiles"] == 128
+    # Designs differing only in the vector core or the tile count are told apart.
+    smaller = layout.decode([0.0] * len(layout.choices))
+    assert smaller.intra_tiles == 2 and smaller.key != design.key
+
+
+def test_every_vector_gene_value_decodes_to_a_valid_core():
+    layout = _fusemax_layout()
+    configs = layout.cacti_configs()
+    for value in (0.0, 0.37, 0.999999):
+        design = layout.decode([value] * len(layout.choices))
+        for core, template in ((layout.core_dict(design), FUSEMAX), (layout.vector_core_dict(design), FUSEMAX_VECTOR)):
+            for name, memory in core["memories"].items():
+                read_bandwidth = TemplateGeneLayout._read_bandwidth(template["memories"][name])
+                assert (memory["mem_type"], memory["size"], read_bandwidth) in configs
+
+
+def test_largest_divisor_at_most():
+    assert _largest_divisor_at_most(128, 32) == 32
+    assert _largest_divisor_at_most(56, 32) == 28
+    assert _largest_divisor_at_most(7, 4) == 1
+    assert _largest_divisor_at_most(16, 128) == 16
 
 
 def test_template_grid_layout():

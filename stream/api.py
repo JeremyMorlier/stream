@@ -1673,6 +1673,7 @@ def optimize_template_accelerator(  # noqa: PLR0913
     output_path: str,
     search_budget: SearchBudget | None = None,
     template_param_ranges: dict[str, Any] | None = None,
+    vector_core: str | None = None,
     population_size: int = 16,
     nb_template_generations: int = 10,
     max_workers: int | None = None,
@@ -1685,9 +1686,11 @@ def optimize_template_accelerator(  # noqa: PLR0913
     columns, the template's array and memory sizes, and every layer's inter-core tiling. Memory costs come from
     CACTI, precomputed for every size the search can pick.
 
-    `template_core` is a core file of `stream/inputs/examples/hardware/cores/` (e.g. `edge_tpu_like.yaml`). The
-    seed accelerator and its mapping are `grid_generator.write_template_grid` at the largest grid of
-    `template_param_ranges`; the mapping's intra-core tiling is kept for every design.
+    `template_core` is a core file of `stream/inputs/examples/hardware/cores/` (e.g. `edge_tpu_like.yaml`), and so
+    is `vector_core`, the grid's shared vector core, searched as a template too (e.g. `fusemax_vec_like.yaml`; by
+    default the fixed `simd.yaml`). The seed accelerator and its mapping are `grid_generator.write_template_grid` at
+    the largest grid of `template_param_ranges`; the mapping's intra-core tiling is kept for every design, unless
+    `template_param_ranges` gives `intra_tiles` to pick its tile count from.
 
     Returns:
         The best design's schedule by EDP, and the search's extra info (`pareto_designs`: every design on the front
@@ -1705,7 +1708,9 @@ def optimize_template_accelerator(  # noqa: PLR0913
     )
 
     ranges = TemplateParamRanges(**(template_param_ranges or {}))
-    hardware, mapping = write_template_grid(template_core, ranges.max_rows, ranges.max_cols)
+    hardware, mapping = write_template_grid(
+        template_core, ranges.max_rows, ranges.max_cols, simd_core_file=vector_core or "simd.yaml"
+    )
     _sanity_check_inputs(hardware, workload, mapping, mode, output_path)
     os.makedirs(f"{output_path}/{experiment_id}", exist_ok=True)
     logger = _logging.getLogger(__name__)
@@ -1716,9 +1721,15 @@ def optimize_template_accelerator(  # noqa: PLR0913
     else:
         raise ValueError(f"Invalid temporal mapping type: {temporal_mapping_type}. Must be 'uneven' or 'even'.")
     template_core_path = os.path.join(CORES_DIR, template_core)
+    vector_core_path = None if vector_core is None else os.path.join(CORES_DIR, vector_core)
 
     # The memory sizes do not depend on the workload: precompute their costs before the stage's pool forks.
-    layout = TemplateGeneLayout(load_template_core(template_core_path), [], ranges)
+    layout = TemplateGeneLayout(
+        load_template_core(template_core_path),
+        [],
+        ranges,
+        vector_template=None if vector_core_path is None else load_template_core(vector_core_path),
+    )
     install_cacti_monkeypatch(precompute_cacti_configs(layout.cacti_configs(), max_workers=cacti_precompute_workers))
 
     mainstage = MainStage(
@@ -1745,6 +1756,7 @@ def optimize_template_accelerator(  # noqa: PLR0913
         template_core_path=template_core_path,
         template_search_dir=f"{output_path}/{experiment_id}/template_search",
         template_param_ranges=template_param_ranges,
+        vector_core_path=vector_core_path,
         population_size=population_size,
         nb_template_generations=nb_template_generations,
         max_workers=max_workers,

@@ -1,20 +1,25 @@
 """NSGA2 over a homogeneous accelerator built from one parameterized core template.
 
 The accelerator is a `rows x cols` mesh of identical copies of a template core (e.g. `edge_tpu_like.yaml`), plus a
-shared SIMD core and the off-chip DRAM, laid out as `grid_generator.template_grid_dict`. A genome sets:
+shared vector core (`simd.yaml`, or a vector template such as `fusemax_vec_like.yaml`) and the off-chip DRAM, laid
+out as `grid_generator.template_grid_dict`. A genome sets:
 
 - the grid: `rows` and `cols` (the number of PEs along x and y);
 - the core: the size of every operational-array dimension (powers of two), and the size of every template memory
   (a log grid around its template size). Each memory's read/write energy and area come from CACTI
   (`auto_cost_extraction`), served from the precomputed lookup (`TemplateGeneLayout.cacti_configs`);
+- the vector core, when it is a template: its sizes, likewise;
+- the intra-core tiling, when `TemplateParamRanges.intra_tiles` is given: one tile count for every layer, along
+  the dimensions of the mapping's intra-core tiling (the largest divisor of each dimension not above it). A template
+  whose array unrolls the dimension the mapping tiles (FuseMax's D) needs fewer, larger tiles than its `all`;
 - the inter-core tiling: one `TilingExplorationStage` inter gene per layer (at most one split dimension), its
   factor clamped to the grid's core count.
 
-The intra-core tiling stays the mapping's. Genes are real values in `[0, 1)`, each the index of a discrete choice,
-so the core NSGA2 operators (`_make_core_toolbox`, `_run_nsga2`) apply unchanged. Every distinct design is
-scheduled once with the stages after this one (tiling generation, ZigZag cost estimation and the measurement
-chain) in a forked worker; fitness is `(latency, energy, area)`, area being the compute cores' (SIMD included,
-off-chip excluded) plus the interconnect's, as in `TilingExplorationStage`.
+Otherwise the intra-core tiling stays the mapping's. Genes are real values in `[0, 1)`, each the index of a
+discrete choice, so the core NSGA2 operators (`_make_core_toolbox`, `_run_nsga2`) apply unchanged. Every distinct
+design is scheduled once with the stages after this one (tiling generation, ZigZag cost estimation and the
+measurement chain) in a forked worker; fitness is `(latency, energy, area)`, area being the compute cores' (vector
+core included, off-chip excluded) plus the interconnect's, as in `TilingExplorationStage`.
 
 The CACTI lookup is keyed on `(mem_type, size, read bandwidth)` with one read and one write port, so a template
 memory with more ports (edge_tpu's `rf_2B`) is costed as a 1R/1W one.
@@ -69,24 +74,31 @@ CACTI_MIN_SRAM_ROWS = 32
 class TemplateParamRanges:
     """What the template search may change. A memory's sizes are `SIZE_GRID_STEPS` log-spaced, byte-aligned values
     from `template size / memory_shrink` to `template size * memory_growth`; an array dimension's are the powers of
-    two from 1 to `template size * oa_growth`."""
+    two from 1 to `template size * oa_growth`. The same holds for the vector core's, when it is a template too.
+    `intra_tiles`, when given, are the intra-core tile counts per layer the search picks from (one count for every
+    layer, along the dimensions of the mapping's intra-core tiling); empty keeps the mapping's."""
 
     max_rows: int = 4
     max_cols: int = 4
     oa_growth: int = 4
     memory_shrink: int = 16
     memory_growth: int = 4
+    intra_tiles: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
 class TemplateDesign:
-    """A decoded genome. `inter` holds, per inter gene, the chosen candidate index after clamping to the grid."""
+    """A decoded genome. `inter` holds, per inter gene, the chosen candidate index after clamping to the grid. The
+    vector core's sizes are empty, and `intra_tiles` None, when the search does not choose them."""
 
     rows: int
     cols: int
     oa_sizes: tuple[int, ...]
     memory_sizes: tuple[int, ...]
     inter: tuple[int, ...]
+    vector_oa_sizes: tuple[int, ...] = ()
+    vector_memory_sizes: tuple[int, ...] = ()
+    intra_tiles: int | None = None
 
     @property
     def nb_cores(self) -> int:
@@ -94,39 +106,69 @@ class TemplateDesign:
 
     @property
     def key(self) -> str:
-        return _candidate_key([self.rows, self.cols, *self.oa_sizes, *self.memory_sizes, *self.inter])
+        return _candidate_key(
+            [
+                self.rows,
+                self.cols,
+                *self.oa_sizes,
+                *self.memory_sizes,
+                *self.vector_oa_sizes,
+                *self.vector_memory_sizes,
+                *(() if self.intra_tiles is None else (self.intra_tiles,)),
+                *self.inter,
+            ]
+        )
 
 
 @dataclass
 class TemplateGeneLayout:
-    """The genome of a template search: grid, array sizes, memory sizes, then the inter-core tiling genes."""
+    """The genome of a template search: grid, array sizes, memory sizes, then (when given) the vector core's array
+    and memory sizes and the intra-core tile count, then the inter-core tiling genes."""
 
     template: dict[str, Any]
     inter_genes: list[TilingGene]
     ranges: TemplateParamRanges = field(default_factory=TemplateParamRanges)
+    vector_template: dict[str, Any] | None = None
 
     def __post_init__(self):
-        array = self.template["operational_array"]
-        self.oa_dims: list[str] = list(array["dimensions"])
+        self.oa_dims: list[str] = list(self.template["operational_array"]["dimensions"])
         self.memory_names: list[str] = list(self.template["memories"])
         self.choices: list[list[Any]] = [
             list(range(1, self.ranges.max_rows + 1)),
             list(range(1, self.ranges.max_cols + 1)),
         ]
-        for size in array["sizes"]:
-            top = size * self.ranges.oa_growth
-            self.choices.append([2**k for k in range(int(math.log2(top)) + 1)])
-        for name in self.memory_names:
-            self.choices.append(self._memory_sizes(self.template["memories"][name]))
+        self.choices += self._core_choices(self.template)
+        self.vector_oa_dims: list[str] = []
+        self.vector_memory_names: list[str] = []
+        if self.vector_template is not None:
+            self.vector_oa_dims = list(self.vector_template["operational_array"]["dimensions"])
+            self.vector_memory_names = list(self.vector_template["memories"])
+            self.choices += self._core_choices(self.vector_template)
+        if self.ranges.intra_tiles:
+            self.choices.append(sorted(self.ranges.intra_tiles))
         self.choices += [list(range(len(gene.candidates))) for gene in self.inter_genes]
         self.low = [0.0] * len(self.choices)
         self.high = [1.0] * len(self.choices)
+
+    def _core_choices(self, core: dict[str, Any]) -> list[list[int]]:
+        """The size choices of a core template's array dimensions, then of its memories."""
+        oa_choices = []
+        for size in core["operational_array"]["sizes"]:
+            top = size * self.ranges.oa_growth
+            oa_choices.append([2**k for k in range(int(math.log2(top)) + 1)])
+        return oa_choices + [self._memory_sizes(core["memories"][name]) for name in core["memories"]]
 
     @property
     def memory_choices(self) -> list[list[int]]:
         """The size choices of each template memory, in `memory_names` order."""
         offset = 2 + len(self.oa_dims)
         return self.choices[offset : offset + len(self.memory_names)]
+
+    @property
+    def vector_memory_choices(self) -> list[list[int]]:
+        """The size choices of each vector template memory, in `vector_memory_names` order."""
+        offset = 2 + len(self.oa_dims) + len(self.memory_names) + len(self.vector_oa_dims)
+        return self.choices[offset : offset + len(self.vector_memory_names)]
 
     @staticmethod
     def _read_bandwidth(memory: dict[str, Any]) -> int:
@@ -160,31 +202,43 @@ class TemplateGeneLayout:
             for value, choices in zip(choice_values, self.choices, strict=True)
         ]
 
-    def template_values(self, rows: int, cols: int) -> list[Any]:
-        """The template core itself on a `rows x cols` grid, with no inter-core split."""
-        array = self.template["operational_array"]
+    @staticmethod
+    def _own_values(core: dict[str, Any], memory_names: list[str], memory_choices: list[list[int]]) -> list[int]:
+        """A core template's own array sizes, then the choice nearest to each of its memory sizes."""
         return [
-            rows,
-            cols,
-            *array["sizes"],
+            *core["operational_array"]["sizes"],
             *(
-                min(choices, key=lambda size, name=name: abs(size - self.template["memories"][name]["size"]))
-                for name, choices in zip(self.memory_names, self.memory_choices, strict=True)
+                min(choices, key=lambda size, name=name: abs(size - core["memories"][name]["size"]))
+                for name, choices in zip(memory_names, memory_choices, strict=True)
             ),
-            *([0] * len(self.inter_genes)),
         ]
 
+    def template_values(self, rows: int, cols: int) -> list[Any]:
+        """The template core itself on a `rows x cols` grid (with the vector template itself, and the most intra-core
+        tiles, the mapping's `all`), with no inter-core split."""
+        values = [rows, cols, *self._own_values(self.template, self.memory_names, self.memory_choices)]
+        if self.vector_template is not None:
+            values += self._own_values(self.vector_template, self.vector_memory_names, self.vector_memory_choices)
+        if self.ranges.intra_tiles:
+            values.append(max(self.ranges.intra_tiles))
+        return [*values, *([0] * len(self.inter_genes))]
+
     def decode(self, values: list[float]) -> TemplateDesign:
-        picked = [self._pick(value, choices) for value, choices in zip(values, self.choices, strict=True)]
-        rows, cols = picked[0], picked[1]
-        nb_oa = len(self.oa_dims)
-        oa_sizes = tuple(picked[2 : 2 + nb_oa])
-        memory_sizes = tuple(picked[2 + nb_oa : 2 + nb_oa + len(self.memory_names)])
+        picked = iter(self._pick(value, choices) for value, choices in zip(values, self.choices, strict=True))
+
+        def take(count: int) -> tuple[Any, ...]:
+            return tuple(next(picked) for _ in range(count))
+
+        rows, cols = take(2)
+        oa_sizes, memory_sizes = take(len(self.oa_dims)), take(len(self.memory_names))
+        vector_oa_sizes, vector_memory_sizes = take(len(self.vector_oa_dims)), take(len(self.vector_memory_names))
+        intra_tiles = next(picked) if self.ranges.intra_tiles else None
         inter = tuple(
-            self._clamp(gene, index, rows * cols)
-            for gene, index in zip(self.inter_genes, picked[2 + nb_oa + len(self.memory_names) :], strict=True)
+            self._clamp(gene, index, rows * cols) for gene, index in zip(self.inter_genes, picked, strict=True)
         )
-        return TemplateDesign(rows, cols, oa_sizes, memory_sizes, inter)
+        return TemplateDesign(
+            rows, cols, oa_sizes, memory_sizes, inter, vector_oa_sizes, vector_memory_sizes, intra_tiles
+        )
 
     @staticmethod
     def _clamp(gene: TilingGene, index: int, nb_cores: int) -> int:
@@ -200,24 +254,39 @@ class TemplateGeneLayout:
         ]
         return max(fitting)[1] if fitting else 0
 
-    def core_dict(self, design: TemplateDesign, name: str = "template_core") -> dict[str, Any]:
-        """The validated core dict of a design: the template with its array and memory sizes replaced."""
-        core = copy.deepcopy(self.template)
+    @staticmethod
+    def _resized_core(
+        core_template: dict[str, Any], name: str, oa_sizes: tuple[int, ...], memory_sizes: tuple[int, ...]
+    ) -> dict[str, Any]:
+        core = copy.deepcopy(core_template)
         core["name"] = name
-        core["operational_array"]["sizes"] = list(design.oa_sizes)
-        for memory_name, size in zip(self.memory_names, design.memory_sizes, strict=True):
+        core["operational_array"]["sizes"] = list(oa_sizes)
+        for memory_name, size in zip(core["memories"], memory_sizes, strict=True):
             core["memories"][memory_name]["size"] = size
         return _validate_core_dict(core)
 
+    def core_dict(self, design: TemplateDesign, name: str = "template_core") -> dict[str, Any]:
+        """The validated core dict of a design: the template with its array and memory sizes replaced."""
+        return self._resized_core(self.template, name, design.oa_sizes, design.memory_sizes)
+
+    def vector_core_dict(self, design: TemplateDesign, name: str = "template_vector_core") -> dict[str, Any]:
+        """The validated vector core dict of a design: the vector template with its sizes replaced."""
+        assert self.vector_template is not None, "The search has no vector template."
+        return self._resized_core(self.vector_template, name, design.vector_oa_sizes, design.vector_memory_sizes)
+
     def cacti_configs(self) -> set[tuple[str, int, int]]:
         """Every `(mem_type, size, r_bw)` a decoded design can hand CACTI, for `precompute_cacti_configs`."""
+        cores = [(self.template, self.memory_names, self.memory_choices)]
+        if self.vector_template is not None:
+            cores.append((self.vector_template, self.vector_memory_names, self.vector_memory_choices))
         configs: set[tuple[str, int, int]] = set()
-        for name, sizes in zip(self.memory_names, self.memory_choices, strict=True):
-            memory = self.template["memories"][name]
-            if not memory.get("auto_cost_extraction"):
-                continue
-            mem_type = memory.get("mem_type", "sram")
-            configs |= {(mem_type, size, self._read_bandwidth(memory)) for size in sizes}
+        for core, memory_names, memory_choices in cores:
+            for name, sizes in zip(memory_names, memory_choices, strict=True):
+                memory = core["memories"][name]
+                if not memory.get("auto_cost_extraction"):
+                    continue
+                mem_type = memory.get("mem_type", "sram")
+                configs |= {(mem_type, size, self._read_bandwidth(memory)) for size in sizes}
         return configs
 
     def describe(self, design: TemplateDesign) -> dict[str, Any]:
@@ -227,12 +296,23 @@ class TemplateGeneLayout:
             "cols": design.cols,
             **{f"oa_{dim}": size for dim, size in zip(self.oa_dims, design.oa_sizes, strict=True)},
             **{f"mem_{name}": size for name, size in zip(self.memory_names, design.memory_sizes, strict=True)},
+            **{f"vec_oa_{dim}": size for dim, size in zip(self.vector_oa_dims, design.vector_oa_sizes, strict=True)},
+            **{
+                f"vec_mem_{name}": size
+                for name, size in zip(self.vector_memory_names, design.vector_memory_sizes, strict=True)
+            },
+            **({} if design.intra_tiles is None else {"intra_tiles": design.intra_tiles}),
             "inter_core_tiling": {
                 gene.node_id: gene.candidates[index]
                 for gene, index in zip(self.inter_genes, design.inter, strict=True)
                 if index
             },
         }
+
+
+def _largest_divisor_at_most(size: int, bound: int) -> int:
+    """The largest divisor of `size` not above `bound`: the intra-core tile count of a dimension of `size`."""
+    return max(divisor for divisor in range(1, min(size, bound) + 1) if size % divisor == 0)
 
 
 def load_template_core(path: str) -> dict[str, Any]:
@@ -262,6 +342,7 @@ class TemplateExplorationStage(Stage):
         template_core_path: str,
         template_search_dir: str,
         template_param_ranges: dict[str, Any] | None = None,
+        vector_core_path: str | None = None,
         population_size: int = 16,
         nb_template_generations: int = 10,
         max_workers: int | None = None,
@@ -283,7 +364,9 @@ class TemplateExplorationStage(Stage):
             load_template_core(template_core_path),
             inter_genes,
             TemplateParamRanges(**(template_param_ranges or {})),
+            vector_template=None if vector_core_path is None else load_template_core(vector_core_path),
         )
+        # Without a vector template, the grid's vector core is simd.yaml.
         # simd.yaml fixes `D1: K, 64`, which unrolls nothing on a layer without K (attention's Add on {B, H, D}):
         # without the dataflow, ZigZag searches the SIMD core's spatial mapping as it does the template core's.
         self.simd_core = validate_core_yaml(SIMD_CORE_YAML_PATH)
@@ -301,7 +384,7 @@ class TemplateExplorationStage(Stage):
             design.rows,
             design.cols,
             name=f"template_grid_{design.rows}x{design.cols}",
-            simd_core=self.simd_core,
+            simd_core=self.simd_core if self.layout.vector_template is None else self.layout.vector_core_dict(design),
             offchip_core=self.offchip_core,
         )
         accelerator_data["core_memory_sharing"] = []
@@ -323,6 +406,11 @@ class TemplateExplorationStage(Stage):
             node.possible_core_allocation = list(node.core_allocation)
             # The parser gave the SIMD layers the seed SIMD core's dataflow; ZigZag searches it instead.
             node.spatial_mapping = SpatialMapping.empty()
+            if design.intra_tiles is not None:
+                node.intra_core_tiling = [
+                    (dim, _largest_divisor_at_most(node.layer_dim_sizes[dim], design.intra_tiles))
+                    for dim, _ in node.intra_core_tiling
+                ]
             if not on_simd and node.id in inter_of_node:
                 choice = inter_of_node[node.id]
                 # No split: an empty tiling, which `TilingGenerationStage` turns into a factor of 1.

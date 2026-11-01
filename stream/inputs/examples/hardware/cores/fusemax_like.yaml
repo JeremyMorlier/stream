@@ -1,0 +1,116 @@
+# FuseMax's 2D array (fusemax_array.yaml) as a template core: a 256x256 array of PEs (D1, D2), each with its own
+# register per operand, under one shared SRAM. Every memory's energy and area come from CACTI
+# (auto_cost_extraction), and the MAC's are those of the other templates (0.04 pJ, core_generator.MAC_UNIT_AREA_MM2),
+# so the template stays costed when `TemplateExplorationStage` resizes it. No dataflows (fusemax_array.yaml unrolls
+# D and K), so ZigZag searches the spatial mapping of each layer.
+name: fusemax_like
+type: compute
+
+memories:
+  rf_I:
+    size: 16
+    latency: 1
+    mem_type: rf
+    auto_cost_extraction: True
+    operands: [I1]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 8
+        bandwidth_max: 16
+        allocation:
+          - I1, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 8
+        bandwidth_max: 16
+        allocation:
+          - I1, fh
+    served_dimensions: []
+
+  rf_W:
+    size: 16
+    latency: 1
+    mem_type: rf
+    auto_cost_extraction: True
+    operands: [I2]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 4
+        bandwidth_max: 16
+        allocation:
+          - I2, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 4
+        bandwidth_max: 16
+        allocation:
+          - I2, fh
+    served_dimensions: []
+
+  rf_O:
+    size: 16
+    latency: 1
+    mem_type: rf
+    auto_cost_extraction: True
+    operands: [O]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, tl
+      - name: r_port_2
+        type: read
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, fh
+      - name: w_port_2
+        type: write
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, fl
+    served_dimensions: []
+
+  sram:
+    size: 16777216
+    latency: 1
+    mem_type: sram
+    auto_cost_extraction: True
+    operands: [I1, I2, O]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 256
+        bandwidth_max: 8192
+        allocation:
+          - I1, tl
+          - I2, tl
+          - O, tl
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 256
+        bandwidth_max: 8192
+        allocation:
+          - I1, fh
+          - I2, fh
+          - O, fh
+          - O, fl
+    served_dimensions: [D1, D2]
+
+operational_array:
+  unit_energy: 0.04 # pJ
+  unit_area: 0.00007 # mm^2, core_generator.MAC_UNIT_AREA_MM2
+  dimensions: [D1, D2]
+  sizes: [256, 256]

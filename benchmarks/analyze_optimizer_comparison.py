@@ -47,6 +47,7 @@ METHOD_ORDER = (
     "tiling_coreopt_gurobi",
     "graph_ga",
     "edge_tpu_template",
+    "fusemax_template",
     "grid_2x2",
     "grid_4x4",
 )

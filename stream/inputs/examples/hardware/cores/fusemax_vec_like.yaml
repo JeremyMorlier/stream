@@ -1,0 +1,115 @@
+# FuseMax's 1D vector array (fusemax_vec.yaml) as the vector core of a template grid: 256 PEs (D1), each with its
+# own register per operand, under one shared SRAM, running the Softmax and the residual Add. Costed like
+# fusemax_like.yaml (CACTI memories, the templates' MAC). Its SRAM port is 2048 bits, what 256 lanes of 8 bits
+# read per cycle, not fusemax_vec.yaml's 8192: CACTI prices the port width in area whatever the size.
+name: fusemax_vec_like
+type: compute
+
+memories:
+  rf_I:
+    size: 16
+    latency: 1
+    mem_type: rf
+    auto_cost_extraction: True
+    operands: [I1]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 8
+        bandwidth_max: 16
+        allocation:
+          - I1, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 8
+        bandwidth_max: 16
+        allocation:
+          - I1, fh
+    served_dimensions: []
+
+  rf_W:
+    size: 16
+    latency: 1
+    mem_type: rf
+    auto_cost_extraction: True
+    operands: [I2]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 4
+        bandwidth_max: 16
+        allocation:
+          - I2, tl
+      - name: w_port_1
+        type: write
+        bandwidth_min: 4
+        bandwidth_max: 16
+        allocation:
+          - I2, fh
+    served_dimensions: []
+
+  rf_O:
+    size: 16
+    latency: 1
+    mem_type: rf
+    auto_cost_extraction: True
+    operands: [O]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, tl
+      - name: r_port_2
+        type: read
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, fh
+      - name: w_port_2
+        type: write
+        bandwidth_min: 16
+        bandwidth_max: 16
+        allocation:
+          - O, fl
+    served_dimensions: []
+
+  sram:
+    size: 16777216
+    latency: 1
+    mem_type: sram
+    auto_cost_extraction: True
+    operands: [I1, I2, O]
+    ports:
+      - name: r_port_1
+        type: read
+        bandwidth_min: 256
+        bandwidth_max: 2048
+        allocation:
+          - I1, tl
+          - I2, tl
+          - O, tl
+          - O, th
+      - name: w_port_1
+        type: write
+        bandwidth_min: 256
+        bandwidth_max: 2048
+        allocation:
+          - I1, fh
+          - I2, fh
+          - O, fh
+          - O, fl
+    served_dimensions: [D1]
+
+operational_array:
+  unit_energy: 0.04 # pJ
+  unit_area: 0.00007 # mm^2, core_generator.MAC_UNIT_AREA_MM2
+  dimensions: [D1]
+  sizes: [256]

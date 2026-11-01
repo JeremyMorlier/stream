@@ -19,6 +19,7 @@ METHOD_COLORS = {
     "tiling_coreopt_cpsat": "#0f2f66",
     "tiling_coreopt_gurobi": "#3c7fd0",
     "edge_tpu_template": "#8a5cd6",
+    "fusemax_template": "#b07ce8",
 }
 
 

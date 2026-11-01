@@ -51,6 +51,7 @@ METHOD_STYLES: dict[str, dict[str, Any]] = {
     "tiling_coreopt_cpsat": {"color": "--m-rolled", "marker": "triangle", "dash": False},
     "tiling_coreopt_gurobi": {"color": "--m-rolled", "marker": "triangle", "dash": True},
     "edge_tpu_template": {"color": "--m-template", "marker": "circle", "dash": False},
+    "fusemax_template": {"color": "--m-template", "marker": "diamond", "dash": False},
 }
 DEFAULT_STYLE = {"color": "--m-other", "marker": "circle", "dash": True}
 

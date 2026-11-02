@@ -570,6 +570,26 @@ def _round_population(mu: int) -> int:
     return rounded_mu
 
 
+def _log_objectives(values: tuple[float, ...]) -> tuple[float, ...] | None:
+    """`values` on a log scale, or None when one is not finite and positive."""
+    if not all(0 < v < math.inf for v in values):
+        return None
+    return tuple(math.log(v) for v in values)
+
+
+def _front_stalled(hv_history: list[float], best_history: list[list[float]], patience: int, rel_tol: float) -> bool:
+    """Whether, over the last `patience` generations, both the front's hypervolume and its best value of each
+    objective improved by less than `rel_tol`."""
+    if len(hv_history) <= patience:
+        return False
+    previous_hv, previous_best = hv_history[-1 - patience], best_history[-1 - patience]
+    hv_stalled = previous_hv > 0 and hv_history[-1] / previous_hv - 1 < rel_tol
+    extremes_stalled = all(
+        now >= before * (1 - rel_tol) for now, before in zip(best_history[-1], previous_best, strict=True)
+    )
+    return hv_stalled and extremes_stalled
+
+
 def _run_nsga2(  # noqa: PLR0913
     toolbox: base.Toolbox,
     mu: int,
@@ -603,12 +623,16 @@ def _run_nsga2(  # noqa: PLR0913
     pareto_front = tools.ParetoFront()
     pareto_front.update(population)
 
-    # Convergence (when `convergence_patience` is set): stop once the front's (latency, energy, area)
-    # hypervolume has grown by less than `rel_tol` over the last `convergence_patience` generations.
-    # The reference point is fixed from the initial population so successive volumes are comparable.
-    finite = [ind.fitness.values for ind in population if all(math.isfinite(v) for v in ind.fitness.values)]
-    reference = [1.1 * max(values[i] for values in finite) for i in range(3)] if finite else None
+    # Convergence (when `convergence_patience` is set): stop once, over the last `convergence_patience`
+    # generations, both the front's (latency, energy, area) hypervolume and its best value of each objective
+    # improved by less than `rel_tol`. The hypervolume is taken on log objectives, so that a gain counts as a
+    # ratio: on raw values, halving an area already far below the reference adds almost no volume, and the
+    # front was declared converged while its energy and area ends were still falling. The reference point is
+    # fixed from the initial population so successive volumes are comparable.
+    initial_logs = [logs for ind in population if (logs := _log_objectives(ind.fitness.values)) is not None]
+    reference = [max(logs[i] for logs in initial_logs) + math.log(1.1) for i in range(3)] if initial_logs else None
     hv_history: list[float] = []
+    best_history: list[list[float]] = []
 
     for generation in range(nb_generations):
         # The budget only keeps a new generation from starting; the one under way always completes.
@@ -616,15 +640,16 @@ def _run_nsga2(  # noqa: PLR0913
             logger.info(f"CoreArchitectureExplorationStage: {label} stopped by the search budget.")
             break
         if convergence_patience is not None and reference is not None:
-            hv_history.append(hypervolume_3d([ind.fitness.values for ind in pareto_front], reference))
-            if len(hv_history) > convergence_patience:
-                previous = hv_history[-1 - convergence_patience]
-                if previous > 0 and hv_history[-1] / previous - 1 < rel_tol:
-                    logger.info(
-                        f"CoreArchitectureExplorationStage: {label} front converged after "
-                        f"{generation} generation(s) (hypervolume {hv_history[-1]:.4g})."
-                    )
-                    break
+            front_logs = [logs for ind in pareto_front if (logs := _log_objectives(ind.fitness.values)) is not None]
+            hv_history.append(hypervolume_3d(front_logs, reference))
+            best_history.append([min(ind.fitness.values[i] for ind in pareto_front) for i in range(3)])
+            if _front_stalled(hv_history, best_history, convergence_patience, rel_tol):
+                logger.info(
+                    f"CoreArchitectureExplorationStage: {label} front converged after "
+                    f"{generation} generation(s) (log hypervolume {hv_history[-1]:.4g}, best (latency, energy, "
+                    f"area)={tuple(best_history[-1])})."
+                )
+                break
         offspring = tools.selTournamentDCD(population, mu)
         offspring = [toolbox.clone(ind) for ind in offspring]
         for ind1, ind2 in zip(offspring[::2], offspring[1::2], strict=False):
@@ -830,19 +855,20 @@ class CoreArchitectureExplorationStage(Stage):
             core_param_ranges: overrides for `CoreParamRanges`.
             candidate_results_csv_path, all_evaluated_cores_csv_path: where the cross-tile results and every
                 evaluated design go; default to `core_search/` next to the tiled workload.
-            core_convergence_patience: stop a tile's GA once its front hypervolume gained less than `core_rel_tol`
-                over this many generations (no convergence stop when None).
-            core_rel_tol: relative hypervolume gain counted as progress.
+            core_convergence_patience: stop a tile's GA once its front's log-space hypervolume and its best value
+                of each objective improved by less than `core_rel_tol` over this many generations (no convergence
+                stop when None).
+            core_rel_tol: relative gain counted as progress.
             reuse_pareto_fronts: reuse `core_search/pareto_fronts.pickle` from an earlier run instead of
                 re-running the GA, when it matches this workload's unique tile count.
             cross_tile_evaluation: evaluate every kept design on every other tile shape. Defaults to doing so
                 unless a later stage cost-models the full shape x design matrix itself.
         """
         super().__init__(list_of_callables, **kwargs)
-        # Each tile's NSGA2 stops on convergence (front hypervolume gaining < `core_rel_tol` over
-        # `core_convergence_patience` generations) when a patience is given, or before a new generation once the
-        # optional `SearchBudget` (see stream.opt.search_budget) has stopped; `nb_core_ga_generations` stays a hard
-        # cap either way.
+        # Each tile's NSGA2 stops on convergence (log-space front hypervolume and best value of each objective
+        # gaining < `core_rel_tol` over `core_convergence_patience` generations) when a patience is given, or before
+        # a new generation once the optional `SearchBudget` (see stream.opt.search_budget) has stopped;
+        # `nb_core_ga_generations` stays a hard cap either way.
         self.search_budget = kwargs.get("search_budget")
         self.core_convergence_patience = core_convergence_patience
         self.core_rel_tol = core_rel_tol

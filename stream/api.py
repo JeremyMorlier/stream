@@ -734,8 +734,9 @@ def optimize_rolled_schedules(  # noqa: PLR0913
         prune_rolled: skip folds whose lower bound is already dominated by a measured schedule.
         stats_out: if given, filled with the search statistics (counts and the `prepare_time_s`,
             `search_time_s` and `rolled.time_s` wall times).
-        core_convergence_patience: when set, each tile's core GA stops once its front hypervolume grew by less
-            than `core_rel_tol` over that many generations (`nb_core_ga_generations` stays a hard cap).
+        core_convergence_patience: when set, each tile's core GA stops once its front's log-space hypervolume and
+            its best value of each objective improved by less than `core_rel_tol` over that many generations
+            (`nb_core_ga_generations` stays a hard cap).
         search_budget: optional wall-clock budget (see `stream.opt.search_budget`). Every measured schedule is
             recorded on it; once it stops, the core GAs start no new generation, but the schedule search and the
             rolling still run to their own end.
